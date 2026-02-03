@@ -26,7 +26,7 @@ import requests
 import threading
 import concurrent.futures
 import datetime
-# Restoring necessary imports
+
 try:
     import xgboost as xgb
     from rich.console import Console
@@ -40,101 +40,32 @@ except ImportError:
     from rich.table import Table
     from scipy.stats import norm
 
+# Import shared modules from hedge_fund package
+from hedge_fund.indicators import ManualTA
+from hedge_fund.math_utils import get_kalman_filter, get_hurst
+from hedge_fund.simulation import simulate_exit as _simulate_exit, compute_bracket_labels
+from hedge_fund.features import (
+    calculate_vpin,
+    calculate_enhanced_vwap_features,
+    calculate_volatility_regime,
+    calculate_amihud_illiquidity,
+    calculate_liquidity_sweep,
+)
+from hedge_fund.objectives import profit_factor_objective
+from hedge_fund.data import RateLimiter
+
 # Configuration
 KEYS = {
-    "FMP": "a9ScOGcXHufdJ4trkmiDo6SDEWxzQpK2",
-    "POLY": "Ry6xjaXE_e5AN0qUNUv9cyCLqjpz3eAk", # User provided
+    "FMP": os.environ.get("FMP_API_KEY", ""),
+    "POLY": os.environ.get("POLYGON_API_KEY", ""),
 }
 
 IO_WORKERS = 16
-
-# === 1. MANUAL TA FALLBACK (NO DEPENDENCIES) ===
-class ManualTA:
-    @staticmethod
-    def rsi(close, length=14):
-        delta = close.diff()
-        gain = (delta.where(delta > 0, 0)).ewm(alpha=1/length, adjust=False).mean()
-        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/length, adjust=False).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    @staticmethod
-    def atr(high, low, close, length=14):
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.ewm(alpha=1/length, adjust=False).mean()
-
-    @staticmethod
-    def bbands(close, length=20, std=2):
-        ma = close.rolling(length).mean()
-        std_dev = close.rolling(length).std()
-        upper = ma + std * std_dev
-        lower = ma - std * std_dev
-        # Return dict-like or DF to match pandas_ta
-        # pandas_ta returns cols: BBL_20_2.0, BBM_20_2.0, BBU_20_2.0
-        return pd.DataFrame({
-            f'BBL_{length}_{float(std)}': lower,
-            f'BBM_{length}_{float(std)}': ma,
-            f'BBU_{length}_{float(std)}': upper
-        }, index=close.index)
-
-    @staticmethod
-    def adx(high, low, close, length=14):
-        # Approximated ADX
-        tr1 = high - low
-        tr2 = (high - close.shift()).abs()
-        tr3 = (low - close.shift()).abs()
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-        up = high - high.shift()
-        down = low.shift() - low
-        pos_dm = ((up > down) & (up > 0)) * up
-        neg_dm = ((down > up) & (down > 0)) * down
-
-        # RMA smoothing (alpha = 1/length)
-        tr_s = tr.ewm(alpha=1/length, adjust=False).mean()
-        pos_dm_s = pos_dm.ewm(alpha=1/length, adjust=False).mean()
-        neg_dm_s = neg_dm.ewm(alpha=1/length, adjust=False).mean()
-
-        plus_di = 100 * (pos_dm_s / tr_s)
-        minus_di = 100 * (neg_dm_s / tr_s)
-
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-        adx = dx.ewm(alpha=1/length, adjust=False).mean()
-
-        return pd.DataFrame({f'ADX_{length}': adx}, index=close.index)
 
 ta = ManualTA
 console = Console()
 
 # === 1b. INFRASTRUCTURE (POLYGON HELPER) ===
-
-class RateLimiter:
-    """Token-bucket rate limiter. Allows short bursts while capping average rate."""
-    def __init__(self, rate_per_sec=6.0, burst=10):
-        self._rate = rate_per_sec
-        self._burst = float(burst)
-        self._tokens = float(burst)
-        self._last_refill = time.time()
-        self._lock = threading.Lock()
-
-    def acquire(self, timeout=30.0):
-        """Block until a token is available. Returns True on success."""
-        deadline = time.time() + timeout
-        while True:
-            with self._lock:
-                now = time.time()
-                self._tokens = min(self._burst,
-                                   self._tokens + (now - self._last_refill) * self._rate)
-                self._last_refill = now
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return True
-            if time.time() > deadline:
-                return False
-            time.sleep(0.02)
 
 class Polygon_Helper:
     def __init__(self):
@@ -214,217 +145,7 @@ class Polygon_Helper:
 
         return df
 
-# === 2. GOD MODE MATH (Direct Port from Hedge Fund Monitor) ===
-
-def get_kalman_filter(series, q_base=0.01, r_base=0.1, vol_span=20):
-    n = len(series)
-    if n == 0: return np.array([])
-    abs_returns = np.abs(np.diff(series, prepend=series[0]))
-    alpha_ema = 2.0 / (vol_span + 1)
-    vol_ema = np.empty(n)
-    vol_ema[0] = abs_returns[0] if abs_returns[0] > 0 else 1e-8
-    for i in range(1, n):
-        vol_ema[i] = alpha_ema * abs_returns[i] + (1 - alpha_ema) * vol_ema[i - 1]
-
-    sorted_vol = np.sort(vol_ema)
-    trim_lo = max(1, int(n * 0.10))
-    trim_hi = max(trim_lo + 1, int(n * 0.90))
-    vol_baseline = float(np.mean(sorted_vol[trim_lo:trim_hi]))
-    if vol_baseline <= 0: vol_baseline = 1e-8
-
-    x = series[0]
-    p = 1.0
-    estimates = np.empty(n)
-
-    for i in range(n):
-        ratio = max(0.1, min(10.0, vol_ema[i] / vol_baseline))
-        q = max(0.001, min(0.1, q_base * ratio))
-        r = max(0.01, min(1.0, r_base / ratio))
-        z = series[i]
-        p = p + q
-        k = p / (p + r)
-        x = x + k * (z - x)
-        p = (1 - k) * p
-        estimates[i] = x
-
-    return estimates
-
-def get_hurst(series):
-    try:
-        if len(series) < 20: return 0.5
-        lags = range(2, 20)
-        tau = [np.std(np.subtract(series[lag:], series[:-lag])) for lag in lags]
-        if any(t <= 0 for t in tau): return 0.5
-        slope = np.polyfit(np.log(list(lags)), np.log(tau), 1)[0]
-        return float(np.clip(slope, 0.0, 1.0))
-    except:
-        return 0.5
-
-def calculate_vpin(df, volume_bucket_size=None, window=50):
-    if df is None or len(df) < window: return pd.Series(0.0, index=df.index)
-    if volume_bucket_size is None:
-        avg_daily_volume = df['Volume'].rolling(20).mean().median()
-        volume_bucket_size = max(1, int(avg_daily_volume / 50))
-
-    price_change = df['Close'].diff()
-    price_std = price_change.rolling(20).std()
-    z_score = price_change / (price_std + 1e-9)
-    buy_prob = norm.cdf(z_score)
-
-    df['Buy_Volume'] = df['Volume'] * buy_prob
-    df['Sell_Volume'] = df['Volume'] * (1 - buy_prob)
-
-    cumulative_volume = df['Volume'].cumsum()
-    bucket_id = (cumulative_volume / volume_bucket_size).astype(int)
-
-    bucket_imbalance = df.groupby(bucket_id).apply(lambda x: abs(x['Buy_Volume'].sum() - x['Sell_Volume'].sum()))
-    bucket_volume = df.groupby(bucket_id)['Volume'].sum()
-
-    vpin_buckets = bucket_imbalance / (bucket_volume + 1)
-    vpin_rolling = vpin_buckets.rolling(window, min_periods=10).mean()
-    bucket_to_vpin = vpin_rolling.to_dict()
-
-    return df.groupby(bucket_id).ngroup().map(bucket_to_vpin).fillna(0).clip(0, 1)
-
-def profit_factor_objective(y_true, y_pred):
-    # Custom Gradient for Profit Factor Optimization
-    epsilon = 1e-6
-    agreement = y_true * y_pred
-    temp = 2.0
-    soft_win_prob = 1.0 / (1.0 + np.exp(-agreement / temp))
-    soft_loss_prob = 1.0 - soft_win_prob
-
-    win_contribution = soft_win_prob * np.abs(y_true)
-    loss_contribution = soft_loss_prob * np.abs(y_true)
-
-    gross_profit = np.sum(win_contribution) + epsilon
-    gross_loss = np.sum(loss_contribution) + epsilon
-
-    sigmoid_derivative = soft_win_prob * (1.0 - soft_win_prob)
-    d_win_prob = sigmoid_derivative * y_true / temp
-    d_loss_prob = -d_win_prob
-
-    grad = -(1.0 / gross_profit) * d_win_prob * np.abs(y_true) + \
-           (1.0 / gross_loss) * d_loss_prob * np.abs(y_true)
-
-    hess = sigmoid_derivative * (1.0 / (temp**2)) * np.abs(y_true) + epsilon
-    return grad, hess
-
-# === 2b. INSTITUTIONAL HELPERS (Ported from Main Bot) ===
-
-def _simulate_exit(highs, lows, sl, tp, side, trail_dist=None):
-    """
-    Simulate bracket exit bar-by-bar with OPTIONAL TRAILING STOP.
-
-    If trail_dist is set (e.g. 1.0 * ATR):
-      - LONG: If High > (Current_SL + trail_dist + SL_dist), move SL up.
-        (Simple version: SL trails High by trail_dist)
-      - SHORT: If Low < (Current_SL - trail_dist - SL_dist), move SL down.
-
-    Returns 'win', 'loss', 'timeout', or 'trail_stop'.
-    """
-    current_sl = sl
-
-    for i in range(len(highs)):
-        h = highs[i]
-        l = lows[i]
-
-        if side == 'LONG':
-            # 1. Check STOP LOSS first (Conservative)
-            if l <= current_sl:
-                status = 'loss' if current_sl == sl else 'trail_stop'
-                return status, current_sl
-
-            # 2. Check TAKE PROFIT
-            if h >= tp:
-                return 'win', tp
-
-            # 3. Update TRAILING STOP
-            if trail_dist:
-                # If price moves up, drag SL up to be (High - trail_dist)
-                # But never move SL down.
-                new_sl = h - trail_dist
-                if new_sl > current_sl:
-                    current_sl = new_sl
-
-        else:  # SHORT
-            # 1. Check STOP LOSS
-            if h >= current_sl:
-                status = 'loss' if current_sl == sl else 'trail_stop'
-                return status, current_sl
-
-            # 2. Check TAKE PROFIT
-            if l <= tp:
-                return 'win', tp
-
-            # 3. Update TRAILING STOP
-            if trail_dist:
-                # If price moves down, drag SL down to (Low + trail_dist)
-                # But never move SL up.
-                new_sl = l + trail_dist
-                if new_sl < current_sl:
-                    current_sl = new_sl
-
-    return 'timeout', None
-
-def calculate_enhanced_vwap_features(df):
-    """Enhanced VWAP features for mean reversion signals (from bot)."""
-    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-    vwap = (typical_price * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
-    vwap_dist = df['Close'] - vwap
-    vwap_std = vwap_dist.rolling(20).std()
-    vwap_zscore = vwap_dist / (vwap_std + 1e-9)
-    vwap_slope = vwap.pct_change(5).rolling(10).mean()
-    avg_vol = df['Volume'].rolling(20).mean()
-    vwap_vol_ratio = df['Volume'] / (avg_vol + 1)
-    return vwap_zscore, vwap_slope, vwap_vol_ratio
-
-def calculate_volatility_regime(df):
-    """GEX Proxy: Volatility Regime Detection (from bot)."""
-    returns = df['Close'].pct_change()
-    realized_vol = returns.rolling(20).std() * np.sqrt(252)
-    atr_20 = ta.atr(df['High'], df['Low'], df['Close'], length=20)
-    atr_change = atr_20.pct_change(5)
-    vol_percentile = realized_vol.rolling(100).apply(
-        lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5, raw=False)
-    regime = pd.Series(0, index=df.index)
-    regime[(vol_percentile < 0.3) & (atr_change < 0)] = 1    # Positive GEX
-    regime[(vol_percentile > 0.7) & (atr_change > 0)] = -1   # Negative GEX
-    vol_regime = pd.Series('MEDIUM', index=df.index)
-    vol_regime[vol_percentile < 0.3] = 'LOW'
-    vol_regime[vol_percentile > 0.7] = 'HIGH'
-    return regime, vol_regime
-
-def calculate_amihud_illiquidity(df, window=20):
-    """Amihud Illiquidity Ratio - high = low liquidity (from bot)."""
-    returns = df['Close'].pct_change().abs()
-    dollar_volume = df['Volume'] * df['Close']
-    illiquidity = returns / (dollar_volume + 1e-9)
-    illiquidity_ratio = illiquidity.rolling(window).mean()
-    illiquidity_rank = illiquidity_ratio.rolling(100).apply(
-        lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5, raw=False)
-    return illiquidity_rank
-
-def calculate_liquidity_sweep(df, lookback=16):
-    """Institutional liquidity sweep detection (from bot)."""
-    signals = pd.Series(0, index=df.index)
-    rolling_high = df['High'].rolling(lookback).max()
-    rolling_low = df['Low'].rolling(lookback).min()
-    avg_volume = df['Volume'].rolling(20).mean()
-    volume_surge = df['Volume'] > (avg_volume * 1.5)
-    for i in range(lookback + 1, len(df)):
-        current_bar = df.iloc[i]
-        prev_high = rolling_high.iloc[i-1]
-        prev_low = rolling_low.iloc[i-1]
-        if (current_bar['High'] > prev_high and
-            current_bar['Close'] < prev_high and
-            volume_surge.iloc[i]):
-            signals.iloc[i] = -1  # Bearish sweep
-        elif (current_bar['Low'] < prev_low and
-              current_bar['Close'] > prev_low and
-              volume_surge.iloc[i]):
-            signals.iloc[i] = 1   # Bullish sweep
-    return signals
+# === 2. Math and simulation functions now imported from hedge_fund package ===
 
 # === 3. FEATURE KITCHEN (1:1 Parity with Main Bot) ===
 
@@ -488,12 +209,12 @@ def prepare_god_mode_features(df):
     df['Hour'] = df.index.hour
     df['Day_of_Week'] = df.index.dayofweek
 
-    # 13. Enhanced VWAP features (institutional mean reversion - from bot)
+    # 13. Enhanced VWAP features (institutional mean reversion - from hedge_fund package)
     try:
-        vwap_z, vwap_slope, vwap_vol_ratio = calculate_enhanced_vwap_features(df)
-        df['VWAP_ZScore'] = vwap_z.fillna(0.0)
-        df['VWAP_Slope'] = vwap_slope.fillna(0.0)
-        df['VWAP_Volume_Ratio'] = vwap_vol_ratio.fillna(1.0)
+        vwap_feats = calculate_enhanced_vwap_features(df)
+        df['VWAP_ZScore'] = vwap_feats['VWAP_ZScore'].fillna(0.0)
+        df['VWAP_Slope'] = vwap_feats['VWAP_Slope'].fillna(0.0)
+        df['VWAP_Volume_Ratio'] = vwap_feats['VWAP_Volume_Ratio'].fillna(1.0)
     except:
         df['VWAP_ZScore'] = 0.0
         df['VWAP_Slope'] = 0.0
@@ -630,7 +351,7 @@ def train_and_predict(df_orig, features, sl_mult, tp_mult, max_bars):
     """
     df = df_orig.copy()
 
-    df = compute_bracket_labels(df, sl_mult=sl_mult, tp_mult=tp_mult, max_bars=max_bars)
+    df['Target'] = compute_bracket_labels(df, sl_mult=sl_mult, tp_mult=tp_mult, max_bars=max_bars)
 
     # Train/Test Split (Time Series)
     train_size = int(len(df) * 0.75)
