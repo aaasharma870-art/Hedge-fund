@@ -2,10 +2,16 @@
 Risk management utilities for position sizing and trade risk.
 
 Provides risk-based position sizing, Kelly criterion calculations,
-and portfolio heat management.
+overnight gap risk management, slippage modeling, and portfolio heat management.
 """
 
+import datetime
+import logging
+from zoneinfo import ZoneInfo
+
 import numpy as np
+
+_ET = ZoneInfo("America/New_York")
 
 
 def calculate_position_size(equity, entry_price, stop_price, risk_pct=0.015,
@@ -88,3 +94,178 @@ def kelly_criterion(win_rate, avg_win_r, avg_loss_r, timeout_rate=0.0,
     adjusted = kelly_f * shrinkage * confidence_boost
 
     return float(np.clip(adjusted, min_risk, max_risk))
+
+
+class OvernightGapModel:
+    """
+    Overnight gap risk management.
+
+    Before market close, assesses gap risk for each position and either:
+    - Exits positions with high gap risk (earnings, high VIX, low PnL)
+    - Tightens stops on remaining positions to reduce overnight exposure
+    """
+
+    PRE_CLOSE_MINUTES = 15  # Start managing 15 min before close (15:45 ET)
+
+    def __init__(self, earnings_guard=None):
+        """
+        Args:
+            earnings_guard: Optional object with a ``check_safe(ticker)`` method
+                that returns True if the ticker has no upcoming earnings risk.
+        """
+        self.earnings = earnings_guard
+        self._gap_stats = {}  # ticker -> (avg_gap_pct, gap_std)
+
+    def is_pre_close(self):
+        """True if within PRE_CLOSE_MINUTES of market close (16:00 ET)."""
+        try:
+            now = datetime.datetime.now(_ET)
+        except Exception:
+            now = datetime.datetime.now()
+        h, m = now.hour, now.minute
+        if now.weekday() >= 5:
+            return False
+        return (h == 15 and m >= (60 - self.PRE_CLOSE_MINUTES)) or h >= 16
+
+    def gap_risk_score(self, ticker, vix, pnl_r, has_earnings_tomorrow=False):
+        """
+        Compute overnight gap risk score (0-1).
+
+        Args:
+            ticker: Stock ticker symbol.
+            vix: Current VIX level.
+            pnl_r: Current position PnL in R-multiples.
+            has_earnings_tomorrow: Whether earnings are expected next day.
+
+        Returns:
+            Float 0-1. Higher = more risk. >= 0.55 suggests exit.
+        """
+        score = 0.0
+
+        # VIX component
+        if vix > 30:
+            score += 0.35
+        elif vix > 25:
+            score += 0.20
+        elif vix > 20:
+            score += 0.10
+
+        # Earnings component
+        if has_earnings_tomorrow:
+            score += 0.40
+
+        # PnL component: low/negative PnL = worse risk/reward overnight
+        if pnl_r < 0.3:
+            score += 0.20
+        elif pnl_r < 0.0:
+            score += 0.30
+
+        return min(1.0, score)
+
+    def should_exit_pre_close(self, ticker, vix, pnl_r):
+        """Returns True if position should be closed before market close."""
+        has_earnings = False
+        if self.earnings:
+            try:
+                has_earnings = not self.earnings.check_safe(ticker)
+            except Exception:
+                pass
+        risk = self.gap_risk_score(ticker, vix, pnl_r, has_earnings)
+        return risk >= 0.55
+
+    def pre_close_stop_tightening(self, side, entry, current_sl, atr, pnl_r):
+        """
+        Tighten stop for positions held overnight.
+
+        Args:
+            side: 'LONG' or 'SHORT'.
+            entry: Entry price.
+            current_sl: Current stop-loss price.
+            atr: Current ATR value.
+            pnl_r: Current PnL in R-multiples.
+
+        Returns:
+            New stop-loss price, or None if no change needed.
+        """
+        if pnl_r < 0.5:
+            return None  # Should be exited, not tightened
+
+        # Move stop to lock in at least 0.25R profit overnight
+        lock_level = 0.25
+        if side == 'LONG':
+            min_sl = entry + lock_level * abs(entry - current_sl)
+            return max(current_sl, min_sl)
+        else:
+            min_sl = entry - lock_level * abs(entry - current_sl)
+            return min(current_sl, min_sl)
+
+
+class SlippageCalculator:
+    """
+    Realistic execution cost model for trade simulation.
+
+    Models three components of slippage:
+    - Bid-ask spread cost (fixed per side)
+    - Market impact (proportional to order size relative to ADV)
+    - Commission (per-share, typically zero for retail)
+    """
+
+    def __init__(self, spread_pct=0.03, impact_pct=0.02, commission_per_share=0.0):
+        """
+        Args:
+            spread_pct: Bid-ask spread cost per side as percentage (default 0.03%).
+            impact_pct: Market impact estimate per side as percentage (default 0.02%).
+            commission_per_share: Per-share commission (default 0.0).
+        """
+        self.spread_pct = spread_pct / 100.0
+        self.impact_pct = impact_pct / 100.0
+        self.commission_per_share = commission_per_share
+
+    def one_way_cost(self, price, qty=1):
+        """
+        Compute one-way (entry or exit) execution cost in dollars.
+
+        Args:
+            price: Execution price per share.
+            qty: Number of shares.
+
+        Returns:
+            Total one-way cost in dollars.
+        """
+        spread_cost = price * self.spread_pct * qty
+        impact_cost = price * self.impact_pct * qty
+        commission = self.commission_per_share * qty
+        return spread_cost + impact_cost + commission
+
+    def round_trip_cost(self, price, qty=1):
+        """
+        Compute round-trip (entry + exit) execution cost in dollars.
+
+        Args:
+            price: Execution price per share.
+            qty: Number of shares.
+
+        Returns:
+            Total round-trip cost in dollars.
+        """
+        return 2 * self.one_way_cost(price, qty)
+
+    def round_trip_pct(self):
+        """Return round-trip cost as a decimal fraction of price."""
+        return 2 * (self.spread_pct + self.impact_pct)
+
+    def cost_in_r(self, entry_price, sl_distance):
+        """
+        Express round-trip cost as R-multiples for bracket trade sizing.
+
+        Args:
+            entry_price: Trade entry price.
+            sl_distance: Stop-loss distance in price units.
+
+        Returns:
+            Round-trip cost expressed in R-multiples.
+        """
+        if sl_distance <= 0:
+            return 0.0
+        cost_per_share = entry_price * self.round_trip_pct()
+        return cost_per_share / sl_distance

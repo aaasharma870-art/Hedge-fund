@@ -1,43 +1,49 @@
 # ==============================================================================
-# GOD MODE BACKTESTER V5: STATISTICALLY ROBUST GRID SEARCH
+# GOD MODE BACKTESTER V6: OPTUNA BAYESIAN + STATEFUL SIMULATION
 # ==============================================================================
-# V5 improvements over V4:
-#   1. 3-year backtest window (vs 1 year) for multi-regime coverage
-#   2. Walk-forward validation (rolling train/test, no single split)
-#   3. Monte Carlo significance test (shuffle labels 1000x)
-#   4. Per-ticker results breakdown (detect single-stock dependency)
-#   5. Advanced risk metrics (drawdown, Sharpe, Calmar, losing streaks)
-#   6. Feature importance pruning (auto-drop bottom 50%)
-#   7. Realistic execution costs (spread + commission + impact)
-#   8. Diversified universe (tech + healthcare + energy + financials)
+# V6 upgrades over V5:
+#   1. Optuna Bayesian optimization (replaces grid search)
+#   2. Stateful simulation with MonteCarloGovernor equity tracking
+#   3. Partial profit simulation (scale out 1/3 at 1.5R)
+#   4. Regime-specific logic (Hurst-based Trend vs MeanReversion)
+#   5. Dynamic Kelly criterion sizing from walk-forward stats
+#   6. SlippageCalculator for realistic execution cost model
+# Preserved from V5:
+#   - 3-year backtest window, walk-forward validation
+#   - Monte Carlo significance test, per-ticker breakdown
+#   - Feature importance pruning, diversified universe
 # ==============================================================================
 
-import os
 import sys
+import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 import subprocess
 import time
 import warnings
 import random
 import numpy as np
 import pandas as pd
-import json
 import requests
 import threading
-import concurrent.futures
 import datetime
 
 try:
     import xgboost as xgb
     from rich.console import Console
     from rich.table import Table
-    from scipy.stats import norm
+    import optuna
 except ImportError:
     print("Missing deps, running pip install...", flush=True)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', 'xgboost', 'rich', 'scipy'], check=True)
+    subprocess.run([sys.executable, '-m', 'pip', 'install',
+                    'xgboost', 'rich', 'scipy', 'optuna'], check=True)
     import xgboost as xgb
     from rich.console import Console
     from rich.table import Table
-    from scipy.stats import norm
+    import optuna
 
 from hedge_fund.indicators import ManualTA
 from hedge_fund.math_utils import get_kalman_filter, get_hurst
@@ -49,10 +55,12 @@ from hedge_fund.features import (
     calculate_amihud_illiquidity,
     calculate_liquidity_sweep,
 )
-from hedge_fund.objectives import profit_factor_objective
 from hedge_fund.data import RateLimiter
+from hedge_fund.governance import MonteCarloGovernor
+from hedge_fund.risk import kelly_criterion, SlippageCalculator
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ==============================================================================
 # CONFIGURATION
@@ -65,25 +73,23 @@ KEYS = {
 
 IO_WORKERS = 16
 
-# --- IMPROVEMENT #1: 3 years of data ---
-LOOKBACK_DAYS = 1095
+# --- Data window ---
+LOOKBACK_DAYS = 1095  # 3 years
 
-# --- IMPROVEMENT #2: Walk-forward settings ---
+# --- Walk-forward settings ---
 WF_TRAIN_BARS = 1500   # ~9 months of hourly bars for training
 WF_TEST_BARS = 500     # ~3 months of hourly bars for testing
 WF_STEP_BARS = 500     # step forward by 3 months each window
 
-# --- IMPROVEMENT #7: Execution cost model ---
-SPREAD_COST_PCT = 0.03      # bid-ask spread per side (0.03%)
-COMMISSION_PER_SHARE = 0.0  # most brokers are zero-commission
-MARKET_IMPACT_PCT = 0.02    # market impact estimate per side
-ROUND_TRIP_COST_PCT = 2 * (SPREAD_COST_PCT + MARKET_IMPACT_PCT) / 100  # total as decimal
+# --- Execution cost model (via SlippageCalculator) ---
+SLIPPAGE = SlippageCalculator(spread_pct=0.03, impact_pct=0.02)
+ROUND_TRIP_COST_PCT = SLIPPAGE.round_trip_pct()
 
-# --- IMPROVEMENT #8: Diversified universe ---
+# --- Diversified universe ---
 TICKERS = [
     # Tech / Growth
     'NVDA', 'PLTR', 'TSLA', 'AMD', 'MSFT', 'META',
-    # Small-cap momentum (original)
+    # Small-cap momentum
     'RKLB', 'ASTS',
     # Financials
     'JPM', 'GS',
@@ -97,24 +103,16 @@ TICKERS = [
     'AMZN', 'COST',
 ]
 
-# --- IMPROVEMENT #3: Monte Carlo settings ---
+# --- Monte Carlo settings ---
 MONTE_CARLO_RUNS = 1000
 
-# --- IMPROVEMENT #6: Feature pruning ---
+# --- Feature pruning ---
 PRUNE_FEATURES = True
-PRUNE_KEEP_RATIO = 0.5  # keep top 50% by importance
+PRUNE_KEEP_RATIO = 0.5
 
-GRID_SETTINGS = {
-    "PRED_THRESHOLD": [0.20, 0.30],
-    "SL_MULT": [1.5],
-    "RISK_REWARD": ["1:1.5", "1:2"],
-    "MAX_BARS": [8, 12],
-    "FILTER_MODE": ["STRICT", "MINIMAL"],
-    "TRAIL_MULT": [1.0, 1.5],
-    "HURST_LIMIT": [0.45, 0.55],
-    "ADX_MIN": [20, 25],
-    "DYNAMIC_SIZING": [True],
-}
+# --- Optuna settings ---
+OPTUNA_N_TRIALS = 60     # Bayesian optimization trials
+OPTUNA_TIMEOUT = None    # No time limit (set to seconds to cap)
 
 ta = ManualTA
 console = Console()
@@ -177,7 +175,7 @@ class Polygon_Helper:
                         print(f"   Polygon {t} status {r.status_code}")
                         url = None
                         break
-                except Exception as e:
+                except Exception:
                     retries += 1
                     time.sleep(3)
 
@@ -361,7 +359,7 @@ def compute_bracket_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=20, atr_col='A
 
 
 # ==============================================================================
-# IMPROVEMENT #2: WALK-FORWARD TRAIN + PREDICT
+# WALK-FORWARD TRAIN + PREDICT
 # ==============================================================================
 
 def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
@@ -409,7 +407,6 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
         )
         model.fit(train_df[active_features], train_df['Target'])
 
-        # Accumulate feature importance for pruning
         importance_accum[:len(active_features)] += model.feature_importances_
         window_count += 1
 
@@ -428,7 +425,7 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
     if not all_test_dfs:
         return None, features
 
-    # --- IMPROVEMENT #6: Feature pruning ---
+    # Feature pruning
     pruned_features = list(active_features)
     if prune and window_count > 0:
         avg_importance = importance_accum[:len(active_features)] / window_count
@@ -438,7 +435,6 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
         dropped = [f for f, _ in feat_imp[keep_n:]]
         if dropped:
             print(f"      [Pruned] Dropped {len(dropped)} weak features: {', '.join(dropped[:5])}...")
-            # Re-run walk-forward with pruned features for final predictions
             return _walk_forward_pruned(df, pruned_features, sl_mult, tp_mult, max_bars,
                                         train_bars, test_bars, step_bars), pruned_features
 
@@ -487,15 +483,22 @@ def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
 
 
 # ==============================================================================
-# TRADE SIMULATION (with execution costs)
+# V6: STATEFUL TRADE SIMULATION
 # ==============================================================================
 
-def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
-                    trail_mult=None, filter_mode="STRICT",
-                    hurst_limit=0.5, adx_min=0, dynamic_sizing=False,
-                    execution_cost_pct=ROUND_TRIP_COST_PCT):
+def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
+                             trail_mult=None, filter_mode="STRICT",
+                             hurst_limit=0.5, adx_min=0,
+                             scale_out_r=1.5, use_kelly=True,
+                             regime_hurst_filter=True):
     """
-    Simulate trades with institutional entry filters and execution costs.
+    V6 stateful trade simulation with:
+    - MonteCarloGovernor for equity-aware risk scaling
+    - Partial profit taking (scale out 1/3 at scale_out_r * R)
+    - Regime-specific logic (Hurst-based Trend vs MeanReversion)
+    - Dynamic Kelly criterion sizing
+    - SlippageCalculator execution costs
+
     Returns list of (outcome_r, is_resolved, position_size, ticker).
     """
     if test_df is None or len(test_df) == 0:
@@ -504,13 +507,22 @@ def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
     rr = tp_mult / sl_mult
     trades = []
 
+    # Stateful governor tracks simulated equity
+    governor = MonteCarloGovernor(dd_warning=0.05, dd_critical=0.08,
+                                  lookback_trades=50, update_interval=0)
+
+    # Running stats for Kelly
+    win_count = 0
+    loss_count = 0
+    total_win_r = 0.0
+    total_loss_r = 0.0
+
     close = test_df['Close'].values
     high = test_df['High'].values
     low = test_df['Low'].values
     atr_vals = test_df['ATR'].values
     hurst_vals = test_df['Hurst'].values
     adx_vals = test_df['ADX'].values
-    preds = test_df['Predictions'].values
     ticker = test_df.get('_ticker', pd.Series('UNK', index=test_df.index)).values
 
     i = 0
@@ -522,17 +534,40 @@ def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
             i += 1
             continue
 
+        # VPIN toxicity filter
         if row.get('VPIN', 0.0) > 0.85:
             i += 1
             continue
 
-        if filter_mode in ["STRICT", "MODERATE"] and row.get('Amihud_Illiquidity', 0.5) > 0.90:
+        # Amihud illiquidity filter
+        if filter_mode in ("STRICT", "MODERATE") and row.get('Amihud_Illiquidity', 0.5) > 0.90:
             i += 1
             continue
 
         side = 'LONG' if pred_r > 0 else 'SHORT'
+        hurst_val = hurst_vals[i]
 
-        if filter_mode in ["STRICT", "MODERATE"]:
+        # V6: Regime-specific filtering
+        if regime_hurst_filter:
+            if hurst_val > 0.6:
+                # Trending regime: only allow trend-following (momentum)
+                if side == 'LONG' and row.get('ROC_5', 0) < 0:
+                    i += 1
+                    continue
+                if side == 'SHORT' and row.get('ROC_5', 0) > 0:
+                    i += 1
+                    continue
+            elif hurst_val < 0.4:
+                # Mean-reverting regime: only allow mean-reversion
+                if side == 'LONG' and row.get('RSI', 50) > 60:
+                    i += 1
+                    continue
+                if side == 'SHORT' and row.get('RSI', 50) < 40:
+                    i += 1
+                    continue
+
+        # Standard filters
+        if filter_mode in ("STRICT", "MODERATE"):
             vwap_z = row.get('VWAP_ZScore', 0.0)
             if abs(vwap_z) > 2.5:
                 if vwap_z > 2.5 and side == 'LONG':
@@ -601,66 +636,158 @@ def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
             i += 1
             continue
 
-        outcome_str, exit_price = _simulate_exit(future_high, future_low, sl, tp, side, trail_dist)
+        # V6: Partial profit simulation (scale out 1/3 at scale_out_r)
+        partial_r = _simulate_with_partial(
+            future_high, future_low, close, idx, max_bars,
+            entry, sl, tp, sl_dist, side, trail_dist,
+            scale_out_r=scale_out_r, rr=rr
+        )
 
-        is_resolved = False
-        outcome = 0.0
+        outcome = partial_r['total_r']
+        is_resolved = partial_r['resolved']
+        bars_held = max_bars
 
-        if outcome_str == 'win':
-            outcome = rr
-            bars_held = max_bars
-            is_resolved = True
-        elif outcome_str == 'loss':
-            outcome = -1.0
-            bars_held = max_bars
-            is_resolved = True
-        elif outcome_str == 'trail_stop':
-            if side == 'LONG':
-                raw_pnl = exit_price - entry
-            else:
-                raw_pnl = entry - exit_price
-            outcome = raw_pnl / sl_dist if sl_dist > 0 else 0.0
-            bars_held = max_bars
-            is_resolved = True
-        else:
-            exit_idx = min(idx + max_bars, len(close) - 1)
-            exit_price_to = close[exit_idx]
-            raw = (exit_price_to - entry) if side == 'LONG' else (entry - exit_price_to)
-            outcome = raw / sl_dist if sl_dist > 0 else 0.0
-            bars_held = max_bars
-            is_resolved = False
+        # Deduct execution costs via SlippageCalculator
+        cost_r = SLIPPAGE.cost_in_r(entry, sl_dist)
+        outcome -= cost_r
 
-        # --- IMPROVEMENT #7: Deduct execution costs ---
-        cost_in_r = (execution_cost_pct * entry) / sl_dist if sl_dist > 0 else 0
-        outcome -= cost_in_r
-
-        # Dynamic sizing
+        # V6: Dynamic sizing via Kelly + Governor
         pos_size = 1.0
-        if dynamic_sizing:
-            pred_val = preds[idx]
-            diff = abs(pred_val) - pred_threshold
-            if diff > 0:
-                pos_size += (diff * 2.0)
-                pos_size = min(pos_size, 2.0)
+
+        if use_kelly and win_count + loss_count >= 20:
+            wr = win_count / (win_count + loss_count)
+            avg_w = total_win_r / win_count if win_count > 0 else rr
+            avg_l = total_loss_r / loss_count if loss_count > 0 else 1.0
+            kelly_frac = kelly_criterion(wr, avg_w, avg_l, shrinkage=0.35)
+            # Scale position: kelly_frac is 0.003-0.03, map to 0.5-2.0x sizing
+            pos_size = float(np.clip(kelly_frac / 0.015, 0.5, 2.0))
+
+        # Governor risk scaling
+        governor.apply_adjustments()
+        pos_size *= governor.get_risk_scalar()
 
         final_pnl = outcome * pos_size
         tick = ticker[idx] if idx < len(ticker) else 'UNK'
         trades.append((final_pnl, is_resolved, pos_size, tick))
+
+        # Update running stats
+        if outcome > 0:
+            win_count += 1
+            total_win_r += outcome
+        else:
+            loss_count += 1
+            total_loss_r += abs(outcome)
+
+        # Feed governor with simulated PnL
+        governor.add_trade(pnl=final_pnl, risk_dollars=1.0, side=side)
 
         i += max(bars_held, 2)
 
     return trades
 
 
+def _simulate_with_partial(future_high, future_low, close, idx, max_bars,
+                           entry, sl, tp, sl_dist, side, trail_dist,
+                           scale_out_r=1.5, rr=2.0):
+    """
+    Simulate bracket exit with partial profit taking.
+
+    Scale out 1/3 of position at scale_out_r (e.g. 1.5R), let remaining
+    2/3 ride to full TP or trail stop.
+    """
+    partial_tp_level = entry + (scale_out_r * sl_dist) if side == 'LONG' else entry - (scale_out_r * sl_dist)
+
+    # Check if partial TP is hit first
+    partial_hit = False
+    for j in range(len(future_high)):
+        h, l = future_high[j], future_low[j]
+        if side == 'LONG':
+            if l <= sl:
+                # Full stop loss before any partial
+                return {'total_r': -1.0, 'resolved': True}
+            if h >= partial_tp_level and not partial_hit:
+                partial_hit = True
+                break
+        else:
+            if h >= sl:
+                return {'total_r': -1.0, 'resolved': True}
+            if l <= partial_tp_level and not partial_hit:
+                partial_hit = True
+                break
+
+    if not partial_hit:
+        # No partial hit, simulate normally
+        outcome_str, exit_price = _simulate_exit(future_high, future_low, sl, tp, side, trail_dist)
+
+        if outcome_str == 'win':
+            return {'total_r': rr, 'resolved': True}
+        elif outcome_str == 'loss':
+            return {'total_r': -1.0, 'resolved': True}
+        elif outcome_str == 'trail_stop':
+            if side == 'LONG':
+                raw_pnl = exit_price - entry
+            else:
+                raw_pnl = entry - exit_price
+            r_val = raw_pnl / sl_dist if sl_dist > 0 else 0.0
+            return {'total_r': r_val, 'resolved': True}
+        else:
+            n = len(close)
+            exit_idx = min(idx + max_bars, n - 1)
+            exit_p = close[exit_idx]
+            raw = (exit_p - entry) if side == 'LONG' else (entry - exit_p)
+            r_val = raw / sl_dist if sl_dist > 0 else 0.0
+            return {'total_r': r_val, 'resolved': False}
+
+    # Partial hit: 1/3 locked at scale_out_r, 2/3 continues
+    partial_pnl = (1.0 / 3.0) * scale_out_r
+
+    # Move stop to breakeven for remaining 2/3
+    if side == 'LONG':
+        new_sl = entry  # breakeven
+    else:
+        new_sl = entry
+
+    # Simulate remaining 2/3 from partial hit point onward
+    remaining_high = future_high[j + 1:] if j + 1 < len(future_high) else np.array([])
+    remaining_low = future_low[j + 1:] if j + 1 < len(future_low) else np.array([])
+
+    if len(remaining_high) == 0:
+        # Partial was hit on last bar
+        return {'total_r': partial_pnl, 'resolved': True}
+
+    remaining_out, remaining_exit = _simulate_exit(
+        remaining_high, remaining_low, new_sl, tp, side, trail_dist
+    )
+
+    if remaining_out == 'win':
+        remaining_r = rr
+    elif remaining_out == 'loss':
+        # Stop at breakeven = 0R for remaining
+        remaining_r = 0.0
+    elif remaining_out == 'trail_stop':
+        if side == 'LONG':
+            raw = remaining_exit - entry
+        else:
+            raw = entry - remaining_exit
+        remaining_r = raw / sl_dist if sl_dist > 0 else 0.0
+    else:
+        n = len(close)
+        exit_idx = min(idx + max_bars, n - 1)
+        exit_p = close[exit_idx]
+        raw = (exit_p - entry) if side == 'LONG' else (entry - exit_p)
+        remaining_r = raw / sl_dist if sl_dist > 0 else 0.0
+
+    total_r = partial_pnl + (2.0 / 3.0) * remaining_r
+    resolved = remaining_out in ('win', 'loss', 'trail_stop')
+    return {'total_r': total_r, 'resolved': resolved}
+
+
 # ==============================================================================
-# IMPROVEMENT #5: ADVANCED RISK METRICS
+# RISK METRICS
 # ==============================================================================
 
 def compute_risk_metrics(trades):
-    """
-    Compute comprehensive risk metrics from a list of trade outcomes.
-    Returns dict with PF, WR, Sharpe, MaxDD, Calmar, longest losing streak, etc.
-    """
+    """Compute comprehensive risk metrics from trade outcomes."""
     if not trades:
         return _empty_metrics()
 
@@ -668,14 +795,12 @@ def compute_risk_metrics(trades):
     resolved = [t[0] for t in trades if t[1]]
     n_total = len(outcomes)
 
-    # --- Basic metrics ---
     wins = sum(1 for x in outcomes if x > 0)
     gross_win = sum(x for x in outcomes if x > 0)
     gross_loss = abs(sum(x for x in outcomes if x < 0))
     pf_raw = gross_win / gross_loss if gross_loss > 0 else 0
     wr_raw = wins / n_total if n_total > 0 else 0
 
-    # Resolved metrics
     if resolved:
         res_wins = sum(1 for x in resolved if x > 0)
         gross_win_res = sum(x for x in resolved if x > 0)
@@ -686,15 +811,11 @@ def compute_risk_metrics(trades):
         pf_res = 0
         wr_res = 0
 
-    # --- Equity curve ---
     equity = np.cumsum(outcomes)
-
-    # --- Max Drawdown ---
     peak = np.maximum.accumulate(equity)
     drawdowns = equity - peak
     max_dd = float(np.min(drawdowns)) if len(drawdowns) > 0 else 0
 
-    # --- Longest losing streak ---
     longest_loss = 0
     current_loss = 0
     for x in outcomes:
@@ -704,22 +825,18 @@ def compute_risk_metrics(trades):
         else:
             current_loss = 0
 
-    # --- Sharpe Ratio (annualized, assuming ~6.5 trades/day is wrong; use per-trade) ---
     if len(outcomes) > 1:
         mean_r = np.mean(outcomes)
         std_r = np.std(outcomes, ddof=1)
         sharpe_per_trade = mean_r / std_r if std_r > 0 else 0
-        # Annualize: assume ~250 trading days, ~2 trades/day avg
         trades_per_year = min(len(outcomes) * (252 * 6.5 / max(len(outcomes), 1)), 2000)
         sharpe_annual = sharpe_per_trade * np.sqrt(trades_per_year)
     else:
         sharpe_annual = 0
 
-    # --- Calmar Ratio (total return / max drawdown) ---
     total_return = equity[-1] if len(equity) > 0 else 0
     calmar = total_return / abs(max_dd) if max_dd != 0 else 0
 
-    # --- Average win / average loss ---
     avg_win = gross_win / wins if wins > 0 else 0
     avg_loss = gross_loss / (n_total - wins) if (n_total - wins) > 0 else 0
     payoff_ratio = avg_win / avg_loss if avg_loss > 0 else 0
@@ -749,10 +866,6 @@ def _empty_metrics():
     }
 
 
-# ==============================================================================
-# IMPROVEMENT #4: PER-TICKER BREAKDOWN
-# ==============================================================================
-
 def per_ticker_breakdown(trades):
     """Group trades by ticker and compute metrics for each."""
     by_ticker = {}
@@ -768,17 +881,13 @@ def per_ticker_breakdown(trades):
     return breakdown
 
 
-# ==============================================================================
-# IMPROVEMENT #3: MONTE CARLO SIGNIFICANCE TEST
-# ==============================================================================
-
 def monte_carlo_test(trades, observed_pf, n_simulations=MONTE_CARLO_RUNS):
     """
     Shuffle trade outcomes and re-compute PF to test significance.
     Returns p-value (fraction of shuffled runs that beat observed PF).
     """
     if len(trades) < 10:
-        return 1.0  # not enough data
+        return 1.0
 
     outcomes = [t[0] for t in trades]
     beat_count = 0
@@ -786,7 +895,6 @@ def monte_carlo_test(trades, observed_pf, n_simulations=MONTE_CARLO_RUNS):
     for _ in range(n_simulations):
         shuffled = list(outcomes)
         random.shuffle(shuffled)
-        # Randomly flip signs to destroy any directional signal
         shuffled = [x * random.choice([1, -1]) for x in shuffled]
 
         gross_win = sum(x for x in shuffled if x > 0)
@@ -800,15 +908,77 @@ def monte_carlo_test(trades, observed_pf, n_simulations=MONTE_CARLO_RUNS):
 
 
 # ==============================================================================
+# V6: OPTUNA OBJECTIVE
+# ==============================================================================
+
+def create_optuna_objective(predictions_cache):
+    """
+    Create an Optuna objective function that evaluates parameter combinations
+    using the pre-computed walk-forward predictions cache.
+    """
+    def objective(trial):
+        # Bayesian search space
+        pred_threshold = trial.suggest_float("pred_threshold", 0.10, 0.40)
+        sl_mult = trial.suggest_float("sl_mult", 1.0, 2.5, step=0.25)
+        tp_rr = trial.suggest_float("tp_rr", 1.5, 3.5, step=0.5)
+        tp_mult = sl_mult * tp_rr
+        max_bars = trial.suggest_int("max_bars", 6, 16, step=2)
+        trail_mult = trial.suggest_float("trail_mult", 0.5, 2.0, step=0.25)
+        hurst_limit = trial.suggest_float("hurst_limit", 0.35, 0.65, step=0.05)
+        adx_min = trial.suggest_int("adx_min", 15, 30, step=5)
+        filter_mode = trial.suggest_categorical("filter_mode", ["STRICT", "MODERATE", "MINIMAL"])
+        scale_out_r = trial.suggest_float("scale_out_r", 1.0, 2.0, step=0.25)
+        regime_hurst = trial.suggest_categorical("regime_hurst_filter", [True, False])
+
+        all_trades = []
+        for t, test_df in predictions_cache.items():
+            t_results = simulate_trades_stateful(
+                test_df, pred_threshold, sl_mult, tp_mult, max_bars,
+                trail_mult=trail_mult, filter_mode=filter_mode,
+                hurst_limit=hurst_limit, adx_min=adx_min,
+                scale_out_r=scale_out_r, use_kelly=True,
+                regime_hurst_filter=regime_hurst,
+            )
+            all_trades.extend(t_results)
+
+        if len(all_trades) < 15:
+            return 0.0  # Not enough trades
+
+        metrics = compute_risk_metrics(all_trades)
+
+        # Multi-objective scoring: PF * WR * sqrt(Trades) / (1 + |MaxDD|)
+        # Penalize low trade count and deep drawdowns
+        pf = metrics['PF_Res']
+        wr = metrics['WR_Res']
+        n = metrics['Trades']
+        dd = abs(metrics['MaxDD_R'])
+
+        if pf < 1.0 or wr < 0.40:
+            return 0.0
+
+        score = pf * wr * np.sqrt(n) / (1.0 + dd)
+
+        # Store metrics for later retrieval
+        trial.set_user_attr("metrics", metrics)
+        trial.set_user_attr("trades", all_trades)
+        trial.set_user_attr("tp_mult", tp_mult)
+
+        return score
+
+    return objective
+
+
+# ==============================================================================
 # MAIN
 # ==============================================================================
 
 def main():
-    console.print("[bold green]GOD MODE BACKTESTER V5 (STATISTICALLY ROBUST)[/bold green]")
+    console.print("[bold green]GOD MODE BACKTESTER V6 (OPTUNA BAYESIAN + STATEFUL SIM)[/bold green]")
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
     console.print(f"[dim]Feature pruning: {'ON (keep top '+str(int(PRUNE_KEEP_RATIO*100))+'%)' if PRUNE_FEATURES else 'OFF'}[/dim]")
-    console.print(f"[dim]Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]\n")
+    console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
+    console.print(f"[dim]V6 features: Partial profits, regime logic, Kelly sizing, MC Governor[/dim]\n")
 
     # ── 1. Download & Prep ──
     poly = Polygon_Helper()
@@ -832,89 +1002,76 @@ def main():
         print("No data available. Set POLYGON_API_KEY env var.")
         return
 
-    # ── 2. Grid Search with Walk-Forward ──
+    # ── 2. Walk-Forward Training (once, shared across Optuna trials) ──
+    print("\nRunning walk-forward training (shared across all Optuna trials)...")
+    # Use middle-of-range SL/TP for training labels (Optuna varies filters, not labels)
+    base_sl = 1.5
+    base_tp = 3.0
+    base_mb = 10
+
+    predictions_cache = {}
+    for t, df in data_cache.items():
+        wf_result, pruned_feats = walk_forward_train_predict(
+            df, ALL_FEATURES, base_sl, base_tp, base_mb)
+        if wf_result is not None:
+            predictions_cache[t] = wf_result
+            print(f"   {t}: {len(wf_result)} test predictions generated")
+
+    if not predictions_cache:
+        print("Walk-forward produced no predictions. Check data quality.")
+        return
+
+    # ── 3. Optuna Bayesian Optimization ──
+    print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials)...")
+
+    study = optuna.create_study(direction="maximize",
+                                 study_name="backtester_v6",
+                                 sampler=optuna.samplers.TPESampler(seed=42))
+
+    objective = create_optuna_objective(predictions_cache)
+    study.optimize(objective, n_trials=OPTUNA_N_TRIALS, timeout=OPTUNA_TIMEOUT,
+                   show_progress_bar=True)
+
+    # ── 4. Collect results from all trials ──
     results = []
-    n_combos = (len(GRID_SETTINGS["SL_MULT"]) * len(GRID_SETTINGS["RISK_REWARD"]) *
-                len(GRID_SETTINGS["MAX_BARS"]) * len(GRID_SETTINGS["PRED_THRESHOLD"]) *
-                len(GRID_SETTINGS["FILTER_MODE"]) * len(GRID_SETTINGS["TRAIL_MULT"]) *
-                len(GRID_SETTINGS["HURST_LIMIT"]) * len(GRID_SETTINGS["ADX_MIN"]))
-    print(f"\nGrid Search: {n_combos} parameter combinations\n")
-    ctr = 0
+    for trial in study.trials:
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        if trial.value is None or trial.value <= 0:
+            continue
 
-    for sl_m in GRID_SETTINGS["SL_MULT"]:
-        for rr_str in GRID_SETTINGS["RISK_REWARD"]:
-            reward_ratio = float(rr_str.split(":")[1])
-            tp_m = sl_m * reward_ratio
-
-            for mb in GRID_SETTINGS["MAX_BARS"]:
-                print(f"   Walk-Forward Training: SL={sl_m} TP={tp_m:.1f} ({rr_str}) MB={mb}...",
-                      flush=True)
-
-                # Walk-forward per ticker
-                predictions_cache = {}
-                pruned_features_cache = {}
-                for t, df in data_cache.items():
-                    wf_result, pruned_feats = walk_forward_train_predict(
-                        df, ALL_FEATURES, sl_m, tp_m, mb)
-                    if wf_result is not None:
-                        predictions_cache[t] = wf_result
-                        pruned_features_cache[t] = pruned_feats
-
-                if not predictions_cache:
-                    continue
-
-                # Sweep filters
-                for thresh in GRID_SETTINGS["PRED_THRESHOLD"]:
-                    for fmode in GRID_SETTINGS["FILTER_MODE"]:
-                        for trail in GRID_SETTINGS["TRAIL_MULT"]:
-                            for h_lim in GRID_SETTINGS["HURST_LIMIT"]:
-                                for adx_m in GRID_SETTINGS["ADX_MIN"]:
-                                    ctr += 1
-                                    all_trades = []
-
-                                    for t, test_df in predictions_cache.items():
-                                        t_results = simulate_trades(
-                                            test_df, thresh, sl_m, tp_m, mb,
-                                            trail_mult=trail, filter_mode=fmode,
-                                            hurst_limit=h_lim, adx_min=adx_m,
-                                            dynamic_sizing=True)
-                                        all_trades.extend(t_results)
-
-                                    if len(all_trades) < 10:
-                                        continue
-
-                                    metrics = compute_risk_metrics(all_trades)
-
-                                    if ctr % 50 == 0 or (metrics['PF_Res'] > 1.3 and metrics['WR_Res'] > 0.45):
-                                        print(f"   [{ctr}/{n_combos}] {rr_str} T={thresh} "
-                                              f"H<{h_lim} ADX>{adx_m} {fmode} -> "
-                                              f"PF={metrics['PF_Res']:.2f} WR={metrics['WR_Res']:.1%} "
-                                              f"DD={metrics['MaxDD_R']:.1f}R "
-                                              f"N={metrics['Trades']}", flush=True)
-
-                                    result = {
-                                        "SL": sl_m, "R:R": rr_str, "MB": mb,
-                                        "Thresh": thresh, "Mode": fmode,
-                                        "Trail": str(trail), "Hurst": str(h_lim),
-                                        "ADX": str(adx_m),
-                                        **metrics,
-                                        "_trades": all_trades,
-                                    }
-                                    results.append(result)
+        metrics = trial.user_attrs.get("metrics", _empty_metrics())
+        all_trades = trial.user_attrs.get("trades", [])
+        result = {
+            "SL": trial.params.get("sl_mult", 1.5),
+            "R:R": f"1:{trial.params.get('tp_rr', 2.0):.1f}",
+            "MB": trial.params.get("max_bars", 10),
+            "Thresh": round(trial.params.get("pred_threshold", 0.2), 2),
+            "Mode": trial.params.get("filter_mode", "STRICT"),
+            "Trail": str(trial.params.get("trail_mult", 1.0)),
+            "Hurst": str(trial.params.get("hurst_limit", 0.5)),
+            "ADX": str(trial.params.get("adx_min", 20)),
+            "ScaleOut": str(trial.params.get("scale_out_r", 1.5)),
+            "Regime": str(trial.params.get("regime_hurst_filter", True)),
+            **metrics,
+            "_trades": all_trades,
+            "_score": trial.value,
+        }
+        results.append(result)
 
     if not results:
         console.print("[red]No results. Check data and parameters.[/red]")
         return
 
-    # ── 3. Sort and display top results ──
-    results.sort(key=lambda x: x['PF_Res'], reverse=True)
+    results.sort(key=lambda x: x['_score'], reverse=True)
 
-    print("\n" + "=" * 100)
-    print("FINAL RESULTS (SORTED BY RESOLVED PF) - WITH RISK METRICS")
-    print("=" * 100)
+    # ── 5. Display top results ──
+    print("\n" + "=" * 110)
+    print("FINAL RESULTS (SORTED BY COMPOSITE SCORE) - V6 STATEFUL SIMULATION")
+    print("=" * 110)
 
     table = Table(show_header=True, header_style="bold magenta",
-                  title=f"Top 20 Configs ({len(TICKERS)} tickers, {LOOKBACK_DAYS}d, walk-forward)")
+                  title=f"Top 20 Configs ({len(TICKERS)} tickers, {LOOKBACK_DAYS}d, walk-forward, Optuna)")
     table.add_column("SL")
     table.add_column("R:R")
     table.add_column("MB")
@@ -964,12 +1121,13 @@ def main():
 
     console.print(table)
 
-    # ── 4. Best config deep-dive ──
+    # ── 6. Best config deep-dive ──
     if best_config:
         console.print(f"\n[bold green]BEST CONFIG:[/bold green]")
         console.print(f"   SL_MULT={best_config['SL']}, R:R={best_config['R:R']}, MAX_BARS={best_config['MB']}")
         console.print(f"   THRESHOLD={best_config['Thresh']}, MODE={best_config['Mode']}, TRAIL={best_config['Trail']}")
         console.print(f"   HURST<{best_config['Hurst']}, ADX>{best_config['ADX']}")
+        console.print(f"   ScaleOut={best_config['ScaleOut']}, Regime={best_config['Regime']}")
         console.print(f"   PF={best_config['PF_Res']:.2f} | WR={best_config['WR_Res']:.1%} | "
                        f"Sharpe={best_config['Sharpe']:.2f} | MaxDD={best_config['MaxDD_R']:.1f}R | "
                        f"Calmar={best_config['Calmar']:.1f}")
@@ -978,7 +1136,7 @@ def main():
                        f"Avg Loss: {best_config['AvgLoss_R']:.2f}R | "
                        f"Payoff: {best_config['PayoffRatio']:.2f}")
 
-        # ── IMPROVEMENT #4: Per-ticker breakdown ──
+        # Per-ticker breakdown
         console.print(f"\n[bold cyan]PER-TICKER BREAKDOWN:[/bold cyan]")
         ticker_table = Table(show_header=True, header_style="bold cyan")
         ticker_table.add_column("Ticker")
@@ -1023,7 +1181,7 @@ def main():
             console.print("[yellow]   WARNING: Edge concentrated in <50% of tickers. "
                           "Strategy may be ticker-dependent, not systematic.[/yellow]")
 
-        # ── IMPROVEMENT #3: Monte Carlo significance ──
+        # Monte Carlo significance
         console.print(f"\n[bold yellow]MONTE CARLO SIGNIFICANCE TEST ({MONTE_CARLO_RUNS} shuffles):[/bold yellow]")
         p_value = monte_carlo_test(best_config['_trades'], best_config['PF_Res'])
 
@@ -1044,13 +1202,16 @@ def main():
         console.print("\n[yellow]No config passed minimum thresholds. "
                       "Consider loosening filters or extending data.[/yellow]")
 
-    # ── 5. Summary warnings ──
+    # ── 7. Summary ──
     console.print(f"\n[dim]{'='*60}[/dim]")
     console.print("[dim]NOTES:[/dim]")
     console.print(f"[dim]  - Execution cost deducted: {ROUND_TRIP_COST_PCT*100:.2f}% per round trip[/dim]")
     console.print(f"[dim]  - Walk-forward windows: train={WF_TRAIN_BARS} test={WF_TEST_BARS} step={WF_STEP_BARS}[/dim]")
     if PRUNE_FEATURES:
         console.print(f"[dim]  - Features auto-pruned to top {int(PRUNE_KEEP_RATIO*100)}% by importance[/dim]")
+    console.print(f"[dim]  - Optuna trials: {OPTUNA_N_TRIALS} (TPE Bayesian sampler)[/dim]")
+    console.print(f"[dim]  - V6: Partial profits at scale-out, regime-aware filters, Kelly sizing[/dim]")
+    console.print(f"[dim]  - V6: MonteCarloGovernor risk scaling (DD-adaptive)[/dim]")
     console.print(f"[dim]  - Universe: {', '.join(TICKERS)}[/dim]")
     console.print(f"[dim]  - All metrics include unrealized timeout trades[/dim]")
 

@@ -2,8 +2,9 @@
 hedge_fund - Quantitative algorithmic trading system.
 
 Provides shared modules for indicators, math utilities, simulation,
-feature engineering, risk management, and data helpers used by both
-the backtester and the live trading bot.
+feature engineering, risk management, portfolio optimization,
+governance, analysis, and data helpers used by both the backtester
+and the live trading bot.
 """
 
 from hedge_fund.indicators import ManualTA
@@ -16,10 +17,19 @@ from hedge_fund.features import (
     calculate_amihud_illiquidity,
     calculate_real_relative_strength,
     calculate_liquidity_sweep,
+    CrossSectionalRanker,
 )
-from hedge_fund.risk import calculate_position_size, kelly_criterion
+from hedge_fund.risk import (
+    calculate_position_size,
+    kelly_criterion,
+    OvernightGapModel,
+    SlippageCalculator,
+)
 from hedge_fund.data import RateLimiter
 from hedge_fund.objectives import profit_factor_objective, asymmetric_loss_objective
+from hedge_fund.optimization import PortfolioOptimizer
+from hedge_fund.governance import MonteCarloGovernor
+from hedge_fund.analysis import run_attribution_analysis
 
 __all__ = [
     "ManualTA",
@@ -33,9 +43,15 @@ __all__ = [
     "calculate_amihud_illiquidity",
     "calculate_real_relative_strength",
     "calculate_liquidity_sweep",
+    "CrossSectionalRanker",
     "calculate_position_size",
     "kelly_criterion",
+    "OvernightGapModel",
+    "SlippageCalculator",
     "RateLimiter",
     "profit_factor_objective",
     "asymmetric_loss_objective",
+    "PortfolioOptimizer",
+    "MonteCarloGovernor",
+    "run_attribution_analysis",
 ]

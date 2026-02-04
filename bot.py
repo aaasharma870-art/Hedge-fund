@@ -1,18 +1,13 @@
 # ==============================================================================
-# GOD MODE HEDGE FUND MONITOR (v14.2 - PRODUCTION)
-# "Multi-Signal Scanner with XGBoost and ATR-Bracket Trades"
+# GOD MODE HEDGE FUND MONITOR (v14.3 - PRODUCTION)
+# "Hybrid God Mode: Specialist + Grinder"
 #
-# CRITICAL FIXES APPLIED:
-#   1. Risk-based sizing (qty = risk / stop_distance)
-#   2. Pending order tracking (no phantom positions)
-#   3. Equity refresh every loop (no stale sizing)
-#   4. High/Low hit detection (not close-only)
-#   5. Datetime walk-forward split with embargo
-#   6. 15-min training bars (not 1-min)
-#   7. Market orders for paper trading
-#   8. Daily ATR for risk sizing
-#   9. Exception handling with logging
-#  10. Rule-based regime detection
+# CRITICAL UPGRADES (v14.3):
+#   1. "One Brain" Architecture: Imports core logic from hedge_fund/ package
+#   2. Hybrid Strategy: TIER_1 (Specialist) and TIER_2 (Grinder) execution
+#   3. Monte Carlo Governor: Dynamic risk scaling based on equity drawdown
+#   4. Portfolio Optimizer: Mean-Variance allocation with Beta constraints
+#   5. Attribution Analysis: ML-driven pattern recognition for trades
 # ==============================================================================
 
 # --- COLAB SETUP ---
@@ -108,11 +103,25 @@ except ImportError:
 except SystemExit as e:
     print(str(e))
 
+import sys
+import os
+# Fix Windows Unicode Encode Error
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding='utf-8')
+
+# Load environment variables
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ Environment variables loaded from .env")
+except ImportError:
+    print("⚠️ python-dotenv not installed. Using system environment variables.")
+
 print("\n" + "="*60)
 print("🚀 LAUNCHING HEDGE FUND MONITOR...")
 print("="*60 + "\n")
 
-import sys, os, threading, time, json, sqlite3, logging, warnings, gc, math, traceback, random
+import threading, time, json, sqlite3, logging, warnings, gc, math, traceback, random
 import datetime
 from datetime import timedelta, timezone
 import concurrent.futures, requests
@@ -125,10 +134,8 @@ import joblib
 
 # Scientific / ML
 from scipy.stats import beta, norm
-from scipy.optimize import minimize
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.linear_model import LogisticRegression, Ridge
-from sklearn.tree import DecisionTreeRegressor, export_text, _tree
 from xgboost import XGBRegressor
 try:
     import lightgbm as lgb
@@ -150,6 +157,13 @@ except ImportError:
 import alpaca_trade_api as tradeapi
 import yfinance as yf
 from logging.handlers import RotatingFileHandler
+
+# --- "ONE BRAIN" IMPORTS ---
+from hedge_fund.risk import MonteCarloGovernor, OvernightGapModel, SlippageCalculator
+from hedge_fund.optimization import PortfolioOptimizer
+from hedge_fund.governance import MonteCarloGovernor # Prefer the dedicated module
+from hedge_fund.analysis import run_attribution_analysis
+from hedge_fund.features import CrossSectionalRanker
 
 # Optional UI
 try:
@@ -233,302 +247,15 @@ logging.info(f"🔥 HARDWARE: {NUM_CORES} CS | {IO_WORKERS} I/O Workers | Optimi
 
 
 # ==============================================================================
-# EMBEDDED MODULES (Consolidated v14.3)
+# SHARED MODULES (from hedge_fund package)
 # ==============================================================================
 
-# --- MONTE CARLO GOVERNOR ---
-"""Monte Carlo Risk Governor"""
+from hedge_fund.governance import MonteCarloGovernor
+from hedge_fund.optimization import PortfolioOptimizer
+from hedge_fund.features import CrossSectionalRanker
+from hedge_fund.risk import OvernightGapModel, SlippageCalculator
+from hedge_fund.analysis import run_attribution_analysis as _run_attribution
 
-class MonteCarloGovernor:
-    def __init__(self, settings):
-        self.settings = settings
-        self.trade_history = deque(maxlen=500)
-        self.risk_scalar = 1.0
-        self.last_update = None
-        self.in_drawdown = False
-        self.DD_WARNING = 0.05
-        self.DD_CRITICAL = 0.08
-        self.LOOKBACK_TRADES = 50
-        logging.info("🎲 Monte Carlo Governor initialized")
-
-    def add_trade(self, pnl, risk_dollars, side='LONG', timestamp=None):
-        if timestamp is None:
-            timestamp = datetime.datetime.now()
-        r_multiple = pnl / risk_dollars if risk_dollars > 0 else 0
-        self.trade_history.append({'timestamp': timestamp, 'pnl': pnl, 'risk': risk_dollars, 'r_multiple': r_multiple, 'side': side})
-
-    def apply_adjustments(self):
-        if len(self.trade_history) < 20:
-            self.risk_scalar = 1.0
-            return
-        if self.last_update and (datetime.datetime.now() - self.last_update).total_seconds() < 300:
-            return
-        try:
-            recent = list(self.trade_history)[-self.LOOKBACK_TRADES:]
-            equity_curve = self._calculate_equity_curve(recent)
-            peak = max(equity_curve)
-            current = equity_curve[-1]
-            drawdown = (peak - current) / peak if peak > 0 else 0
-            if drawdown >= self.DD_CRITICAL:
-                self.risk_scalar = 0.5
-            elif drawdown >= self.DD_WARNING:
-                self.risk_scalar = 0.75
-            else:
-                self.risk_scalar = 1.0
-            self.last_update = datetime.datetime.now()
-        except Exception as e:
-            logging.error(f"🎲 MC error: {e}")
-            self.risk_scalar = 1.0
-
-    def _calculate_equity_curve(self, trades):
-        curve = [0]
-        cumulative = 0
-        for t in trades:
-            cumulative += t['pnl']
-            curve.append(cumulative)
-        return curve
-
-    def get_risk_scalar(self):
-        return self.risk_scalar
-
-# --- PORTFOLIO OPTIMIZER ---
-
-
-class PortfolioOptimizer:
-    """
-    Institutional-Grade Mean-Variance Optimizer.
-
-    Goal: Find the optimal weights (w) that maximize:
-    UTILITY = Expected_Return - (Risk_Aversion * Portfolio_Variance)
-
-    "Aggressive but Safe":
-    - We maximize Sharpe Ratio (Return / Risk).
-    - We penalize correlation risk (Variance).
-    - But we ALLOW high volatility if the expected return is high enough.
-    """
-
-    def __init__(self, risk_free_rate=0.04, target_vol=0.25):
-        self.risk_free_rate = risk_free_rate
-        # Target Volatility (Annualized). 0.25 = 25% (Aggressive).
-        # SPY is usually ~15%. 25% allow for "Hedge Fund" level risk.
-        self.target_vol = target_vol
-
-    def get_optimal_weights(self, candidates, lookback_prices_df, market_ticker='SPY'):
-        """
-        candidates: List of dicts [{'symbol': 'NVDA', 'predicted_r': 2.5}, ...]
-        lookback_prices_df: DataFrame of historical CLOSE prices (index=datetime, cols=symbols)
-        """
-        if not candidates or lookback_prices_df.empty:
-            return {}
-
-        symbols = [c['symbol'] for c in candidates]
-
-        # 1. Expected Returns (Alpha Vector)
-        alpha_vector = np.array([c.get('ev', 0.0) for c in candidates])
-
-        # 2. Daily Returns & Covariance
-        returns_df = lookback_prices_df.pct_change().dropna()
-
-        if len(returns_df) < 20:
-             logging.warning("⚠️ Not enough history. Using equal weights.")
-             return {s: 1.0/len(symbols) for s in symbols}
-
-        # Extract subset for candidates
-        # Note: lookback_prices_df should include candidates + SPY
-        try:
-             cand_returns = returns_df[symbols]
-             # FIX: Ledoit-Wolf shrinkage for stable covariance with limited data
-             # Sample cov is noisy with ~20-30 data points; shrinkage regularizes it
-             try:
-                 from sklearn.covariance import LedoitWolf
-                 lw = LedoitWolf().fit(cand_returns.dropna())
-                 cov_matrix = pd.DataFrame(
-                     lw.covariance_ * 252, index=symbols, columns=symbols
-                 )
-                 logging.debug(f"📊 LW shrinkage coef: {lw.shrinkage_:.3f}")
-             except Exception:
-                 cov_matrix = cand_returns.cov() * 252
-        except KeyError as e:
-             logging.error(f"Missing data for symbols: {e}")
-             return {s: 1.0/len(symbols) for s in symbols}
-
-        # 3. Calculate Betas (Sensitivity to Market)
-        betas = np.ones(len(symbols))
-        if market_ticker in returns_df.columns:
-            market_ret = returns_df[market_ticker]
-            market_var = market_ret.var()
-            if market_var > 1e-6:
-                for i, sym in enumerate(symbols):
-                    # Beta = Cov(Stock, Mkt) / Var(Mkt)
-                    cov_sm = cand_returns[sym].cov(market_ret)
-                    betas[i] = cov_sm / market_var
-
-        # 4. Optimization
-        num_assets = len(symbols)
-        initial_weights = np.ones(num_assets) / num_assets
-        bounds = tuple((0.0, 0.40) for _ in range(num_assets))
-
-        # Constraints
-        # A. Fully Invested
-        cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}]
-
-        # B. Beta Constraint (Market Neutrality / Crash Proofing)
-        # "Aggressive" funds might allow Beta up to 1.5, "Neutral" funds want 0.0.
-        # We set a cap: Portfolio Beta <= 0.8 (Defensive bias even if aggressive stocks)
-        # OR: Beta strictly between -0.5 and 1.2
-        def beta_constraint(x):
-            port_beta = np.sum(x * betas)
-            # Valid if Beta <= 0.90 (Slightly less than market risk)
-            return 0.90 - port_beta
-
-        cons.append({'type': 'ineq', 'fun': beta_constraint})
-
-        # Objective: Maximize Sharpe
-        def negative_sharpe(weights):
-            port_return = np.sum(weights * alpha_vector)
-            port_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
-            sharpe = port_return / (port_vol + 1e-6)
-            return -sharpe
-
-        try:
-            result = minimize(
-                negative_sharpe,
-                initial_weights,
-                method='SLSQP',
-                bounds=bounds,
-                constraints=cons
-            )
-
-            if not result.success:
-                # If constrained optimization fails (e.g. impossible to get Beta < 0.9),
-                # Fallback to Unconstrained Sharpe Optimization
-                logging.debug("Constraint check failed, retrying without Beta cap...")
-                result = minimize(
-                    negative_sharpe,
-                    initial_weights,
-                    method='SLSQP',
-                    bounds=bounds,
-                    constraints=[cons[0]] # Only sum=1
-                )
-
-            optimal_weights = result.x
-            optimal_weights[optimal_weights < 0.01] = 0.0
-            if np.sum(optimal_weights) > 0:
-                optimal_weights /= np.sum(optimal_weights)
-
-            # Log the resulting Portfolio Beta
-            final_beta = np.sum(optimal_weights * betas)
-            logging.info(f"📊 Quant Portfolio Optimized: Est. Beta = {final_beta:.2f}")
-
-            return {sym: w for sym, w in zip(symbols, optimal_weights)}
-
-        except Exception as e:
-            logging.error(f"Optimizer breakdown: {e}")
-            return {s: 1.0/len(symbols) for s in symbols}
-
-    def calculate_allocation(self, total_equity, optimal_weights, max_leverage=1.5):
-        """
-        Convert weights to dollar allocations, applying global leverage
-        max_leverage=1.5 means we can go 150% long (aggressive)
-        """
-        allocations = {}
-        for sym, w in optimal_weights.items():
-            if w > 0:
-                allocations[sym] = total_equity * w * max_leverage
-        return allocations
-
-# --- ATTRIBUTION ANALYZER ---
-def run_attribution_analysis():
-
-
-    # Setup
-    DB_PATH = "c:/Users/aaash/.gemini/antigravity/scratch/data/db/godmode.db" # Adjusted for user path
-    if not os.path.exists(DB_PATH):
-        # Try relative
-        DB_PATH = "./data/db/godmode.db"
-
-    logging.basicConfig(level=logging.INFO, format='%(message)s')
-
-    def get_rules(tree, feature_names, class_names):
-        tree_ = tree.tree_
-        feature_name = [
-            feature_names[i] if i != _tree.TREE_UNDEFINED else "undefined!"
-            for i in tree_.feature
-        ]
-
-        paths = []
-
-        def recurse(node, path, names):
-            if tree_.feature[node] != _tree.TREE_UNDEFINED:
-                name = feature_name[node]
-                threshold = tree_.threshold[node]
-                p1, n1 = path + [f"{name} <= {threshold:.2f}"], names + [name]
-                recurse(tree_.children_left[node], p1, n1)
-                p2, n2 = path + [f"{name} > {threshold:.2f}"], names + [name]
-                recurse(tree_.children_right[node], p2, n2)
-            else:
-                value = tree_.value[node][0][0]
-                paths.append((value, path))
-
-        recurse(0, [], [])
-        return sorted(paths, key=lambda x: x[0], reverse=True)
-
-    def analyze_attribution():
-        print("🧠 QUANT ATTRIBUTION ANALYSIS")
-        print("="*40)
-
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            df = pd.read_sql("SELECT * FROM trade_outcomes ORDER BY ts DESC LIMIT 1000", conn)
-            conn.close()
-        except Exception as e:
-            print(f"❌ DB connection failed: {e}")
-            return
-
-        if df.empty:
-            print("⚠️ No trade history found yet. Run the bot to generate data.")
-            return
-
-        print(f"📊 Analyzing {len(df)} past trades...")
-
-        # Target: Realized PnL (R-value)
-        # If pnl_r is missing, calc it
-        if 'pnl_r' not in df.columns:
-            df['pnl_r'] = df['pnl'] / df['entry_price'] # Rough approx if size unknown
-
-        # Features to Analyze
-        ignore_cols = ['id', 'symbol', 'side', 'entry_price', 'exit_price', 'pnl', 'pnl_r', 'outcome', 'ts', 'reason']
-        feature_cols = [c for c in df.columns if c not in ignore_cols and pd.api.types.is_numeric_dtype(df[c])]
-
-        df_clean = df.dropna(subset=feature_cols + ['pnl_r'])
-
-        if len(df_clean) < 10:
-            print("⚠️ Not enough data points for ML analysis (need > 10).")
-            return
-
-        # Train Interpretable Model (Decision Tree)
-        # We want to find "What rules lead to high PnL?"
-        dt = DecisionTreeRegressor(max_depth=3, min_samples_leaf=5)
-        X = df_clean[feature_cols]
-        y = df_clean['pnl_r']
-
-        dt.fit(X, y)
-
-        # Extract Best Rules
-        rules = get_rules(dt, feature_cols, None)
-
-        print("\n🏆 WINNING PATTERNS (Where PnL is highest):")
-        for val, rule_path in rules[:3]:
-            print(f"   💰 Avg Return: {val:.2f}R | Condition: {' AND '.join(rule_path)}")
-
-        print("\n💀 LOSING PATTERNS (Where PnL is lowest):")
-        for val, rule_path in rules[-3:]:
-            print(f"   💸 Avg Return: {val:.2f}R | Condition: {' AND '.join(rule_path)}")
-
-        # Feature Importance
-        importances = pd.Series(dt.feature_importances_, index=feature_cols).sort_values(ascending=False)
-        print("\n🔑 MOST IMPORTANT FACTORS:")
-        print(importances.head(5))
 
 
 
@@ -551,35 +278,29 @@ if not os.path.exists(DRIVE_ROOT): os.makedirs(DRIVE_ROOT, exist_ok=True)
 for d in ["logs", "market_cache", "models", "db"]:
     os.makedirs(os.path.join(DRIVE_ROOT, d), exist_ok=True)
 
-# API Keys - use env vars or fallback to defaults
+# API Keys - env vars only (no hardcoded secrets)
 def require_env(name):
-    # Fallback for user convenience if they hardcoded in previous versions, but generally enforce ENV
+    """Retrieve a required environment variable or raise on critical keys."""
     val = os.getenv(name)
     if not val:
-        # Check standard hardcoded defaults (legacy support)
-        if name == "POLYGON_API_KEY": return "Ry6xjaXE_e5AN0qUNUv9cyCLqjpz3eAk"
-        if name == "FMP_API_KEY": return "a9ScOGcXHufdJ4trkmiDo6SDEWxzQpK2"
-        # Raise error for critical execution keys if missing
-        if name in ["ALPACA_API_KEY", "ALPACA_SECRET_KEY"]:
-             raise RuntimeError(f"❌ Missing required env var: {name}")
+        if name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+            raise RuntimeError(f"Missing required env var: {name}")
         return ""
     return val
 
 KEYS = {
-    "FMP": os.getenv("FMP_API_KEY", "a9ScOGcXHufdJ4trkmiDo6SDEWxzQpK2"),
-    "POLY": os.getenv("POLYGON_API_KEY", "Ry6xjaXE_e5AN0qUNUv9cyCLOjpz3eAk"),
-    "ALPACA_KEY": os.getenv("ALPACA_API_KEY", "PKD5WDLDC4H6ZCHGKWVSH6CRGZ"),
-    "ALPACA_SEC": os.getenv("ALPACA_SECRET_KEY", "BDpfT7RY2aBJbEc1aVpgZbR2DqpT6CguGsv8QjiZYD7Z"),
+    "FMP": os.getenv("FMP_API_KEY", ""),
+    "POLY": os.getenv("POLYGON_API_KEY", ""),
+    "ALPACA_KEY": require_env("ALPACA_API_KEY"),
+    "ALPACA_SEC": require_env("ALPACA_SECRET_KEY"),
     "DISCORD": os.getenv("DISCORD_WEBHOOK", ""),
-    "RAPIDAPI_KEY": os.getenv("RAPIDAPI_KEY", "0f336440a0msh3d44677518ce31fp194761jsn97fd08526ec2"),
+    "RAPIDAPI_KEY": os.getenv("RAPIDAPI_KEY", ""),
 }
 ALPACA_URL = "https://paper-api.alpaca.markets"
 
 SETTINGS = {
-    "RISK_PER_TRADE": 0.01,
-    "MAX_POSITIONS": 6,
+    "RISK_PER_TRADE": 0.015,  # 1.5% Risk per trade
     "MAX_POSITIONS": 5,
-    "RISK_PER_TRADE": 0.015, # 1.5% Risk per trade
     "STOP_MULT": 1.5,
     "TP_MULT": 3.0,
     "MIN_CONFIDENCE": 0.02, # OPTIMIZED: Proven Positive Expectancy
@@ -2001,187 +1722,7 @@ def ev_to_size_mult(ev_r):
     return float(np.clip(0.35 + 1.5 * ev_r, 0.35, 1.25))
 
 
-class CrossSectionalRanker:
-    """
-    Cross-sectional factor ranking: rank stocks vs. peers by momentum, value, quality.
-    Produces percentile scores (0-1) per ticker for use as model features and score boosters.
-    Recomputed once per scan cycle from snapshot + fundamental data.
-    """
-    def __init__(self):
-        self._ranks = {}     # ticker -> {'momentum_rank': 0.75, 'value_rank': 0.60, ...}
-        self._last_update = 0
-
-    def update(self, snap_data, fmp_helper, universe):
-        """
-        Rank universe cross-sectionally.
-        snap_data: dict from Polygon snapshot {ticker: {price, dayVol, dayOpen, ...}}
-        fmp_helper: FMP_Helper for fundamentals
-        universe: list of tickers
-        """
-        if not snap_data or len(snap_data) < 5:
-            return
-
-        tickers = [t for t in universe if t in snap_data]
-        if len(tickers) < 5:
-            return
-
-        # ── Momentum factor: intraday return (proxy for short-term momentum) ──
-        mom = {}
-        for t in tickers:
-            s = snap_data[t]
-            day_open = s.get('dayOpen', 0)
-            price = s.get('price', 0)
-            if day_open > 0 and price > 0:
-                mom[t] = (price - day_open) / day_open
-            else:
-                mom[t] = 0.0
-
-        # ── Volume factor: relative dollar volume (liquidity + attention) ──
-        vol = {}
-        for t in tickers:
-            s = snap_data[t]
-            vol[t] = s.get('dayVol', 0) * s.get('price', 1)
-
-        # ── Value factor: inverse P/E (high = cheap = good value) ──
-        value = {}
-        for t in tickers:
-            try:
-                feats = fmp_helper.get_fundamental_features(t)
-                pe = feats.get('pe_ratio', 20)
-                if pe and pe > 0:
-                    value[t] = 1.0 / pe  # Inverse P/E: higher = cheaper
-                else:
-                    value[t] = 0.05  # Default
-            except Exception:
-                value[t] = 0.05
-
-        # ── Compute percentile ranks ──
-        def _pct_rank(data_dict):
-            if not data_dict:
-                return {}
-            items = sorted(data_dict.items(), key=lambda x: x[1])
-            n = len(items)
-            return {t: (i / max(1, n - 1)) for i, (t, _) in enumerate(items)}
-
-        mom_ranks = _pct_rank(mom)
-        vol_ranks = _pct_rank(vol)
-        val_ranks = _pct_rank(value)
-
-        # ── Composite score: 50% momentum + 25% volume + 25% value ──
-        ranks = {}
-        for t in tickers:
-            mr = mom_ranks.get(t, 0.5)
-            vr = vol_ranks.get(t, 0.5)
-            vlr = val_ranks.get(t, 0.5)
-            composite = 0.50 * mr + 0.25 * vr + 0.25 * vlr
-            ranks[t] = {
-                'momentum_rank': round(mr, 3),
-                'volume_rank': round(vr, 3),
-                'value_rank': round(vlr, 3),
-                'composite_rank': round(composite, 3)
-            }
-
-        with threading.Lock():
-            self._ranks = ranks
-            self._last_update = time.time()
-
-        logging.info(f"📈 Cross-sectional ranking: {len(ranks)} tickers ranked")
-
-    def get_ranks(self, ticker):
-        """Return factor ranks for a ticker, or neutral defaults."""
-        return self._ranks.get(ticker, {
-            'momentum_rank': 0.5, 'volume_rank': 0.5,
-            'value_rank': 0.5, 'composite_rank': 0.5
-        })
-
-    def get_score_boost(self, ticker):
-        """
-        Score multiplier based on composite rank.
-        Top-ranked stocks get up to 1.3x score boost, bottom get 0.7x.
-        """
-        r = self.get_ranks(ticker)
-        comp = r['composite_rank']
-        return float(np.clip(0.7 + 0.6 * comp, 0.7, 1.3))
-
-
-class OvernightGapModel:
-    """
-    Overnight gap risk management.
-    Before market close, assess gap risk for each position and either:
-    - Exit positions with high gap risk (earnings next day, high VIX, low PnL)
-    - Tighten stops on remaining positions (reduce overnight exposure)
-    """
-    PRE_CLOSE_MINUTES = 15  # Start managing 15 min before close (15:45 ET)
-
-    def __init__(self, earnings_guard=None):
-        self.earnings = earnings_guard
-        self._gap_stats = {}  # ticker -> (avg_gap_pct, gap_std)
-
-    def is_pre_close(self):
-        """True if within PRE_CLOSE_MINUTES of market close (16:00 ET)."""
-        try:
-            now = datetime.datetime.now(ET)
-        except Exception:
-            now = datetime.datetime.now()
-        h, m = now.hour, now.minute
-        if now.weekday() >= 5:
-            return False
-        return (h == 15 and m >= (60 - self.PRE_CLOSE_MINUTES)) or h >= 16
-
-    def gap_risk_score(self, ticker, vix, pnl_r, has_earnings_tomorrow=False):
-        """
-        Score 0-1 indicating overnight gap risk.
-        High score = should exit before close.
-        """
-        score = 0.0
-        # VIX component: VIX > 25 = elevated gap risk
-        if vix > 30:
-            score += 0.35
-        elif vix > 25:
-            score += 0.20
-        elif vix > 20:
-            score += 0.10
-
-        # Earnings next day = very high gap risk
-        if has_earnings_tomorrow:
-            score += 0.40
-
-        # Low PnL positions have worse risk/reward for overnight hold
-        if pnl_r < 0.3:
-            score += 0.20
-        elif pnl_r < 0.0:
-            score += 0.30  # Losing positions especially risky overnight
-
-        return min(1.0, score)
-
-    def should_exit_pre_close(self, ticker, vix, pnl_r):
-        """Returns True if position should be closed before market close."""
-        has_earnings = False
-        if self.earnings:
-            try:
-                has_earnings = not self.earnings.check_safe(ticker)
-            except Exception:
-                pass
-        risk = self.gap_risk_score(ticker, vix, pnl_r, has_earnings)
-        return risk >= 0.55  # Exit if risk score above threshold
-
-    def pre_close_stop_tightening(self, side, entry, current_sl, atr, pnl_r):
-        """
-        Tighten stop for positions held overnight.
-        Returns new_sl or None if no change needed.
-        """
-        if pnl_r < 0.5:
-            return None  # Should be exited, not tightened
-
-        # Move stop to lock in at least 0.25R profit overnight
-        lock_level = 0.25
-        if side == 'LONG':
-            min_sl = entry + lock_level * abs(entry - current_sl)
-            return max(current_sl, min_sl)
-        else:
-            min_sl = entry - lock_level * abs(entry - current_sl)
-            return min(current_sl, min_sl)
-
+# NOTE: CrossSectionalRanker and OvernightGapModel are now imported from hedge_fund package above.
 
 # FIX #8: Get DAILY ATR for risk sizing (more stable than minute ATR)
 def get_daily_atr(ticker, period=14):

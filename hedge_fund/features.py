@@ -6,6 +6,10 @@ Provides microstructure features (VPIN, VWAP, Amihud), regime detection
 and enhanced triple-barrier labeling.
 """
 
+import logging
+import threading
+import time
+
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -244,3 +248,118 @@ def calculate_liquidity_sweep(df, lookback=16):
             signals.iloc[i] = 1  # Bullish sweep
 
     return signals
+
+
+class CrossSectionalRanker:
+    """
+    Cross-sectional factor ranking: rank stocks vs peers by momentum, value, quality.
+
+    Produces percentile scores (0-1) per ticker for use as model features
+    and score boosters. Recomputed once per scan cycle from snapshot data.
+    """
+
+    def __init__(self):
+        self._ranks = {}  # ticker -> {'momentum_rank': 0.75, ...}
+        self._last_update = 0
+        self._lock = threading.Lock()
+
+    def update(self, snap_data, fundamental_getter, universe):
+        """
+        Rank universe cross-sectionally.
+
+        Args:
+            snap_data: Dict from market snapshot
+                {ticker: {'price': float, 'dayVol': int, 'dayOpen': float, ...}}
+            fundamental_getter: Callable(ticker) -> dict with at least 'pe_ratio'.
+                Can be None to skip value factor.
+            universe: List of ticker strings to rank.
+        """
+        if not snap_data or len(snap_data) < 5:
+            return
+
+        tickers = [t for t in universe if t in snap_data]
+        if len(tickers) < 5:
+            return
+
+        # Momentum factor: intraday return
+        mom = {}
+        for t in tickers:
+            s = snap_data[t]
+            day_open = s.get('dayOpen', 0)
+            price = s.get('price', 0)
+            if day_open > 0 and price > 0:
+                mom[t] = (price - day_open) / day_open
+            else:
+                mom[t] = 0.0
+
+        # Volume factor: relative dollar volume (liquidity + attention)
+        vol = {}
+        for t in tickers:
+            s = snap_data[t]
+            vol[t] = s.get('dayVol', 0) * s.get('price', 1)
+
+        # Value factor: inverse P/E (high = cheap = good value)
+        value = {}
+        for t in tickers:
+            try:
+                if fundamental_getter is not None:
+                    feats = fundamental_getter(t)
+                    pe = feats.get('pe_ratio', 20)
+                    if pe and pe > 0:
+                        value[t] = 1.0 / pe
+                    else:
+                        value[t] = 0.05
+                else:
+                    value[t] = 0.05
+            except Exception:
+                value[t] = 0.05
+
+        # Compute percentile ranks
+        def _pct_rank(data_dict):
+            if not data_dict:
+                return {}
+            items = sorted(data_dict.items(), key=lambda x: x[1])
+            n = len(items)
+            return {t: (i / max(1, n - 1)) for i, (t, _) in enumerate(items)}
+
+        mom_ranks = _pct_rank(mom)
+        vol_ranks = _pct_rank(vol)
+        val_ranks = _pct_rank(value)
+
+        # Composite score: 50% momentum + 25% volume + 25% value
+        ranks = {}
+        for t in tickers:
+            mr = mom_ranks.get(t, 0.5)
+            vr = vol_ranks.get(t, 0.5)
+            vlr = val_ranks.get(t, 0.5)
+            composite = 0.50 * mr + 0.25 * vr + 0.25 * vlr
+            ranks[t] = {
+                'momentum_rank': round(mr, 3),
+                'volume_rank': round(vr, 3),
+                'value_rank': round(vlr, 3),
+                'composite_rank': round(composite, 3),
+            }
+
+        with self._lock:
+            self._ranks = ranks
+            self._last_update = time.time()
+
+        logging.info(f"Cross-sectional ranking: {len(ranks)} tickers ranked")
+
+    def get_ranks(self, ticker):
+        """Return factor ranks for a ticker, or neutral defaults."""
+        with self._lock:
+            return self._ranks.get(ticker, {
+                'momentum_rank': 0.5, 'volume_rank': 0.5,
+                'value_rank': 0.5, 'composite_rank': 0.5,
+            })
+
+    def get_score_boost(self, ticker):
+        """
+        Score multiplier based on composite rank.
+
+        Top-ranked stocks get up to 1.3x score boost, bottom get 0.7x.
+        """
+        r = self.get_ranks(ticker)
+        comp = r['composite_rank']
+        return float(np.clip(0.7 + 0.6 * comp, 0.7, 1.3))
