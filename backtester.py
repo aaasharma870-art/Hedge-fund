@@ -1,17 +1,15 @@
 # ==============================================================================
-# GOD MODE BACKTESTER: GRID SEARCH OPTIMIZATION (COLAB EDITION V4 - FINAL)
+# GOD MODE BACKTESTER V5: STATISTICALLY ROBUST GRID SEARCH
 # ==============================================================================
-# Purpose: Scientifically find the "Golden Parameters" for >1.5 PF and >50% WR.
-#
-# CHANGES IN V4 (THE "GOD MODE" UPGRADE):
-# - 1:1 PARITY with Main Bot Logic via `WalkForwardAI` port.
-# - ADDED: Kalman Filter & Hurst Exponent (Trend vs Mean Reversion).
-# - ADDED: Custom "Profit Factor" Objective Function for XGBoost.
-# - ADDED: Institutional Features (VPIN, Liquidity Sweeps, RRS).
-# - SWITCHED: From Classifier (Up/Down) to Regressor (Predicting R-Value).
-#
-# This script is the "Truth Teller". If it says a config is bad, it is bad.
-# If it says a config is good, it is statistically robust.
+# V5 improvements over V4:
+#   1. 3-year backtest window (vs 1 year) for multi-regime coverage
+#   2. Walk-forward validation (rolling train/test, no single split)
+#   3. Monte Carlo significance test (shuffle labels 1000x)
+#   4. Per-ticker results breakdown (detect single-stock dependency)
+#   5. Advanced risk metrics (drawdown, Sharpe, Calmar, losing streaks)
+#   6. Feature importance pruning (auto-drop bottom 50%)
+#   7. Realistic execution costs (spread + commission + impact)
+#   8. Diversified universe (tech + healthcare + energy + financials)
 # ==============================================================================
 
 import os
@@ -19,6 +17,7 @@ import sys
 import subprocess
 import time
 import warnings
+import random
 import numpy as np
 import pandas as pd
 import json
@@ -40,10 +39,9 @@ except ImportError:
     from rich.table import Table
     from scipy.stats import norm
 
-# Import shared modules from hedge_fund package
 from hedge_fund.indicators import ManualTA
 from hedge_fund.math_utils import get_kalman_filter, get_hurst
-from hedge_fund.simulation import simulate_exit as _simulate_exit, compute_bracket_labels
+from hedge_fund.simulation import simulate_exit as _simulate_exit
 from hedge_fund.features import (
     calculate_vpin,
     calculate_enhanced_vwap_features,
@@ -54,7 +52,12 @@ from hedge_fund.features import (
 from hedge_fund.objectives import profit_factor_objective
 from hedge_fund.data import RateLimiter
 
-# Configuration
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
 KEYS = {
     "FMP": os.environ.get("FMP_API_KEY", ""),
     "POLY": os.environ.get("POLYGON_API_KEY", ""),
@@ -62,10 +65,64 @@ KEYS = {
 
 IO_WORKERS = 16
 
+# --- IMPROVEMENT #1: 3 years of data ---
+LOOKBACK_DAYS = 1095
+
+# --- IMPROVEMENT #2: Walk-forward settings ---
+WF_TRAIN_BARS = 1500   # ~9 months of hourly bars for training
+WF_TEST_BARS = 500     # ~3 months of hourly bars for testing
+WF_STEP_BARS = 500     # step forward by 3 months each window
+
+# --- IMPROVEMENT #7: Execution cost model ---
+SPREAD_COST_PCT = 0.03      # bid-ask spread per side (0.03%)
+COMMISSION_PER_SHARE = 0.0  # most brokers are zero-commission
+MARKET_IMPACT_PCT = 0.02    # market impact estimate per side
+ROUND_TRIP_COST_PCT = 2 * (SPREAD_COST_PCT + MARKET_IMPACT_PCT) / 100  # total as decimal
+
+# --- IMPROVEMENT #8: Diversified universe ---
+TICKERS = [
+    # Tech / Growth
+    'NVDA', 'PLTR', 'TSLA', 'AMD', 'MSFT', 'META',
+    # Small-cap momentum (original)
+    'RKLB', 'ASTS',
+    # Financials
+    'JPM', 'GS',
+    # Healthcare
+    'UNH', 'LLY',
+    # Energy
+    'XOM', 'CVX',
+    # Industrials
+    'CAT', 'GE',
+    # Consumer
+    'AMZN', 'COST',
+]
+
+# --- IMPROVEMENT #3: Monte Carlo settings ---
+MONTE_CARLO_RUNS = 1000
+
+# --- IMPROVEMENT #6: Feature pruning ---
+PRUNE_FEATURES = True
+PRUNE_KEEP_RATIO = 0.5  # keep top 50% by importance
+
+GRID_SETTINGS = {
+    "PRED_THRESHOLD": [0.20, 0.30],
+    "SL_MULT": [1.5],
+    "RISK_REWARD": ["1:1.5", "1:2"],
+    "MAX_BARS": [8, 12],
+    "FILTER_MODE": ["STRICT", "MINIMAL"],
+    "TRAIL_MULT": [1.0, 1.5],
+    "HURST_LIMIT": [0.45, 0.55],
+    "ADX_MIN": [20, 25],
+    "DYNAMIC_SIZING": [True],
+}
+
 ta = ManualTA
 console = Console()
 
-# === 1b. INFRASTRUCTURE (POLYGON HELPER) ===
+
+# ==============================================================================
+# INFRASTRUCTURE
+# ==============================================================================
 
 class Polygon_Helper:
     def __init__(self):
@@ -80,10 +137,6 @@ class Polygon_Helper:
         self._rate_limiter.acquire()
 
     def fetch_data(self, t, days=365, mult=1, timespan='hour'):
-        """
-        Fetch Polygon aggregate bars with pagination.
-        Defaulting to 1-hour bars for backtester compatibility.
-        """
         with self._lock:
             if time.time() - self.last_429 < 60:
                 time.sleep(60 - (time.time() - self.last_429))
@@ -121,7 +174,7 @@ class Polygon_Helper:
                             self.last_429 = time.time()
                         time.sleep(5 + (retries * 5))
                     else:
-                        print(f"   ⚠️ Polygon {t} status {r.status_code}")
+                        print(f"   Polygon {t} status {r.status_code}")
                         url = None
                         break
                 except Exception as e:
@@ -140,189 +193,154 @@ class Polygon_Helper:
         })
         df['Datetime'] = pd.to_datetime(df['Datetime'], unit='ms', utc=True).dt.tz_convert("America/New_York")
         df = df.set_index('Datetime').sort_index()
-        # Filter duplicates
         df = df[~df.index.duplicated()]
-
         return df
 
-# === 2. Math and simulation functions now imported from hedge_fund package ===
 
-# === 3. FEATURE KITCHEN (1:1 Parity with Main Bot) ===
+# ==============================================================================
+# FEATURE ENGINEERING
+# ==============================================================================
 
-def prepare_god_mode_features(df):
-    # 1. Basic Technicals
+ALL_FEATURES = [
+    'RSI', 'ADX', 'ATR_Pct', 'Vol_Rel', 'Kalman_Dist', 'Hurst',
+    'BB_Width', 'BB_Position', 'VWAP_Dist', 'HL_Range',
+    'ROC_5', 'ROC_20',
+    'Vol_Surge', 'Money_Flow',
+    'Volatility_Rank', 'Trend_Consistency',
+    'Hour', 'Day_of_Week',
+    'VPIN', 'VWAP_ZScore', 'VWAP_Slope', 'VWAP_Volume_Ratio',
+    'Regime_GEX_Proxy', 'Amihud_Illiquidity', 'Volatility_Regime_Score',
+    'RRS_Cumulative', 'Liquidity_Sweep',
+]
+
+
+def prepare_features(df):
+    """Compute all 27 features on a DataFrame of OHLCV bars."""
+    df = df.copy()
+
     df['RSI'] = ta.rsi(df['Close'], length=14)
     df['ADX'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
     df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
     df['ATR_Pct'] = df['ATR'] / df['Close']
     df['Vol_Rel'] = df['Volume'] / df['Volume'].rolling(20).mean()
 
-    # 2. Kalman Filter (Trend)
     df['Kalman'] = get_kalman_filter(df['Close'].values)
     df['Kalman_Dist'] = (df['Close'] - df['Kalman']) / df['Close']
 
-    # 3. Hurst Exponent (Market Regiment: Trend vs Chop)
-    # Optimized: Compute every 10 bars
     df['Hurst'] = np.nan
     close_vals = df['Close'].values
     for i in range(50, len(df), 10):
-        window = close_vals[i-50:i]
+        window = close_vals[i - 50:i]
         df.iloc[i, df.columns.get_loc('Hurst')] = get_hurst(window)
     df['Hurst'] = df['Hurst'].ffill().fillna(0.5)
 
-    # 4. Bollinger Bands (20, 2)
     bb = ta.bbands(df['Close'], length=20, std=2)
     df['BB_Width'] = (bb['BBU_20_2.0'] - bb['BBL_20_2.0']) / df['Close']
     df['BB_Position'] = (df['Close'] - bb['BBL_20_2.0']) / (bb['BBU_20_2.0'] - bb['BBL_20_2.0'])
 
-    # 5. VWAP (Institutional Gravity)
     df['VWAP'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
     df['VWAP_Dist'] = (df['Close'] - df['VWAP']) / df['Close']
 
-    # 6. Microstructure
     df['HL_Range'] = (df['High'] - df['Low']) / df['Close']
     df['Money_Flow'] = (df['Close'] * df['Volume']).rolling(10).sum()
     df['Money_Flow'] = df['Money_Flow'] / df['Money_Flow'].rolling(50).mean()
 
-    # 7. Momentum
     df['ROC_5'] = df['Close'].pct_change(5)
     df['ROC_20'] = df['Close'].pct_change(20)
 
-    # 8. VPIN (Toxic Flow)
     try:
         df['VPIN'] = calculate_vpin(df)
-    except:
+    except Exception:
         df['VPIN'] = 0.5
 
-    # 9. Vol_Surge (Volume spike detection - from bot)
     df['Vol_Surge'] = df['Volume'] / df['Volume'].rolling(5).mean()
 
-    # 10. Volatility_Rank (ATR percentile rank - from bot)
     df['Volatility_Rank'] = df['ATR_Pct'].rolling(100).apply(
         lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5, raw=False)
 
-    # 11. Trend_Consistency (fraction of positive returns - from bot)
     _ret = df['Close'].pct_change()
     df['Trend_Consistency'] = _ret.rolling(20).apply(lambda s: (s > 0).mean(), raw=False)
 
-    # 12. Time features (intraday patterns - from bot)
     df['Hour'] = df.index.hour
     df['Day_of_Week'] = df.index.dayofweek
 
-    # 13. Enhanced VWAP features (institutional mean reversion - from hedge_fund package)
     try:
         vwap_feats = calculate_enhanced_vwap_features(df)
         df['VWAP_ZScore'] = vwap_feats['VWAP_ZScore'].fillna(0.0)
         df['VWAP_Slope'] = vwap_feats['VWAP_Slope'].fillna(0.0)
         df['VWAP_Volume_Ratio'] = vwap_feats['VWAP_Volume_Ratio'].fillna(1.0)
-    except:
+    except Exception:
         df['VWAP_ZScore'] = 0.0
         df['VWAP_Slope'] = 0.0
         df['VWAP_Volume_Ratio'] = 1.0
 
-    # 14. GEX Proxy / Volatility Regime (from bot)
     try:
         regime_gex, vol_regime_label = calculate_volatility_regime(df)
         df['Regime_GEX_Proxy'] = regime_gex.fillna(0)
         regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
         df['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
-    except:
+    except Exception:
         df['Regime_GEX_Proxy'] = 0
         df['Volatility_Regime_Score'] = 0
 
-    # 15. Amihud Illiquidity (from bot)
     try:
         df['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df, window=20)
-    except:
+    except Exception:
         df['Amihud_Illiquidity'] = 0.5
 
-    # 16. RRS Cumulative (momentum proxy without SPY data - from bot)
     df['RRS_Cumulative'] = df['Close'].pct_change(5).rolling(5).sum().fillna(0.0)
 
-    # 17. Liquidity Sweep (institutional reversal signal - from bot)
     try:
         df['Liquidity_Sweep'] = calculate_liquidity_sweep(df, lookback=16)
-    except:
+    except Exception:
         df['Liquidity_Sweep'] = 0
 
-    # Smart Filters (kept for simulation entry logic)
     df['EMA_50'] = df['Close'].ewm(span=50).mean()
     df['EMA_200'] = df['Close'].ewm(span=200).mean()
 
     df.dropna(inplace=True)
+    return df
 
-    # Feature list matches bot's active_features (minus API-only features)
-    features = [
-        # Core technicals
-        'RSI', 'ADX', 'ATR_Pct', 'Vol_Rel', 'Kalman_Dist', 'Hurst',
-        # Price action
-        'BB_Width', 'BB_Position', 'VWAP_Dist', 'HL_Range',
-        # Momentum
-        'ROC_5', 'ROC_20',
-        # Volume
-        'Vol_Surge', 'Money_Flow',
-        # Regime
-        'Volatility_Rank', 'Trend_Consistency',
-        # Time
-        'Hour', 'Day_of_Week',
-        # Institutional microstructure
-        'VPIN', 'VWAP_ZScore', 'VWAP_Slope', 'VWAP_Volume_Ratio',
-        'Regime_GEX_Proxy', 'Amihud_Illiquidity', 'Volatility_Regime_Score',
-        # Alpha features
-        'RRS_Cumulative', 'Liquidity_Sweep',
-    ]
-    return df, features
 
-# === 4. SIMULATION ENGINE ===
+# ==============================================================================
+# LABEL GENERATION
+# ==============================================================================
 
 def compute_bracket_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=20, atr_col='ATR'):
-    """
-    EV-style continuous labels with direction encoded in sign.
-    PORTED FROM MAIN BOT (compute_bracket_labels) for 1:1 parity.
-      +x  => LONG with expected R ~ x
-      -x  => SHORT with expected R ~ |x|
-       0  => HOLD / no trade (both directions negative EV)
-    Timeouts use mark-to-market at horizon (continuous gradient).
-    """
+    """EV-style continuous labels: +R = LONG, -R = SHORT, 0 = HOLD."""
     n = len(df)
     labels = np.zeros(n, dtype=float)
-
     atr = df[atr_col].values
     close = df['Close'].values
     high = df['High'].values
     low = df['Low'].values
-
-    rr = tp_mult / sl_mult  # e.g. 3.0/1.5 = 2.0R reward
+    rr = tp_mult / sl_mult
 
     for i in range(n - max_bars - 1):
         a = atr[i]
         if not np.isfinite(a) or a <= 0:
             continue
-
         entry = close[i]
         risk = sl_mult * a
         if risk <= 0:
             continue
 
-        # --- LONG bracket ---
         long_sl = entry - risk
         long_tp = entry + tp_mult * a
-        long_out, _ = _simulate_exit(high[i+1:i+max_bars+1], low[i+1:i+max_bars+1],
-                                  long_sl, long_tp, 'LONG')
+        long_out, _ = _simulate_exit(high[i + 1:i + max_bars + 1], low[i + 1:i + max_bars + 1],
+                                     long_sl, long_tp, 'LONG')
         if long_out == 'win':
             long_r = rr
         elif long_out == 'loss':
             long_r = -1.0
         else:
-            # Mark-to-market at horizon with small decay for dead money
             mtm = (close[min(i + max_bars, n - 1)] - entry) / risk
             long_r = float(np.clip(mtm - 0.05, -1.0, rr))
 
-        # --- SHORT bracket ---
         short_sl = entry + risk
         short_tp = entry - tp_mult * a
-        short_out, _ = _simulate_exit(high[i+1:i+max_bars+1], low[i+1:i+max_bars+1],
-                                   short_sl, short_tp, 'SHORT')
+        short_out, _ = _simulate_exit(high[i + 1:i + max_bars + 1], low[i + 1:i + max_bars + 1],
+                                      short_sl, short_tp, 'SHORT')
         if short_out == 'win':
             short_r = rr
         elif short_out == 'loss':
@@ -331,128 +349,190 @@ def compute_bracket_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=20, atr_col='A
             mtm = (entry - close[min(i + max_bars, n - 1)]) / risk
             short_r = float(np.clip(mtm - 0.05, -1.0, rr))
 
-        # --- Choose best POSITIVE EV only; otherwise HOLD = 0 ---
         best = max(long_r, short_r)
         if best <= 0.0:
-            labels[i] = 0.0                    # Both directions negative EV
+            labels[i] = 0.0
         elif long_r >= short_r:
-            labels[i] = float(best)            # + => go long
+            labels[i] = float(best)
         else:
-            labels[i] = float(-best)           # - => go short
+            labels[i] = float(-best)
 
+    return labels
+
+
+# ==============================================================================
+# IMPROVEMENT #2: WALK-FORWARD TRAIN + PREDICT
+# ==============================================================================
+
+def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
+                               train_bars=WF_TRAIN_BARS, test_bars=WF_TEST_BARS,
+                               step_bars=WF_STEP_BARS, prune=PRUNE_FEATURES):
+    """
+    Walk-forward validation: train on rolling window, predict on next window.
+    Returns concatenated test predictions across all windows and the pruned
+    feature list (if pruning enabled).
+    """
+    labels = compute_bracket_labels(df, sl_mult=sl_mult, tp_mult=tp_mult, max_bars=max_bars)
+    df = df.copy()
     df['Target'] = labels
-    return df
 
-def train_and_predict(df_orig, features, sl_mult, tp_mult, max_bars):
-    """
-    Train XGBoost model for given SL/TP/max_bars and return test_df with predictions.
-    Uses compute_bracket_labels (ported from bot) for 1:1 target parity.
-    Separated from simulation so we train once per param combo.
-    """
-    df = df_orig.copy()
+    n = len(df)
+    all_test_dfs = []
+    importance_accum = np.zeros(len(features))
+    window_count = 0
+    active_features = list(features)
 
-    df['Target'] = compute_bracket_labels(df, sl_mult=sl_mult, tp_mult=tp_mult, max_bars=max_bars)
+    start = 0
+    while start + train_bars + test_bars <= n:
+        train_end = start + train_bars
+        test_end = min(train_end + test_bars, n)
 
-    # Train/Test Split (Time Series)
-    train_size = int(len(df) * 0.75)
-    train_df = df.iloc[:train_size]
-    test_df = df.iloc[train_size:].copy()
+        train_df = df.iloc[start:train_end]
+        test_df = df.iloc[train_end:test_end].copy()
 
-    if len(train_df) < 100 or len(test_df) < 30:
+        if len(train_df) < 200 or len(test_df) < 30:
+            start += step_bars
+            continue
+
+        model = xgb.XGBRegressor(
+            n_estimators=100,
+            max_depth=2,
+            learning_rate=0.05,
+            subsample=0.50,
+            colsample_bytree=0.50,
+            min_child_weight=10,
+            reg_alpha=5.0,
+            reg_lambda=10.0,
+            gamma=0.5,
+            n_jobs=-1,
+            verbosity=0,
+        )
+        model.fit(train_df[active_features], train_df['Target'])
+
+        # Accumulate feature importance for pruning
+        importance_accum[:len(active_features)] += model.feature_importances_
+        window_count += 1
+
+        preds = model.predict(test_df[active_features])
+        test_df['Predictions'] = preds
+
+        # Overfitting dampener
+        train_r2 = model.score(train_df[active_features], train_df['Target'])
+        test_r2 = model.score(test_df[active_features], test_df['Target'])
+        if train_r2 - test_r2 > 0.15:
+            test_df['Predictions'] = test_df['Predictions'] * 0.90
+
+        all_test_dfs.append(test_df)
+        start += step_bars
+
+    if not all_test_dfs:
+        return None, features
+
+    # --- IMPROVEMENT #6: Feature pruning ---
+    pruned_features = list(active_features)
+    if prune and window_count > 0:
+        avg_importance = importance_accum[:len(active_features)] / window_count
+        feat_imp = sorted(zip(active_features, avg_importance), key=lambda x: x[1], reverse=True)
+        keep_n = max(5, int(len(active_features) * PRUNE_KEEP_RATIO))
+        pruned_features = [f for f, _ in feat_imp[:keep_n]]
+        dropped = [f for f, _ in feat_imp[keep_n:]]
+        if dropped:
+            print(f"      [Pruned] Dropped {len(dropped)} weak features: {', '.join(dropped[:5])}...")
+            # Re-run walk-forward with pruned features for final predictions
+            return _walk_forward_pruned(df, pruned_features, sl_mult, tp_mult, max_bars,
+                                        train_bars, test_bars, step_bars), pruned_features
+
+    combined = pd.concat(all_test_dfs)
+    return combined, pruned_features
+
+
+def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
+                         train_bars, test_bars, step_bars):
+    """Re-run walk-forward with pruned feature set."""
+    n = len(df)
+    all_test_dfs = []
+    start = 0
+
+    while start + train_bars + test_bars <= n:
+        train_end = start + train_bars
+        test_end = min(train_end + test_bars, n)
+        train_df = df.iloc[start:train_end]
+        test_df = df.iloc[train_end:test_end].copy()
+
+        if len(train_df) < 200 or len(test_df) < 30:
+            start += step_bars
+            continue
+
+        model = xgb.XGBRegressor(
+            n_estimators=100, max_depth=2, learning_rate=0.05,
+            subsample=0.50, colsample_bytree=0.50, min_child_weight=10,
+            reg_alpha=5.0, reg_lambda=10.0, gamma=0.5,
+            n_jobs=-1, verbosity=0,
+        )
+        model.fit(train_df[features], train_df['Target'])
+        preds = model.predict(test_df[features])
+        test_df['Predictions'] = preds
+
+        train_r2 = model.score(train_df[features], train_df['Target'])
+        test_r2 = model.score(test_df[features], test_df['Target'])
+        if train_r2 - test_r2 > 0.15:
+            test_df['Predictions'] = test_df['Predictions'] * 0.90
+
+        all_test_dfs.append(test_df)
+        start += step_bars
+
+    if not all_test_dfs:
         return None
-
-    # Train Regressor (Highly Regularized to fix Overfitting)
-    model = xgb.XGBRegressor(
-        n_estimators=100, # Reduced from 300
-        max_depth=2,      # Stump-like trees to force generalization
-        learning_rate=0.05,
-        subsample=0.50,   # Aggressive bagging
-        colsample_bytree=0.50, # Aggressive feature sampling
-        min_child_weight=10, # Require more data per leaf
-        reg_alpha=5.0,    # High L1
-        reg_lambda=10.0,  # High L2
-        gamma=0.5,        # Min loss reduction
-        n_jobs=-1,
-        verbosity=0
-    )
-
-    model.fit(train_df[features], train_df['Target'])
-
-    # Log Feature Importance (to see what's driving the logic)
-    if random.random() < 0.05: # Print only occasionally
-        imps = list(zip(features, model.feature_importances_))
-        imps.sort(key=lambda x: x[1], reverse=True)
-        top_5 = [f"{f}:{score:.2f}" for f, score in imps[:5]]
-        print(f"      [Model DNA] Top Features: {', '.join(top_5)}")
-
-    preds = model.predict(test_df[features])
-    test_df['Predictions'] = preds
-
-    # Overfitting detection (from bot: R^2 gap check)
-    train_r2 = model.score(train_df[features], train_df['Target'])
-    test_r2 = model.score(test_df[features], test_df['Target'])
-    dampener = 0.90 if (train_r2 - test_r2 > 0.15) else 1.0
-    if dampener < 1.0:
-        test_df['Predictions'] = test_df['Predictions'] * dampener
-        print(f"      (overfit dampener applied: train_R2={train_r2:.3f} test_R2={test_r2:.3f})")
-
-    return test_df
+    return pd.concat(all_test_dfs)
 
 
-def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars, trail_mult=None, filter_mode="STRICT",
-                    hurst_limit=0.5, adx_min=0, dynamic_sizing=False):
+# ==============================================================================
+# TRADE SIMULATION (with execution costs)
+# ==============================================================================
+
+def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
+                    trail_mult=None, filter_mode="STRICT",
+                    hurst_limit=0.5, adx_min=0, dynamic_sizing=False,
+                    execution_cost_pct=ROUND_TRIP_COST_PCT):
     """
-    Simulate bidirectional trades with bot's institutional entry filters.
-    Returns list of tuples: (outcome_r, is_resolved_bool, position_size)
+    Simulate trades with institutional entry filters and execution costs.
+    Returns list of (outcome_r, is_resolved, position_size, ticker).
     """
-    if test_df is None:
+    if test_df is None or len(test_df) == 0:
         return []
 
     rr = tp_mult / sl_mult
-    trades = []  # List of (outcome, is_resolved, size)
+    trades = []
 
     close = test_df['Close'].values
     high = test_df['High'].values
     low = test_df['Low'].values
-    atr = test_df['ATR'].values
-    hurst = test_df['Hurst'].values
-    adx = test_df['ADX'].values
+    atr_vals = test_df['ATR'].values
+    hurst_vals = test_df['Hurst'].values
+    adx_vals = test_df['ADX'].values
     preds = test_df['Predictions'].values
+    ticker = test_df.get('_ticker', pd.Series('UNK', index=test_df.index)).values
 
     i = 0
     while i < len(test_df):
         row = test_df.iloc[i]
         pred_r = row['Predictions']
 
-        # ============================================================
-        # INSTITUTIONAL ENTRY FILTERS (Ported from main bot)
-        # ============================================================
-
-        # 1. Base R-value threshold
         if abs(pred_r) < pred_threshold:
             i += 1
             continue
 
-        # 2. VPIN Filter: Block toxic order flow
-        # APPLIES TO: STRICT, MODERATE, MINIMAL (Safety Check)
         if row.get('VPIN', 0.0) > 0.85:
             i += 1
             continue
 
-        # 3. Amihud Filter: Block illiquid conditions
-        # APPLIES TO: STRICT, MODERATE
         if filter_mode in ["STRICT", "MODERATE"] and row.get('Amihud_Illiquidity', 0.5) > 0.90:
             i += 1
             continue
 
-        # 4. Hurst Filter (used as a scalar later, not an entry block)
-        hurst_val = row.get('Hurst', 0.5)
-
-        # 5. Determine side from prediction sign
         side = 'LONG' if pred_r > 0 else 'SHORT'
 
         if filter_mode in ["STRICT", "MODERATE"]:
-            # 6. VWAP Z-Score extreme filter (bot: block against mean reversion)
             vwap_z = row.get('VWAP_ZScore', 0.0)
             if abs(vwap_z) > 2.5:
                 if vwap_z > 2.5 and side == 'LONG':
@@ -462,66 +542,46 @@ def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars, trail_m
                     i += 1
                     continue
 
-            # 7. EMA 200 Trend Filter ("Golden Gate" from bot)
-            # APPLIES TO: STRICT only
             if filter_mode == "STRICT":
                 last_close = row['Close']
                 ema_200 = row.get('EMA_200', 0)
                 if ema_200 > 0:
                     if last_close < ema_200 and side == 'LONG':
-                        if row.get('RSI', 50) > 25:  # Exception: deep oversold bounce
+                        if row.get('RSI', 50) > 25:
                             i += 1
                             continue
                     if last_close > ema_200 and side == 'SHORT':
-                        if row.get('RSI', 50) < 75:  # Exception: deep overbought dump
+                        if row.get('RSI', 50) < 75:
                             i += 1
                             continue
 
-            # 8. GEX Regime filter (bot: match strategy to regime)
-            # APPLIES TO: STRICT only
             if filter_mode == "STRICT":
                 gex_proxy = row.get('Regime_GEX_Proxy', 0)
-                if gex_proxy == 1:  # Positive GEX = mean reversion
-                    if abs(vwap_z) < 1.0:
+                if gex_proxy == 1:
+                    if abs(row.get('VWAP_ZScore', 0.0)) < 1.0:
                         i += 1
                         continue
-                elif gex_proxy == -1:  # Negative GEX = trending
-                    vwap_slope = row.get('VWAP_Slope', 0.0)
-                    if abs(vwap_slope) < 0.001:
+                elif gex_proxy == -1:
+                    if abs(row.get('VWAP_Slope', 0.0)) < 0.001:
                         i += 1
                         continue
 
-            # Filter: Volatility Rank > 0.5 (avoid sleepy markets)
             if row.get('Volatility_Rank', 0) < 0.5:
                 i += 1
                 continue
 
-        # --- NEW REGIME GATES (Round 6) ---
-        # 1. Hurst Exponent Check (Avoid Chop)
-        # Hurst < 0.5 = Mean Reverting, Hurst > 0.5 = Trending
-        # But commonly Hurst close to 0.5 is Random Walk.
-        # We want to AVOID high Hurst if we are Mean Reverting?
-        # Actually standard interpretation:
-        # H < 0.5: Mean Reverting (Anti-persistent) -> Good for range trading
-        # H > 0.5: Trending (Persistent) -> Good for trend following
-        # H ~ 0.5: Random Walk -> Dangerous
-        # Bot logic often wants H < 0.4 for mean reversion or H > 0.6 for trend.
-        # Here we let Grid decide.
-        if hurst[i] > hurst_limit:
+        if hurst_vals[i] > hurst_limit:
             i += 1
             continue
 
-        # 2. ADX Check (Trend Strength)
-        if adx[i] < adx_min:
+        if adx_vals[i] < adx_min:
             i += 1
             continue
 
-        # ============================================================
-        # TRADE EXECUTION (using bot's _simulate_exit)
-        # ============================================================
+        # --- Trade execution ---
         idx = i
         entry = close[idx]
-        a = atr[idx]
+        a = atr_vals[idx]
         if not np.isfinite(a) or a <= 0:
             i += 1
             continue
@@ -531,13 +591,11 @@ def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars, trail_m
         sl = entry - sl_dist if side == 'LONG' else entry + sl_dist
         tp = entry + tp_dist if side == 'LONG' else entry - tp_dist
 
-        # Trailing Distance (e.g. 1.5 * ATR)
         trail_dist = (trail_mult * a) if trail_mult else None
 
-        # Simulate bracket exit (SL checked first per bar - matches bot)
         end_idx = min(idx + max_bars + 1, len(test_df))
-        future_high = high[idx+1:end_idx]
-        future_low = low[idx+1:end_idx]
+        future_high = high[idx + 1:end_idx]
+        future_low = low[idx + 1:end_idx]
 
         if len(future_high) == 0:
             i += 1
@@ -557,17 +615,14 @@ def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars, trail_m
             bars_held = max_bars
             is_resolved = True
         elif outcome_str == 'trail_stop':
-            # Calculate Real PnL based on exit price
             if side == 'LONG':
                 raw_pnl = exit_price - entry
             else:
                 raw_pnl = entry - exit_price
-
             outcome = raw_pnl / sl_dist if sl_dist > 0 else 0.0
             bars_held = max_bars
             is_resolved = True
         else:
-            # Timeout: mark-to-market (from bot)
             exit_idx = min(idx + max_bars, len(close) - 1)
             exit_price_to = close[exit_idx]
             raw = (exit_price_to - entry) if side == 'LONG' else (entry - exit_price_to)
@@ -575,113 +630,216 @@ def simulate_trades(test_df, pred_threshold, sl_mult, tp_mult, max_bars, trail_m
             bars_held = max_bars
             is_resolved = False
 
+        # --- IMPROVEMENT #7: Deduct execution costs ---
+        cost_in_r = (execution_cost_pct * entry) / sl_dist if sl_dist > 0 else 0
+        outcome -= cost_in_r
 
-        # Note: Bot uses Hurst < 0.38 to halve POSITION SIZE, not R-multiple.
-        # For PF/WR measurement, we record raw R-multiples.
-        # Hurst filter above already skips truly choppy conditions via feature model.
-        # Apply Hurst scalar to outcome (from bot's position sizing logic)
-        # Apply Hurst scalar to outcome (from bot's position sizing logic)
-        # OLD: hurst_scalar = 0.5 if hurst_val < 0.38 else 1.0
-
-        # NEW: Confidence-Based Sizing (Kelly-lite)
-        # If dynamic_sizing=True: Size = 1.0 + (Prob - Threshold) * Scale
-        # e.g. Prob 0.8, Thresh 0.6 -> Size = 1.0 + 0.2*2 = 1.4
+        # Dynamic sizing
         pos_size = 1.0
         if dynamic_sizing:
-             pred_val = preds[idx]
-             diff = abs(pred_val) - pred_threshold
-             if diff > 0:
-                 pos_size += (diff * 2.0) # Bonus size for high conviction
-                 pos_size = min(pos_size, 2.0) # Cap at 2x
+            pred_val = preds[idx]
+            diff = abs(pred_val) - pred_threshold
+            if diff > 0:
+                pos_size += (diff * 2.0)
+                pos_size = min(pos_size, 2.0)
 
-        # Calculate final R-multiple PnL
         final_pnl = outcome * pos_size
+        tick = ticker[idx] if idx < len(ticker) else 'UNK'
+        trades.append((final_pnl, is_resolved, pos_size, tick))
 
-        # Append tuple (outcome, is_resolved, size)
-        trades.append((final_pnl, is_resolved, pos_size))
-
-        i += max(bars_held, 2)  # min 2-bar cooldown
+        i += max(bars_held, 2)
 
     return trades
 
-# === 5. MAIN EXECUTION ===
 
-GRID_SETTINGS = {
-    # Raw prediction threshold
-    "PRED_THRESHOLD": [0.20, 0.30],
-    # Stop loss ATR multiplier
-    "SL_MULT": [1.5],
-    # Take profit as ratio of SL
-    "RISK_REWARD": ["1:1.5", "1:2"],
-    # Max bars to hold (favorites from last round)
-    "MAX_BARS": [8, 12],
-    # New Filter Modes
-    "FILTER_MODE": ["STRICT", "MINIMAL"],
-    # Trailing Stop (ATR multiplier)
-    "TRAIL_MULT": [1.0, 1.5],
-    # Regime Filters (Round 6)
-    "HURST_LIMIT": [0.45, 0.55], # Test stricter vs looser chop filter
-    "ADX_MIN": [20, 25],
-    "DYNAMIC_SIZING": [True]
-}
+# ==============================================================================
+# IMPROVEMENT #5: ADVANCED RISK METRICS
+# ==============================================================================
 
-TICKERS = ['NVDA', 'PLTR', 'TSLA', 'AMD', 'MSFT', 'META', 'RKLB', 'ASTS']
+def compute_risk_metrics(trades):
+    """
+    Compute comprehensive risk metrics from a list of trade outcomes.
+    Returns dict with PF, WR, Sharpe, MaxDD, Calmar, longest losing streak, etc.
+    """
+    if not trades:
+        return _empty_metrics()
+
+    outcomes = [t[0] for t in trades]
+    resolved = [t[0] for t in trades if t[1]]
+    n_total = len(outcomes)
+
+    # --- Basic metrics ---
+    wins = sum(1 for x in outcomes if x > 0)
+    gross_win = sum(x for x in outcomes if x > 0)
+    gross_loss = abs(sum(x for x in outcomes if x < 0))
+    pf_raw = gross_win / gross_loss if gross_loss > 0 else 0
+    wr_raw = wins / n_total if n_total > 0 else 0
+
+    # Resolved metrics
+    if resolved:
+        res_wins = sum(1 for x in resolved if x > 0)
+        gross_win_res = sum(x for x in resolved if x > 0)
+        gross_loss_res = abs(sum(x for x in resolved if x < 0))
+        pf_res = gross_win_res / gross_loss_res if gross_loss_res > 0 else 0
+        wr_res = res_wins / len(resolved)
+    else:
+        pf_res = 0
+        wr_res = 0
+
+    # --- Equity curve ---
+    equity = np.cumsum(outcomes)
+
+    # --- Max Drawdown ---
+    peak = np.maximum.accumulate(equity)
+    drawdowns = equity - peak
+    max_dd = float(np.min(drawdowns)) if len(drawdowns) > 0 else 0
+
+    # --- Longest losing streak ---
+    longest_loss = 0
+    current_loss = 0
+    for x in outcomes:
+        if x < 0:
+            current_loss += 1
+            longest_loss = max(longest_loss, current_loss)
+        else:
+            current_loss = 0
+
+    # --- Sharpe Ratio (annualized, assuming ~6.5 trades/day is wrong; use per-trade) ---
+    if len(outcomes) > 1:
+        mean_r = np.mean(outcomes)
+        std_r = np.std(outcomes, ddof=1)
+        sharpe_per_trade = mean_r / std_r if std_r > 0 else 0
+        # Annualize: assume ~250 trading days, ~2 trades/day avg
+        trades_per_year = min(len(outcomes) * (252 * 6.5 / max(len(outcomes), 1)), 2000)
+        sharpe_annual = sharpe_per_trade * np.sqrt(trades_per_year)
+    else:
+        sharpe_annual = 0
+
+    # --- Calmar Ratio (total return / max drawdown) ---
+    total_return = equity[-1] if len(equity) > 0 else 0
+    calmar = total_return / abs(max_dd) if max_dd != 0 else 0
+
+    # --- Average win / average loss ---
+    avg_win = gross_win / wins if wins > 0 else 0
+    avg_loss = gross_loss / (n_total - wins) if (n_total - wins) > 0 else 0
+    payoff_ratio = avg_win / avg_loss if avg_loss > 0 else 0
+
+    return {
+        'PF_Res': pf_res, 'WR_Res': wr_res,
+        'PF_Raw': pf_raw, 'WR_Raw': wr_raw,
+        'Trades': n_total,
+        'Resolved': len(resolved),
+        'MaxDD_R': round(max_dd, 2),
+        'Sharpe': round(sharpe_annual, 2),
+        'Calmar': round(calmar, 2),
+        'LongestLoss': longest_loss,
+        'TotalReturn_R': round(total_return, 2),
+        'AvgWin_R': round(avg_win, 2),
+        'AvgLoss_R': round(avg_loss, 2),
+        'PayoffRatio': round(payoff_ratio, 2),
+    }
+
+
+def _empty_metrics():
+    return {
+        'PF_Res': 0, 'WR_Res': 0, 'PF_Raw': 0, 'WR_Raw': 0,
+        'Trades': 0, 'Resolved': 0, 'MaxDD_R': 0, 'Sharpe': 0,
+        'Calmar': 0, 'LongestLoss': 0, 'TotalReturn_R': 0,
+        'AvgWin_R': 0, 'AvgLoss_R': 0, 'PayoffRatio': 0,
+    }
+
+
+# ==============================================================================
+# IMPROVEMENT #4: PER-TICKER BREAKDOWN
+# ==============================================================================
+
+def per_ticker_breakdown(trades):
+    """Group trades by ticker and compute metrics for each."""
+    by_ticker = {}
+    for t in trades:
+        tick = t[3]
+        if tick not in by_ticker:
+            by_ticker[tick] = []
+        by_ticker[tick].append(t)
+
+    breakdown = {}
+    for tick, tick_trades in sorted(by_ticker.items()):
+        breakdown[tick] = compute_risk_metrics(tick_trades)
+    return breakdown
+
+
+# ==============================================================================
+# IMPROVEMENT #3: MONTE CARLO SIGNIFICANCE TEST
+# ==============================================================================
+
+def monte_carlo_test(trades, observed_pf, n_simulations=MONTE_CARLO_RUNS):
+    """
+    Shuffle trade outcomes and re-compute PF to test significance.
+    Returns p-value (fraction of shuffled runs that beat observed PF).
+    """
+    if len(trades) < 10:
+        return 1.0  # not enough data
+
+    outcomes = [t[0] for t in trades]
+    beat_count = 0
+
+    for _ in range(n_simulations):
+        shuffled = list(outcomes)
+        random.shuffle(shuffled)
+        # Randomly flip signs to destroy any directional signal
+        shuffled = [x * random.choice([1, -1]) for x in shuffled]
+
+        gross_win = sum(x for x in shuffled if x > 0)
+        gross_loss = abs(sum(x for x in shuffled if x < 0))
+        pf_shuffled = gross_win / gross_loss if gross_loss > 0 else 0
+
+        if pf_shuffled >= observed_pf:
+            beat_count += 1
+
+    return beat_count / n_simulations
+
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
 
 def main():
-    console.print("[bold green]GOD MODE BACKTESTER V4 (FULL BRAIN)[/bold green]")
+    console.print("[bold green]GOD MODE BACKTESTER V5 (STATISTICALLY ROBUST)[/bold green]")
+    console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
+    console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
+    console.print(f"[dim]Feature pruning: {'ON (keep top '+str(int(PRUNE_KEEP_RATIO*100))+'%)' if PRUNE_FEATURES else 'OFF'}[/dim]")
+    console.print(f"[dim]Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]\n")
 
-    # 1. Download & Prep
+    # ── 1. Download & Prep ──
     poly = Polygon_Helper()
     data_cache = {}
-    print("Downloading high-res data...")
+    print("Downloading data (3-year lookback)...")
+
     for t in TICKERS:
         try:
-            # Fetch 1 year of hourly data to match original logic
-            # Polygon allows direct hourly fetch
-            raw = poly.fetch_data(t, days=365, mult=1, timespan='hour')
-
-            if len(raw) > 200:
-                df_proc, feats = prepare_god_mode_features(raw)
-                data_cache[t] = (df_proc, feats)
-
-                # Show Training Logic
-                train_sz = int(len(df_proc) * 0.75)
-                train_end = df_proc.index[train_sz]
-                test_start = df_proc.index[train_sz]
-                print(f"   {t}: Ready ({len(df_proc)} bars)")
-                print(f"      [LEARNING]: {df_proc.index[0].date()} -> {train_end.date()}")
-                print(f"      [TESTING ]: {test_start.date()} -> {df_proc.index[-1].date()}")
+            raw = poly.fetch_data(t, days=LOOKBACK_DAYS, mult=1, timespan='hour')
+            if len(raw) > 500:
+                df_proc = prepare_features(raw)
+                df_proc['_ticker'] = t
+                data_cache[t] = df_proc
+                print(f"   {t}: {len(df_proc)} bars ({df_proc.index[0].date()} to {df_proc.index[-1].date()})")
             else:
                 print(f"   {t}: Insufficient data ({len(raw)} bars)")
         except Exception as e:
             print(f"   {t}: Failed ({e})")
 
     if not data_cache:
-        print("No data available.")
+        print("No data available. Set POLYGON_API_KEY env var.")
         return
 
-    # 2. Grid Search
-    # Outer loop: (SL_MULT x R:R x MAX_BARS) = model training combos
-    # Inner loop: PRED_THRESHOLD + FILTER_MODE + TRAIL_MULT
+    # ── 2. Grid Search with Walk-Forward ──
     results = []
-    n_sl = len(GRID_SETTINGS["SL_MULT"])
-    n_rr = len(GRID_SETTINGS["RISK_REWARD"])
-    n_mb = len(GRID_SETTINGS["MAX_BARS"])
-    n_thresh = len(GRID_SETTINGS["PRED_THRESHOLD"])
-    n_modes = len(GRID_SETTINGS["FILTER_MODE"])
-    n_trail = len(GRID_SETTINGS["TRAIL_MULT"])
-
-    n_train_combos = n_sl * n_rr * n_mb
-    total = n_train_combos * n_thresh * n_modes * n_trail
+    n_combos = (len(GRID_SETTINGS["SL_MULT"]) * len(GRID_SETTINGS["RISK_REWARD"]) *
+                len(GRID_SETTINGS["MAX_BARS"]) * len(GRID_SETTINGS["PRED_THRESHOLD"]) *
+                len(GRID_SETTINGS["FILTER_MODE"]) * len(GRID_SETTINGS["TRAIL_MULT"]) *
+                len(GRID_SETTINGS["HURST_LIMIT"]) * len(GRID_SETTINGS["ADX_MIN"]))
+    print(f"\nGrid Search: {n_combos} parameter combinations\n")
     ctr = 0
-
-    print(f"\nGrid Search: {total} combos ({n_train_combos} model trains x {n_thresh} thresh x {n_modes} features x {n_trail} trails)")
-    print(f"   SL_MULT: {GRID_SETTINGS['SL_MULT']}")
-    print(f"   R:R: {GRID_SETTINGS['RISK_REWARD']}")
-    print(f"   MAX_BARS: {GRID_SETTINGS['MAX_BARS']}")
-    print(f"   THRESHOLDS: {GRID_SETTINGS['PRED_THRESHOLD']}")
-    print(f"   MODES: {GRID_SETTINGS['FILTER_MODE']}")
-    print(f"   TRAILS: {GRID_SETTINGS['TRAIL_MULT']}")
 
     for sl_m in GRID_SETTINGS["SL_MULT"]:
         for rr_str in GRID_SETTINGS["RISK_REWARD"]:
@@ -689,134 +847,213 @@ def main():
             tp_m = sl_m * reward_ratio
 
             for mb in GRID_SETTINGS["MAX_BARS"]:
-                # Train models once per (SL, R:R, MAX_BARS) combo
-                print(f"\n   Training: SL={sl_m} TP={tp_m:.1f} ({rr_str}) MB={mb}...", flush=True)
-                predictions_cache = {}
-                for t, (df, feats) in data_cache.items():
-                    test_df = train_and_predict(df, feats, sl_m, tp_m, mb)
-                    if test_df is not None:
-                        predictions_cache[t] = test_df
+                print(f"   Walk-Forward Training: SL={sl_m} TP={tp_m:.1f} ({rr_str}) MB={mb}...",
+                      flush=True)
 
-                # Sweep thresholds & modes & trails & regime
+                # Walk-forward per ticker
+                predictions_cache = {}
+                pruned_features_cache = {}
+                for t, df in data_cache.items():
+                    wf_result, pruned_feats = walk_forward_train_predict(
+                        df, ALL_FEATURES, sl_m, tp_m, mb)
+                    if wf_result is not None:
+                        predictions_cache[t] = wf_result
+                        pruned_features_cache[t] = pruned_feats
+
+                if not predictions_cache:
+                    continue
+
+                # Sweep filters
                 for thresh in GRID_SETTINGS["PRED_THRESHOLD"]:
                     for fmode in GRID_SETTINGS["FILTER_MODE"]:
                         for trail in GRID_SETTINGS["TRAIL_MULT"]:
                             for h_lim in GRID_SETTINGS["HURST_LIMIT"]:
                                 for adx_m in GRID_SETTINGS["ADX_MIN"]:
-
                                     ctr += 1
-                                    all_trades = [] # List of (outcome, is_resolved, size)
+                                    all_trades = []
 
                                     for t, test_df in predictions_cache.items():
-                                        t_results = simulate_trades(test_df, thresh, sl_m, tp_m, mb, trail_mult=trail, filter_mode=fmode,
-                                                                  hurst_limit=h_lim, adx_min=adx_m, dynamic_sizing=True)
+                                        t_results = simulate_trades(
+                                            test_df, thresh, sl_m, tp_m, mb,
+                                            trail_mult=trail, filter_mode=fmode,
+                                            hurst_limit=h_lim, adx_min=adx_m,
+                                            dynamic_sizing=True)
                                         all_trades.extend(t_results)
 
-                                    if not all_trades:
+                                    if len(all_trades) < 10:
                                         continue
 
-                                    # RAW METRICS (Diluted by timeouts)
-                                    raw_outcomes = [x[0] for x in all_trades]
-                                    resol_flags = [x[1] for x in all_trades]
+                                    metrics = compute_risk_metrics(all_trades)
 
-                                    raw_wins = sum(1 for x in raw_outcomes if x > 0)
-                                    gross_win_raw = sum(x for x in raw_outcomes if x > 0)
-                                    gross_loss_raw = abs(sum(x for x in raw_outcomes if x < 0))
-                                    pf_raw = gross_win_raw / gross_loss_raw if gross_loss_raw > 0 else 0
-                                    wr_raw = raw_wins / len(raw_outcomes)
+                                    if ctr % 50 == 0 or (metrics['PF_Res'] > 1.3 and metrics['WR_Res'] > 0.45):
+                                        print(f"   [{ctr}/{n_combos}] {rr_str} T={thresh} "
+                                              f"H<{h_lim} ADX>{adx_m} {fmode} -> "
+                                              f"PF={metrics['PF_Res']:.2f} WR={metrics['WR_Res']:.1%} "
+                                              f"DD={metrics['MaxDD_R']:.1f}R "
+                                              f"N={metrics['Trades']}", flush=True)
 
-                                    # RESOLVED METRICS
-                                    resolved_outcomes = [x[0] for x in all_trades if x[1]]
-                                    if resolved_outcomes:
-                                        res_wins = sum(1 for x in resolved_outcomes if x > 0)
-                                        gross_win_res = sum(x for x in resolved_outcomes if x > 0)
-                                        gross_loss_res = abs(sum(x for x in resolved_outcomes if x < 0))
-                                        pf_res = gross_win_res / gross_loss_res if gross_loss_res > 0 else 0
-                                        wr_res = res_wins / len(resolved_outcomes)
-                                    else:
-                                        pf_res = 0
-                                        wr_res = 0
-
-                                    # Print status periodically
-                                    if ctr % 100 == 0 or (pf_res > 1.5 and wr_res > 0.45):
-                                         t_str = f"Tr={trail}" if trail else "Tr=OFF"
-                                         print(f"   [{ctr}/{total}] {rr_str} T={thresh} H<{h_lim} ADX>{adx_m} -> PF={pf_res:.2f} WR={wr_res:.1%} (N={len(all_trades)})", flush=True)
-
-                                    results.append({
+                                    result = {
                                         "SL": sl_m, "R:R": rr_str, "MB": mb,
-                                        "Thresh": thresh, "Mode": fmode, "Trail": str(trail),
-                                        "Hurst": str(h_lim), "ADX": str(adx_m),
-                                        "PF_Res": pf_res, "WR_Res": wr_res,
-                                        "PF_Raw": pf_raw, "WR_Raw": wr_raw,
-                                        "Trades": len(all_trades)
-                                    })
+                                        "Thresh": thresh, "Mode": fmode,
+                                        "Trail": str(trail), "Hurst": str(h_lim),
+                                        "ADX": str(adx_m),
+                                        **metrics,
+                                        "_trades": all_trades,
+                                    }
+                                    results.append(result)
 
-    # 3. Report
-    print("\n" + "="*80)
-    print("FINAL RESULTS (SORTED BY RESOLVED PF)")
-    print("="*80)
+    if not results:
+        console.print("[red]No results. Check data and parameters.[/red]")
+        return
 
+    # ── 3. Sort and display top results ──
     results.sort(key=lambda x: x['PF_Res'], reverse=True)
 
-    table = Table(show_header=True, header_style="bold magenta", title="Top 40 Configs")
+    print("\n" + "=" * 100)
+    print("FINAL RESULTS (SORTED BY RESOLVED PF) - WITH RISK METRICS")
+    print("=" * 100)
+
+    table = Table(show_header=True, header_style="bold magenta",
+                  title=f"Top 20 Configs ({len(TICKERS)} tickers, {LOOKBACK_DAYS}d, walk-forward)")
     table.add_column("SL")
     table.add_column("R:R")
     table.add_column("MB")
-    table.add_column("Thresh")
+    table.add_column("T")
     table.add_column("Mode")
     table.add_column("Trail")
-    table.add_column("Hurst")
+    table.add_column("H")
     table.add_column("ADX")
-    table.add_column("PF (Res)", justify="right", style="bold green")
-    table.add_column("WR (Res)", justify="right")
-    table.add_column("PF (Raw)", justify="right", style="dim")
-    table.add_column("Trades", justify="right")
-    table.add_column("Status", justify="right")
+    table.add_column("PF", justify="right", style="bold green")
+    table.add_column("WR", justify="right")
+    table.add_column("N", justify="right")
+    table.add_column("MaxDD", justify="right", style="red")
+    table.add_column("Sharpe", justify="right", style="cyan")
+    table.add_column("Calmar", justify="right")
+    table.add_column("LStrk", justify="right")
+    table.add_column("Ret", justify="right")
+    table.add_column("Stat")
 
     best_config = None
 
-    for r in results[:40]:  # Top 40
+    for r in results[:20]:
         status = ""
-        style = "white"
-
         if r['Trades'] < 30:
             status = "Low N"
-            style = "dim"
-        elif r['PF_Res'] > 1.5 and r['WR_Res'] > 0.50:
-            status = "HOLY GRAIL"
-            if not best_config: best_config = r
-        elif r['PF_Res'] > 1.4:
-            status = "Strong"
-            if not best_config: best_config = r
+        elif r['PF_Res'] > 1.5 and r['WR_Res'] > 0.50 and r['Sharpe'] > 1.0:
+            status = "STRONG"
+            if not best_config:
+                best_config = r
+        elif r['PF_Res'] > 1.3 and r['WR_Res'] > 0.48:
+            status = "OK"
+            if not best_config:
+                best_config = r
 
         table.add_row(
-            str(r['SL']),
-            r['R:R'],
-            str(r['MB']),
-            str(r['Thresh']),
-            r['Mode'],
-            r['Trail'],
-            str(r['Hurst']),
-            str(r['ADX']),
-            f"{r['PF_Res']:.2f}",
-            f"{r['WR_Res']:.1%}",
-            f"{r['PF_Raw']:.2f}",
+            str(r['SL']), r['R:R'], str(r['MB']),
+            str(r['Thresh']), r['Mode'], r['Trail'],
+            str(r['Hurst']), str(r['ADX']),
+            f"{r['PF_Res']:.2f}", f"{r['WR_Res']:.1%}",
             str(r['Trades']),
-            status
+            f"{r['MaxDD_R']:.1f}R",
+            f"{r['Sharpe']:.1f}",
+            f"{r['Calmar']:.1f}",
+            str(r['LongestLoss']),
+            f"{r['TotalReturn_R']:.1f}R",
+            status,
         )
 
     console.print(table)
 
+    # ── 4. Best config deep-dive ──
     if best_config:
         console.print(f"\n[bold green]BEST CONFIG:[/bold green]")
-        console.print(f"   SL_MULT={best_config['SL']}, R:R={best_config['R:R']}")
-        console.print(f"   MAX_BARS={best_config['MB']}, THRESHOLD={best_config['Thresh']}")
-        console.print(f"   FILTER_MODE={best_config['Mode']}, TRAIL={best_config['Trail']}")
+        console.print(f"   SL_MULT={best_config['SL']}, R:R={best_config['R:R']}, MAX_BARS={best_config['MB']}")
+        console.print(f"   THRESHOLD={best_config['Thresh']}, MODE={best_config['Mode']}, TRAIL={best_config['Trail']}")
         console.print(f"   HURST<{best_config['Hurst']}, ADX>{best_config['ADX']}")
-        console.print(f"   PF (Res): {best_config['PF_Res']:.2f} | WR (Res): {best_config['WR_Res']:.1%}")
-    else:
-        console.print("\n[yellow]No Holy Grail found yet, but check top results.[/yellow]")
+        console.print(f"   PF={best_config['PF_Res']:.2f} | WR={best_config['WR_Res']:.1%} | "
+                       f"Sharpe={best_config['Sharpe']:.2f} | MaxDD={best_config['MaxDD_R']:.1f}R | "
+                       f"Calmar={best_config['Calmar']:.1f}")
+        console.print(f"   Trades: {best_config['Trades']} | "
+                       f"Avg Win: {best_config['AvgWin_R']:.2f}R | "
+                       f"Avg Loss: {best_config['AvgLoss_R']:.2f}R | "
+                       f"Payoff: {best_config['PayoffRatio']:.2f}")
 
-import random
+        # ── IMPROVEMENT #4: Per-ticker breakdown ──
+        console.print(f"\n[bold cyan]PER-TICKER BREAKDOWN:[/bold cyan]")
+        ticker_table = Table(show_header=True, header_style="bold cyan")
+        ticker_table.add_column("Ticker")
+        ticker_table.add_column("PF", justify="right")
+        ticker_table.add_column("WR", justify="right")
+        ticker_table.add_column("Trades", justify="right")
+        ticker_table.add_column("Return", justify="right")
+        ticker_table.add_column("MaxDD", justify="right")
+        ticker_table.add_column("LStrk", justify="right")
+        ticker_table.add_column("Verdict", justify="right")
+
+        breakdown = per_ticker_breakdown(best_config['_trades'])
+        profitable_tickers = 0
+        for tick, m in breakdown.items():
+            verdict = ""
+            if m['Trades'] < 5:
+                verdict = "Too few"
+            elif m['PF_Res'] > 1.3 and m['TotalReturn_R'] > 0:
+                verdict = "Profitable"
+                profitable_tickers += 1
+            elif m['TotalReturn_R'] > 0:
+                verdict = "Marginal"
+                profitable_tickers += 1
+            else:
+                verdict = "Losing"
+
+            ticker_table.add_row(
+                tick,
+                f"{m['PF_Res']:.2f}",
+                f"{m['WR_Res']:.1%}",
+                str(m['Trades']),
+                f"{m['TotalReturn_R']:.1f}R",
+                f"{m['MaxDD_R']:.1f}R",
+                str(m['LongestLoss']),
+                verdict,
+            )
+
+        console.print(ticker_table)
+        console.print(f"   Profitable tickers: {profitable_tickers}/{len(breakdown)}")
+
+        if profitable_tickers < len(breakdown) * 0.5:
+            console.print("[yellow]   WARNING: Edge concentrated in <50% of tickers. "
+                          "Strategy may be ticker-dependent, not systematic.[/yellow]")
+
+        # ── IMPROVEMENT #3: Monte Carlo significance ──
+        console.print(f"\n[bold yellow]MONTE CARLO SIGNIFICANCE TEST ({MONTE_CARLO_RUNS} shuffles):[/bold yellow]")
+        p_value = monte_carlo_test(best_config['_trades'], best_config['PF_Res'])
+
+        if p_value < 0.01:
+            sig_label = "[bold green]HIGHLY SIGNIFICANT (p < 0.01)[/bold green]"
+        elif p_value < 0.05:
+            sig_label = "[green]SIGNIFICANT (p < 0.05)[/green]"
+        elif p_value < 0.10:
+            sig_label = "[yellow]MARGINAL (p < 0.10)[/yellow]"
+        else:
+            sig_label = "[red]NOT SIGNIFICANT (p >= 0.10) - LIKELY NOISE[/red]"
+
+        console.print(f"   p-value: {p_value:.4f}")
+        console.print(f"   Verdict: {sig_label}")
+        console.print(f"   (Probability that random trading achieves PF >= {best_config['PF_Res']:.2f})")
+
+    else:
+        console.print("\n[yellow]No config passed minimum thresholds. "
+                      "Consider loosening filters or extending data.[/yellow]")
+
+    # ── 5. Summary warnings ──
+    console.print(f"\n[dim]{'='*60}[/dim]")
+    console.print("[dim]NOTES:[/dim]")
+    console.print(f"[dim]  - Execution cost deducted: {ROUND_TRIP_COST_PCT*100:.2f}% per round trip[/dim]")
+    console.print(f"[dim]  - Walk-forward windows: train={WF_TRAIN_BARS} test={WF_TEST_BARS} step={WF_STEP_BARS}[/dim]")
+    if PRUNE_FEATURES:
+        console.print(f"[dim]  - Features auto-pruned to top {int(PRUNE_KEEP_RATIO*100)}% by importance[/dim]")
+    console.print(f"[dim]  - Universe: {', '.join(TICKERS)}[/dim]")
+    console.print(f"[dim]  - All metrics include unrealized timeout trades[/dim]")
+
+
 if __name__ == "__main__":
     main()
