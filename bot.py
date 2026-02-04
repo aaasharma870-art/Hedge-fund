@@ -128,7 +128,11 @@ import concurrent.futures, requests
 import optuna
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
+import importlib.metadata # FIX: Required for pandas_ta-openbb on some envs
+try:
+    import pandas_ta as ta
+except ImportError:
+    import pandas_ta_openbb as ta
 from collections import defaultdict, deque
 import joblib
 

@@ -31,6 +31,15 @@ import requests
 import threading
 import datetime
 
+import importlib.metadata # FIX: Required for pandas_ta-openbb
+try:
+    import pandas_ta as ta
+except ImportError:
+    import pandas_ta_openbb as ta
+
+from collections import defaultdict, deque
+import joblib
+
 try:
     import xgboost as xgb
     from rich.console import Console
