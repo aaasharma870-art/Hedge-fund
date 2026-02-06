@@ -30,6 +30,10 @@ from hedge_fund.objectives import profit_factor_objective, asymmetric_loss_objec
 from hedge_fund.optimization import PortfolioOptimizer
 from hedge_fund.governance import MonteCarloGovernor
 from hedge_fund.analysis import run_attribution_analysis
+from hedge_fund.config import save_optimal_params, load_optimal_params, apply_to_settings
+from hedge_fund.dashboard import Dashboard
+from hedge_fund.scanner import CandidateScanner
+from hedge_fund.ensemble import EnsembleModel
 
 __all__ = [
     "ManualTA",
@@ -54,4 +58,10 @@ __all__ = [
     "PortfolioOptimizer",
     "MonteCarloGovernor",
     "run_attribution_analysis",
+    "save_optimal_params",
+    "load_optimal_params",
+    "apply_to_settings",
+    "Dashboard",
+    "CandidateScanner",
+    "EnsembleModel",
 ]

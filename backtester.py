@@ -1,6 +1,10 @@
 # ==============================================================================
-# GOD MODE BACKTESTER V6.1: OPTUNA BAYESIAN + STATEFUL SIMULATION
+# GOD MODE BACKTESTER V6.2: OPTUNA BAYESIAN + ENSEMBLE + PARETO
 # ==============================================================================
+# V6.2 additions:
+#   1. Ensemble model stacking (XGBoost + LightGBM + Ridge -> meta-learner)
+#   2. Multi-objective Optuna: Pareto frontier for PF vs MaxDD
+#   3. Config sync: saves optimal params to JSON for bot auto-loading
 # V6.1 fixes over V6:
 #   1. Label-parameter alignment: SL/TP label buckets match Optuna trials
 #   2. Holdout validation: final N bars reserved, Optuna never sees them
@@ -77,6 +81,8 @@ from hedge_fund.features import (
 from hedge_fund.data import RateLimiter
 from hedge_fund.governance import MonteCarloGovernor
 from hedge_fund.risk import kelly_criterion, SlippageCalculator
+from hedge_fund.config import save_optimal_params
+from hedge_fund.ensemble import EnsembleModel
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -146,6 +152,12 @@ LABEL_BUCKETS = [
 
 # --- Holdout settings ---
 HOLDOUT_BARS = 500  # Reserve last ~3 months as final validation
+
+# --- Ensemble settings ---
+USE_ENSEMBLE = True  # Use XGBoost + LightGBM + Ridge stacked ensemble
+
+# --- Multi-objective settings ---
+MULTI_OBJECTIVE = True  # Pareto frontier: maximize PF, minimize MaxDD
 
 ta = ManualTA
 console = Console()
@@ -425,19 +437,22 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
             start += step_bars
             continue
 
-        model = xgb.XGBRegressor(
-            n_estimators=100,
-            max_depth=2,
-            learning_rate=0.05,
-            subsample=0.50,
-            colsample_bytree=0.50,
-            min_child_weight=10,
-            reg_alpha=5.0,
-            reg_lambda=10.0,
-            gamma=0.5,
-            n_jobs=-1,
-            verbosity=0,
-        )
+        if USE_ENSEMBLE:
+            model = EnsembleModel()
+        else:
+            model = xgb.XGBRegressor(
+                n_estimators=100,
+                max_depth=2,
+                learning_rate=0.05,
+                subsample=0.50,
+                colsample_bytree=0.50,
+                min_child_weight=10,
+                reg_alpha=5.0,
+                reg_lambda=10.0,
+                gamma=0.5,
+                n_jobs=-1,
+                verbosity=0,
+            )
         model.fit(train_df[active_features], train_df['Target'])
 
         importance_accum[:len(active_features)] += model.feature_importances_
@@ -492,12 +507,15 @@ def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
             start += step_bars
             continue
 
-        model = xgb.XGBRegressor(
-            n_estimators=100, max_depth=2, learning_rate=0.05,
-            subsample=0.50, colsample_bytree=0.50, min_child_weight=10,
-            reg_alpha=5.0, reg_lambda=10.0, gamma=0.5,
-            n_jobs=-1, verbosity=0,
-        )
+        if USE_ENSEMBLE:
+            model = EnsembleModel()
+        else:
+            model = xgb.XGBRegressor(
+                n_estimators=100, max_depth=2, learning_rate=0.05,
+                subsample=0.50, colsample_bytree=0.50, min_child_weight=10,
+                reg_alpha=5.0, reg_lambda=10.0, gamma=0.5,
+                n_jobs=-1, verbosity=0,
+            )
         model.fit(train_df[features], train_df['Target'])
         preds = model.predict(test_df[features])
         test_df['Predictions'] = preds
@@ -1023,21 +1041,16 @@ def create_optuna_objective(predictions_cache_by_bucket):
             all_trades.extend(t_results)
 
         if len(all_trades) < 15:
+            if MULTI_OBJECTIVE:
+                return 0.0, 99.0  # bad PF, bad DD
             return 0.0  # Not enough trades
 
         metrics = compute_risk_metrics(all_trades)
 
-        # Multi-objective scoring: PF * WR * sqrt(Trades) / (1 + |MaxDD|)
-        # Penalize low trade count and deep drawdowns
         pf = metrics['PF_Res']
         wr = metrics['WR_Res']
         n = metrics['Trades']
         dd = abs(metrics['MaxDD_R'])
-
-        if pf < 1.0 or wr < 0.40:
-            return 0.0
-
-        score = pf * wr * np.sqrt(n) / (1.0 + dd)
 
         # Store metrics for later retrieval
         trial.set_user_attr("metrics", metrics)
@@ -1045,6 +1058,19 @@ def create_optuna_objective(predictions_cache_by_bucket):
         trial.set_user_attr("tp_mult", tp_mult)
         trial.set_user_attr("bucket_key", list(bucket_key))
 
+        if pf < 1.0 or wr < 0.40:
+            if MULTI_OBJECTIVE:
+                return 0.0, dd if dd > 0 else 99.0
+            return 0.0
+
+        if MULTI_OBJECTIVE:
+            # Objective 1: maximize composite score (PF * WR * sqrt(N))
+            # Objective 2: minimize max drawdown
+            score = pf * wr * np.sqrt(n)
+            return score, dd
+
+        # Single objective: composite score
+        score = pf * wr * np.sqrt(n) / (1.0 + dd)
         return score
 
     return objective
@@ -1055,7 +1081,7 @@ def create_optuna_objective(predictions_cache_by_bucket):
 # ==============================================================================
 
 def main():
-    console.print("[bold green]GOD MODE BACKTESTER V6.1 (OPTUNA BAYESIAN + STATEFUL SIM)[/bold green]")
+    console.print("[bold green]GOD MODE BACKTESTER V6.2 (OPTUNA + ENSEMBLE + PARETO)[/bold green]")
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
     console.print(f"[dim]Feature pruning: {'ON (keep top '+str(int(PRUNE_KEEP_RATIO*100))+'%)' if PRUNE_FEATURES else 'OFF'}[/dim]")
@@ -1137,24 +1163,28 @@ def main():
         return
 
     # ── 3. Optuna Bayesian Optimization (with persistence) ──
-    print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials)...")
+    mode_str = "multi-objective (PF vs MaxDD)" if MULTI_OBJECTIVE else "single-objective"
+    print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials, {mode_str})...")
+
+    study_kwargs = {
+        "study_name": "backtester_v6",
+        "sampler": optuna.samplers.TPESampler(seed=42),
+    }
+
+    if MULTI_OBJECTIVE:
+        study_kwargs["directions"] = ["maximize", "minimize"]
+    else:
+        study_kwargs["direction"] = "maximize"
 
     try:
         study = optuna.create_study(
-            direction="maximize",
-            study_name="backtester_v6",
             storage=OPTUNA_STORAGE,
             load_if_exists=True,
-            sampler=optuna.samplers.TPESampler(seed=42),
+            **study_kwargs,
         )
         print(f"   Optuna study persisted to {OPTUNA_STORAGE}")
     except Exception:
-        # Fallback to in-memory if SQLite fails
-        study = optuna.create_study(
-            direction="maximize",
-            study_name="backtester_v6",
-            sampler=optuna.samplers.TPESampler(seed=42),
-        )
+        study = optuna.create_study(**study_kwargs)
         print("   Optuna study in-memory (SQLite unavailable)")
 
     objective = create_optuna_objective(predictions_cache_by_bucket)
@@ -1166,8 +1196,19 @@ def main():
     for trial in study.trials:
         if trial.state != optuna.trial.TrialState.COMPLETE:
             continue
-        if trial.value is None or trial.value <= 0:
-            continue
+        # Handle both single and multi-objective trial values
+        if MULTI_OBJECTIVE:
+            if trial.values is None or len(trial.values) < 2:
+                continue
+            score_val = trial.values[0]  # composite
+            dd_val = trial.values[1]     # drawdown
+            if score_val <= 0:
+                continue
+            composite_score = score_val / (1.0 + dd_val)
+        else:
+            if trial.value is None or trial.value <= 0:
+                continue
+            composite_score = trial.value
 
         metrics = trial.user_attrs.get("metrics", _empty_metrics())
         all_trades = trial.user_attrs.get("trades", [])
@@ -1184,7 +1225,7 @@ def main():
             "Regime": str(trial.params.get("regime_hurst_filter", True)),
             **metrics,
             "_trades": all_trades,
-            "_score": trial.value,
+            "_score": composite_score,
         }
         results.append(result)
 
@@ -1193,6 +1234,16 @@ def main():
         return
 
     results.sort(key=lambda x: x['_score'], reverse=True)
+
+    # Show Pareto front if multi-objective
+    if MULTI_OBJECTIVE:
+        try:
+            pareto_trials = optuna.importance.get_pareto_front_trials(study) \
+                if hasattr(optuna.importance, 'get_pareto_front_trials') \
+                else study.best_trials
+            console.print(f"\n[bold cyan]PARETO FRONT: {len(pareto_trials)} non-dominated configs[/bold cyan]")
+        except Exception:
+            pass
 
     # ── 5. Display top results ──
     print("\n" + "=" * 110)
@@ -1414,11 +1465,21 @@ def main():
         else:
             console.print("\n[yellow]No holdout data available (tickers too short)[/yellow]")
 
+        # ── 8. Save optimal parameters for bot ──
+        console.print(f"\n[bold green]SAVING OPTIMAL PARAMETERS...[/bold green]")
+        try:
+            holdout_m = h_metrics if 'h_metrics' in dir() else None
+            config_path = save_optimal_params(best_config, holdout_metrics=holdout_m)
+            console.print(f"   Saved to {config_path}")
+            console.print(f"   Bot will auto-load these on next startup")
+        except Exception as e:
+            console.print(f"   [red]Failed to save config: {e}[/red]")
+
     else:
         console.print("\n[yellow]No config passed minimum thresholds. "
                       "Consider loosening filters or extending data.[/yellow]")
 
-    # ── 8. Summary ──
+    # ── 9. Summary ──
     console.print(f"\n[dim]{'='*60}[/dim]")
     console.print("[dim]NOTES:[/dim]")
     console.print(f"[dim]  - Execution cost deducted: {ROUND_TRIP_COST_PCT*100:.2f}% per round trip[/dim]")
@@ -1428,8 +1489,10 @@ def main():
     console.print(f"[dim]  - Optuna trials: {OPTUNA_N_TRIALS} (TPE Bayesian sampler, persistent)[/dim]")
     console.print(f"[dim]  - Label buckets: {len(LABEL_BUCKETS)} SL/TP combos (labels match simulation)[/dim]")
     console.print(f"[dim]  - Holdout: {HOLDOUT_BARS} bars reserved for out-of-sample validation[/dim]")
-    console.print(f"[dim]  - V6.1: Partial profits, regime logic, Kelly sizing, MC Governor[/dim]")
-    console.print(f"[dim]  - V6.1: Actual bars_held tracking, parallel fetch, Optuna persistence[/dim]")
+    console.print(f"[dim]  - Ensemble: {'XGB+LGB+Ridge stacked' if USE_ENSEMBLE else 'XGBoost only'}[/dim]")
+    console.print(f"[dim]  - Optuna mode: {'multi-objective Pareto (PF vs DD)' if MULTI_OBJECTIVE else 'single composite score'}[/dim]")
+    console.print(f"[dim]  - V6.2: Partial profits, regime logic, Kelly sizing, MC Governor[/dim]")
+    console.print(f"[dim]  - V6.2: Ensemble stacking, Pareto optimization, config sync[/dim]")
     console.print(f"[dim]  - Universe: {', '.join(TICKERS)}[/dim]")
     console.print(f"[dim]  - All metrics include unrealized timeout trades[/dim]")
 
