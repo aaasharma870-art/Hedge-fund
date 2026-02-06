@@ -1,6 +1,12 @@
 # ==============================================================================
-# GOD MODE BACKTESTER V6: OPTUNA BAYESIAN + STATEFUL SIMULATION
+# GOD MODE BACKTESTER V6.1: OPTUNA BAYESIAN + STATEFUL SIMULATION
 # ==============================================================================
+# V6.1 fixes over V6:
+#   1. Label-parameter alignment: SL/TP label buckets match Optuna trials
+#   2. Holdout validation: final N bars reserved, Optuna never sees them
+#   3. Actual bars_held tracking (was always max_bars, now tracks real exit)
+#   4. Parallel data fetching via ThreadPoolExecutor
+#   5. Optuna SQLite persistence for cross-run study tracking
 # V6 upgrades over V5:
 #   1. Optuna Bayesian optimization (replaces grid search)
 #   2. Stateful simulation with MonteCarloGovernor equity tracking
@@ -30,12 +36,16 @@ import pandas as pd
 import requests
 import threading
 import datetime
+import concurrent.futures
 
-import importlib.metadata # FIX: Required for pandas_ta-openbb
 try:
+    import importlib.metadata  # FIX: Required for pandas_ta-openbb
     import pandas_ta as ta
 except ImportError:
-    import pandas_ta_openbb as ta
+    try:
+        import pandas_ta_openbb as ta
+    except ImportError:
+        ta = None  # Will be replaced by ManualTA below
 
 from collections import defaultdict, deque
 import joblib
@@ -122,6 +132,20 @@ PRUNE_KEEP_RATIO = 0.5
 # --- Optuna settings ---
 OPTUNA_N_TRIALS = 60     # Bayesian optimization trials
 OPTUNA_TIMEOUT = None    # No time limit (set to seconds to cap)
+OPTUNA_STORAGE = "sqlite:///optuna_backtester.db"  # Persistent study storage
+
+# --- SL/TP label buckets for Optuna ---
+# Pre-compute labels for a small set of SL/TP combos so Optuna trials
+# use labels that match their simulation parameters.
+LABEL_BUCKETS = [
+    (1.0, 2.0, 8),
+    (1.5, 3.0, 10),
+    (2.0, 4.0, 12),
+    (2.5, 5.0, 14),
+]
+
+# --- Holdout settings ---
+HOLDOUT_BARS = 500  # Reserve last ~3 months as final validation
 
 ta = ManualTA
 console = Console()
@@ -654,7 +678,7 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
 
         outcome = partial_r['total_r']
         is_resolved = partial_r['resolved']
-        bars_held = max_bars
+        bars_held = partial_r.get('bars_held', max_bars)
 
         # Deduct execution costs via SlippageCalculator
         cost_r = SLIPPAGE.cost_in_r(entry, sl_dist)
@@ -713,13 +737,13 @@ def _simulate_with_partial(future_high, future_low, close, idx, max_bars,
         if side == 'LONG':
             if l <= sl:
                 # Full stop loss before any partial
-                return {'total_r': -1.0, 'resolved': True}
+                return {'total_r': -1.0, 'resolved': True, 'bars_held': j + 1}
             if h >= partial_tp_level and not partial_hit:
                 partial_hit = True
                 break
         else:
             if h >= sl:
-                return {'total_r': -1.0, 'resolved': True}
+                return {'total_r': -1.0, 'resolved': True, 'bars_held': j + 1}
             if l <= partial_tp_level and not partial_hit:
                 partial_hit = True
                 break
@@ -728,33 +752,44 @@ def _simulate_with_partial(future_high, future_low, close, idx, max_bars,
         # No partial hit, simulate normally
         outcome_str, exit_price = _simulate_exit(future_high, future_low, sl, tp, side, trail_dist)
 
+        # Find actual exit bar
+        exit_bar = len(future_high)  # default: timeout at end
+        if outcome_str in ('win', 'loss', 'trail_stop'):
+            for k in range(len(future_high)):
+                fh, fl = future_high[k], future_low[k]
+                if side == 'LONG':
+                    if fl <= sl or fh >= tp:
+                        exit_bar = k + 1
+                        break
+                else:
+                    if fh >= sl or fl <= tp:
+                        exit_bar = k + 1
+                        break
+
         if outcome_str == 'win':
-            return {'total_r': rr, 'resolved': True}
+            return {'total_r': rr, 'resolved': True, 'bars_held': exit_bar}
         elif outcome_str == 'loss':
-            return {'total_r': -1.0, 'resolved': True}
+            return {'total_r': -1.0, 'resolved': True, 'bars_held': exit_bar}
         elif outcome_str == 'trail_stop':
             if side == 'LONG':
                 raw_pnl = exit_price - entry
             else:
                 raw_pnl = entry - exit_price
             r_val = raw_pnl / sl_dist if sl_dist > 0 else 0.0
-            return {'total_r': r_val, 'resolved': True}
+            return {'total_r': r_val, 'resolved': True, 'bars_held': exit_bar}
         else:
             n = len(close)
             exit_idx = min(idx + max_bars, n - 1)
             exit_p = close[exit_idx]
             raw = (exit_p - entry) if side == 'LONG' else (entry - exit_p)
             r_val = raw / sl_dist if sl_dist > 0 else 0.0
-            return {'total_r': r_val, 'resolved': False}
+            return {'total_r': r_val, 'resolved': False, 'bars_held': max_bars}
 
     # Partial hit: 1/3 locked at scale_out_r, 2/3 continues
     partial_pnl = (1.0 / 3.0) * scale_out_r
 
     # Move stop to breakeven for remaining 2/3
-    if side == 'LONG':
-        new_sl = entry  # breakeven
-    else:
-        new_sl = entry
+    new_sl = entry  # breakeven for both LONG and SHORT
 
     # Simulate remaining 2/3 from partial hit point onward
     remaining_high = future_high[j + 1:] if j + 1 < len(future_high) else np.array([])
@@ -762,11 +797,27 @@ def _simulate_with_partial(future_high, future_low, close, idx, max_bars,
 
     if len(remaining_high) == 0:
         # Partial was hit on last bar
-        return {'total_r': partial_pnl, 'resolved': True}
+        return {'total_r': partial_pnl, 'resolved': True, 'bars_held': j + 1}
 
     remaining_out, remaining_exit = _simulate_exit(
         remaining_high, remaining_low, new_sl, tp, side, trail_dist
     )
+
+    # Find exit bar in remaining segment
+    remaining_exit_bar = len(remaining_high)
+    if remaining_out in ('win', 'loss', 'trail_stop'):
+        for k in range(len(remaining_high)):
+            fh, fl = remaining_high[k], remaining_low[k]
+            if side == 'LONG':
+                if fl <= new_sl or fh >= tp:
+                    remaining_exit_bar = k + 1
+                    break
+            else:
+                if fh >= new_sl or fl <= tp:
+                    remaining_exit_bar = k + 1
+                    break
+
+    total_bars = j + 1 + remaining_exit_bar
 
     if remaining_out == 'win':
         remaining_r = rr
@@ -788,7 +839,7 @@ def _simulate_with_partial(future_high, future_low, close, idx, max_bars,
 
     total_r = partial_pnl + (2.0 / 3.0) * remaining_r
     resolved = remaining_out in ('win', 'loss', 'trail_stop')
-    return {'total_r': total_r, 'resolved': resolved}
+    return {'total_r': total_r, 'resolved': resolved, 'bars_held': total_bars}
 
 
 # ==============================================================================
@@ -920,10 +971,25 @@ def monte_carlo_test(trades, observed_pf, n_simulations=MONTE_CARLO_RUNS):
 # V6: OPTUNA OBJECTIVE
 # ==============================================================================
 
-def create_optuna_objective(predictions_cache):
+def _pick_label_bucket(sl_mult, tp_rr):
+    """Select the closest pre-computed label bucket for given SL/TP params."""
+    tp_mult = sl_mult * tp_rr
+    best = None
+    best_dist = float('inf')
+    for b_sl, b_tp, b_mb in LABEL_BUCKETS:
+        dist = abs(sl_mult - b_sl) + abs(tp_mult - b_tp)
+        if dist < best_dist:
+            best_dist = dist
+            best = (b_sl, b_tp, b_mb)
+    return best
+
+
+def create_optuna_objective(predictions_cache_by_bucket):
     """
-    Create an Optuna objective function that evaluates parameter combinations
-    using the pre-computed walk-forward predictions cache.
+    Create an Optuna objective function that evaluates parameter combinations.
+
+    Uses label-bucket-aware predictions: each SL/TP bucket has its own
+    walk-forward predictions so labels match simulation parameters.
     """
     def objective(trial):
         # Bayesian search space
@@ -938,6 +1004,12 @@ def create_optuna_objective(predictions_cache):
         filter_mode = trial.suggest_categorical("filter_mode", ["STRICT", "MODERATE", "MINIMAL"])
         scale_out_r = trial.suggest_float("scale_out_r", 1.0, 2.0, step=0.25)
         regime_hurst = trial.suggest_categorical("regime_hurst_filter", [True, False])
+
+        # Pick the label bucket whose SL/TP best matches this trial
+        bucket_key = _pick_label_bucket(sl_mult, tp_rr)
+        predictions_cache = predictions_cache_by_bucket.get(bucket_key, {})
+        if not predictions_cache:
+            return 0.0
 
         all_trades = []
         for t, test_df in predictions_cache.items():
@@ -971,6 +1043,7 @@ def create_optuna_objective(predictions_cache):
         trial.set_user_attr("metrics", metrics)
         trial.set_user_attr("trades", all_trades)
         trial.set_user_attr("tp_mult", tp_mult)
+        trial.set_user_attr("bucket_key", list(bucket_key))
 
         return score
 
@@ -982,62 +1055,109 @@ def create_optuna_objective(predictions_cache):
 # ==============================================================================
 
 def main():
-    console.print("[bold green]GOD MODE BACKTESTER V6 (OPTUNA BAYESIAN + STATEFUL SIM)[/bold green]")
+    console.print("[bold green]GOD MODE BACKTESTER V6.1 (OPTUNA BAYESIAN + STATEFUL SIM)[/bold green]")
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
     console.print(f"[dim]Feature pruning: {'ON (keep top '+str(int(PRUNE_KEEP_RATIO*100))+'%)' if PRUNE_FEATURES else 'OFF'}[/dim]")
     console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
-    console.print(f"[dim]V6 features: Partial profits, regime logic, Kelly sizing, MC Governor[/dim]\n")
+    console.print(f"[dim]Label buckets: {len(LABEL_BUCKETS)} SL/TP combos | Holdout: {HOLDOUT_BARS} bars[/dim]")
+    console.print(f"[dim]V6.1 fixes: Label-matched buckets, holdout validation, actual bars_held, parallel fetch[/dim]\n")
 
-    # ── 1. Download & Prep ──
+    # ── 1. Download & Prep (parallel) ──
     poly = Polygon_Helper()
     data_cache = {}
-    print("Downloading data (3-year lookback)...")
+    print(f"Downloading data (3-year lookback, {IO_WORKERS} workers)...")
 
-    for t in TICKERS:
+    def _fetch_and_prep(t):
         try:
             raw = poly.fetch_data(t, days=LOOKBACK_DAYS, mult=1, timespan='hour')
             if len(raw) > 500:
                 df_proc = prepare_features(raw)
                 df_proc['_ticker'] = t
-                data_cache[t] = df_proc
-                print(f"   {t}: {len(df_proc)} bars ({df_proc.index[0].date()} to {df_proc.index[-1].date()})")
+                return t, df_proc
             else:
                 print(f"   {t}: Insufficient data ({len(raw)} bars)")
+                return t, None
         except Exception as e:
             print(f"   {t}: Failed ({e})")
+            return t, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=IO_WORKERS) as executor:
+        futures = {executor.submit(_fetch_and_prep, t): t for t in TICKERS}
+        for future in concurrent.futures.as_completed(futures):
+            t, df_proc = future.result()
+            if df_proc is not None:
+                data_cache[t] = df_proc
+                print(f"   {t}: {len(df_proc)} bars ({df_proc.index[0].date()} to {df_proc.index[-1].date()})")
 
     if not data_cache:
         print("No data available. Set POLYGON_API_KEY env var.")
         return
 
-    # ── 2. Walk-Forward Training (once, shared across Optuna trials) ──
-    print("\nRunning walk-forward training (shared across all Optuna trials)...")
-    # Use middle-of-range SL/TP for training labels (Optuna varies filters, not labels)
-    base_sl = 1.5
-    base_tp = 3.0
-    base_mb = 10
-
-    predictions_cache = {}
+    # ── 1b. Split holdout ──
+    # Reserve the last HOLDOUT_BARS from each ticker for final validation.
+    # Optuna only sees data before the holdout cutoff.
+    train_data = {}
+    holdout_data = {}
     for t, df in data_cache.items():
-        wf_result, pruned_feats = walk_forward_train_predict(
-            df, ALL_FEATURES, base_sl, base_tp, base_mb)
-        if wf_result is not None:
-            predictions_cache[t] = wf_result
-            print(f"   {t}: {len(wf_result)} test predictions generated")
+        if len(df) > HOLDOUT_BARS + WF_TRAIN_BARS:
+            train_data[t] = df.iloc[:-HOLDOUT_BARS]
+            holdout_data[t] = df.iloc[-HOLDOUT_BARS:]
+            print(f"   {t}: Train {len(train_data[t])} bars | Holdout {len(holdout_data[t])} bars")
+        else:
+            train_data[t] = df
+            holdout_data[t] = None
+            print(f"   {t}: All {len(df)} bars used for training (insufficient for holdout)")
 
-    if not predictions_cache:
+    # ── 2. Walk-Forward Training per label bucket ──
+    # Train separate models for each SL/TP bucket so labels match Optuna's
+    # simulation parameters.
+    print(f"\nRunning walk-forward training for {len(LABEL_BUCKETS)} label buckets...")
+    predictions_cache_by_bucket = {}
+
+    for bucket_sl, bucket_tp, bucket_mb in LABEL_BUCKETS:
+        bucket_key = (bucket_sl, bucket_tp, bucket_mb)
+        bucket_cache = {}
+        print(f"\n   Bucket SL={bucket_sl} TP={bucket_tp} MB={bucket_mb}:")
+
+        for t, df in train_data.items():
+            wf_result, pruned_feats = walk_forward_train_predict(
+                df, ALL_FEATURES, bucket_sl, bucket_tp, bucket_mb)
+            if wf_result is not None:
+                bucket_cache[t] = wf_result
+                print(f"      {t}: {len(wf_result)} test predictions")
+
+        if bucket_cache:
+            predictions_cache_by_bucket[bucket_key] = bucket_cache
+            print(f"   Bucket ({bucket_sl},{bucket_tp},{bucket_mb}): "
+                  f"{len(bucket_cache)} tickers ready")
+
+    if not predictions_cache_by_bucket:
         print("Walk-forward produced no predictions. Check data quality.")
         return
 
-    # ── 3. Optuna Bayesian Optimization ──
+    # ── 3. Optuna Bayesian Optimization (with persistence) ──
     print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials)...")
 
-    study = optuna.create_study(direction="maximize",
-                                 study_name="backtester_v6",
-                                 sampler=optuna.samplers.TPESampler(seed=42))
+    try:
+        study = optuna.create_study(
+            direction="maximize",
+            study_name="backtester_v6",
+            storage=OPTUNA_STORAGE,
+            load_if_exists=True,
+            sampler=optuna.samplers.TPESampler(seed=42),
+        )
+        print(f"   Optuna study persisted to {OPTUNA_STORAGE}")
+    except Exception:
+        # Fallback to in-memory if SQLite fails
+        study = optuna.create_study(
+            direction="maximize",
+            study_name="backtester_v6",
+            sampler=optuna.samplers.TPESampler(seed=42),
+        )
+        print("   Optuna study in-memory (SQLite unavailable)")
 
-    objective = create_optuna_objective(predictions_cache)
+    objective = create_optuna_objective(predictions_cache_by_bucket)
     study.optimize(objective, n_trials=OPTUNA_N_TRIALS, timeout=OPTUNA_TIMEOUT,
                    show_progress_bar=True)
 
@@ -1207,20 +1327,109 @@ def main():
         console.print(f"   Verdict: {sig_label}")
         console.print(f"   (Probability that random trading achieves PF >= {best_config['PF_Res']:.2f})")
 
+        # ── 7. HOLDOUT VALIDATION ──
+        # Evaluate the best config on data Optuna never saw
+        holdout_tickers_with_data = {t: h for t, h in holdout_data.items() if h is not None and len(h) > 100}
+        if holdout_tickers_with_data:
+            console.print(f"\n[bold magenta]HOLDOUT VALIDATION ({HOLDOUT_BARS} bars, unseen by Optuna):[/bold magenta]")
+
+            # Get best config params
+            best_sl = best_config['SL']
+            best_tp_rr = float(best_config['R:R'].split(':')[1])
+            best_tp_mult = best_sl * best_tp_rr
+            best_mb = best_config['MB']
+            best_thresh = best_config['Thresh']
+            best_trail = float(best_config['Trail'])
+            best_hurst = float(best_config['Hurst'])
+            best_adx = int(best_config['ADX'])
+            best_mode = best_config['Mode']
+            best_scale = float(best_config['ScaleOut'])
+            best_regime = best_config['Regime'] == 'True'
+
+            # Run walk-forward on holdout data to get predictions
+            holdout_trades = []
+            for t, h_df in holdout_tickers_with_data.items():
+                # Use the training data to build a model, then predict on holdout
+                full_df = data_cache[t]
+                train_portion = full_df.iloc[:-HOLDOUT_BARS]
+                if len(train_portion) < WF_TRAIN_BARS:
+                    continue
+
+                # Train on last WF_TRAIN_BARS of training data
+                train_slice = train_portion.iloc[-WF_TRAIN_BARS:]
+                labels = compute_bracket_labels(train_slice, sl_mult=best_sl,
+                                                tp_mult=best_tp_mult, max_bars=best_mb)
+                train_slice = train_slice.copy()
+                train_slice['Target'] = labels
+
+                avail_feats = [f for f in ALL_FEATURES if f in train_slice.columns and f in h_df.columns]
+                if len(avail_feats) < 5:
+                    continue
+
+                model = xgb.XGBRegressor(
+                    n_estimators=100, max_depth=2, learning_rate=0.05,
+                    subsample=0.50, colsample_bytree=0.50, min_child_weight=10,
+                    reg_alpha=5.0, reg_lambda=10.0, gamma=0.5,
+                    n_jobs=-1, verbosity=0,
+                )
+                model.fit(train_slice[avail_feats], train_slice['Target'])
+
+                holdout_df = h_df.copy()
+                holdout_df['Predictions'] = model.predict(holdout_df[avail_feats])
+
+                h_trades = simulate_trades_stateful(
+                    holdout_df, best_thresh, best_sl, best_tp_mult, best_mb,
+                    trail_mult=best_trail, filter_mode=best_mode,
+                    hurst_limit=best_hurst, adx_min=best_adx,
+                    scale_out_r=best_scale, use_kelly=True,
+                    regime_hurst_filter=best_regime,
+                )
+                holdout_trades.extend(h_trades)
+
+            if holdout_trades and len(holdout_trades) >= 5:
+                h_metrics = compute_risk_metrics(holdout_trades)
+                console.print(f"   Trades: {h_metrics['Trades']} | "
+                               f"PF: {h_metrics['PF_Res']:.2f} | "
+                               f"WR: {h_metrics['WR_Res']:.1%} | "
+                               f"Sharpe: {h_metrics['Sharpe']:.2f} | "
+                               f"MaxDD: {h_metrics['MaxDD_R']:.1f}R | "
+                               f"Return: {h_metrics['TotalReturn_R']:.1f}R")
+
+                # Compare in-sample vs holdout
+                is_pf = best_config['PF_Res']
+                ho_pf = h_metrics['PF_Res']
+                decay = (is_pf - ho_pf) / is_pf * 100 if is_pf > 0 else 0
+
+                if ho_pf >= 1.3 and h_metrics['WR_Res'] >= 0.45:
+                    console.print(f"   [bold green]HOLDOUT PASSED[/bold green] "
+                                   f"(PF decay: {decay:.0f}%)")
+                elif ho_pf >= 1.0:
+                    console.print(f"   [yellow]HOLDOUT MARGINAL[/yellow] "
+                                   f"(PF decay: {decay:.0f}% - edge weakened out-of-sample)")
+                else:
+                    console.print(f"   [red]HOLDOUT FAILED[/red] "
+                                   f"(PF decay: {decay:.0f}% - likely overfit)")
+            else:
+                console.print("   [yellow]Not enough holdout trades for evaluation[/yellow]")
+        else:
+            console.print("\n[yellow]No holdout data available (tickers too short)[/yellow]")
+
     else:
         console.print("\n[yellow]No config passed minimum thresholds. "
                       "Consider loosening filters or extending data.[/yellow]")
 
-    # ── 7. Summary ──
+    # ── 8. Summary ──
     console.print(f"\n[dim]{'='*60}[/dim]")
     console.print("[dim]NOTES:[/dim]")
     console.print(f"[dim]  - Execution cost deducted: {ROUND_TRIP_COST_PCT*100:.2f}% per round trip[/dim]")
     console.print(f"[dim]  - Walk-forward windows: train={WF_TRAIN_BARS} test={WF_TEST_BARS} step={WF_STEP_BARS}[/dim]")
     if PRUNE_FEATURES:
         console.print(f"[dim]  - Features auto-pruned to top {int(PRUNE_KEEP_RATIO*100)}% by importance[/dim]")
-    console.print(f"[dim]  - Optuna trials: {OPTUNA_N_TRIALS} (TPE Bayesian sampler)[/dim]")
-    console.print(f"[dim]  - V6: Partial profits at scale-out, regime-aware filters, Kelly sizing[/dim]")
-    console.print(f"[dim]  - V6: MonteCarloGovernor risk scaling (DD-adaptive)[/dim]")
+    console.print(f"[dim]  - Optuna trials: {OPTUNA_N_TRIALS} (TPE Bayesian sampler, persistent)[/dim]")
+    console.print(f"[dim]  - Label buckets: {len(LABEL_BUCKETS)} SL/TP combos (labels match simulation)[/dim]")
+    console.print(f"[dim]  - Holdout: {HOLDOUT_BARS} bars reserved for out-of-sample validation[/dim]")
+    console.print(f"[dim]  - V6.1: Partial profits, regime logic, Kelly sizing, MC Governor[/dim]")
+    console.print(f"[dim]  - V6.1: Actual bars_held tracking, parallel fetch, Optuna persistence[/dim]")
     console.print(f"[dim]  - Universe: {', '.join(TICKERS)}[/dim]")
     console.print(f"[dim]  - All metrics include unrealized timeout trades[/dim]")
 
