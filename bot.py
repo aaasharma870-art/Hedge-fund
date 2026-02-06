@@ -163,9 +163,9 @@ import yfinance as yf
 from logging.handlers import RotatingFileHandler
 
 # --- "ONE BRAIN" IMPORTS ---
-from hedge_fund.risk import MonteCarloGovernor, OvernightGapModel, SlippageCalculator
+from hedge_fund.governance import MonteCarloGovernor
 from hedge_fund.optimization import PortfolioOptimizer
-from hedge_fund.governance import MonteCarloGovernor # Prefer the dedicated module
+from hedge_fund.risk import OvernightGapModel, SlippageCalculator
 from hedge_fund.analysis import run_attribution_analysis
 from hedge_fund.features import CrossSectionalRanker
 
@@ -250,15 +250,7 @@ logging.info(f"🔥 HARDWARE: {NUM_CORES} CS | {IO_WORKERS} I/O Workers | Optimi
 # ==============================================================================
 
 
-# ==============================================================================
-# SHARED MODULES (from hedge_fund package)
-# ==============================================================================
-
-from hedge_fund.governance import MonteCarloGovernor
-from hedge_fund.optimization import PortfolioOptimizer
-from hedge_fund.features import CrossSectionalRanker
-from hedge_fund.risk import OvernightGapModel, SlippageCalculator
-from hedge_fund.analysis import run_attribution_analysis as _run_attribution
+# (shared modules already imported above in "ONE BRAIN" section)
 
 
 
