@@ -3,10 +3,10 @@
 A hedge-fund-grade quantitative trading system that combines machine learning signal generation, Bayesian parameter optimization, and institutional risk management to trade US equities.
 
 **Two components work together:**
-- **`backtester.py`** (V6.1) -- Optuna Bayesian optimizer that finds the best trading parameters across 18 diversified stocks using walk-forward validation, Monte Carlo significance testing, and out-of-sample holdout verification.
-- **`bot.py`** (v14.3) -- Live trading bot that executes on Alpaca using XGBoost predictions, ATR-bracket trades, and multi-layered risk controls. Designed for Google Colab Pro+.
+- **`backtester.py`** (V6.2) -- Multi-objective Optuna Bayesian optimizer with ensemble model stacking (XGBoost + LightGBM + Ridge). Finds the best trading parameters across 18 diversified stocks using walk-forward validation, Pareto frontier optimization, Monte Carlo significance testing, and out-of-sample holdout verification. Saves optimal params to JSON for the bot.
+- **`bot.py`** (v14.3) -- Live trading bot that executes on Alpaca using XGBoost predictions, ATR-bracket trades, and multi-layered risk controls. Auto-loads optimized parameters from the backtester. Designed for Google Colab Pro+.
 
-The backtester discovers the optimal parameters. The bot uses them to trade live.
+The backtester discovers the optimal parameters and saves them. The bot auto-loads and uses them to trade live.
 
 ---
 
@@ -38,7 +38,7 @@ This is a **systematic quantitative trading system** -- the same type of approac
 
 ```
 Hedge-fund/
-├── backtester.py              # V6.1 Optuna Bayesian optimizer
+├── backtester.py              # V6.2 Optuna Bayesian + Ensemble + Pareto
 ├── bot.py                     # v14.3 Live trading bot (Colab Pro+)
 ├── hedge_fund/                # Shared quantitative library
 │   ├── __init__.py            # Package exports
@@ -52,11 +52,18 @@ Hedge-fund/
 │   ├── governance.py          # MonteCarloGovernor (DD-adaptive risk scalar)
 │   ├── optimization.py        # PortfolioOptimizer (Mean-Variance + Ledoit-Wolf)
 │   ├── analysis.py            # DecisionTree trade attribution analysis
+│   ├── config.py              # Parameter sync: backtester saves, bot loads
+│   ├── dashboard.py           # Trading dashboard (Rich + ASCII fallback)
+│   ├── scanner.py             # Candidate evaluation with 10+ entry gates
+│   ├── ensemble.py            # Stacked ensemble (XGBoost + LightGBM + Ridge)
 │   ├── data.py                # Token-bucket rate limiter
 │   └── objectives.py          # XGBoost custom loss functions
-├── tests/                     # 108 unit tests
+├── tests/                     # 138 unit tests
 │   ├── test_backtester.py     # Risk metrics, Monte Carlo, per-ticker breakdown
 │   ├── test_backtester_v6.py  # V6 stateful sim, partial profits, label buckets
+│   ├── test_config.py         # Config save/load/apply parameter sync
+│   ├── test_ensemble.py       # Ensemble fit/predict/score
+│   ├── test_scanner.py        # Entry gates and candidate ranking
 │   ├── test_simulation.py     # Bracket exits, trailing stops, label generation
 │   ├── test_indicators.py     # RSI, ATR, Bollinger Bands, ADX
 │   ├── test_risk.py           # Position sizing, Kelly criterion
@@ -135,7 +142,7 @@ Designed for Google Colab Pro+ with GPU. The bot:
 python -m pytest tests/ -v
 ```
 
-108 tests covering indicators, simulation, risk math, broker order flow, stateful simulation, partial profits, and label bucket selection.
+138 tests covering indicators, simulation, risk math, broker order flow, stateful simulation, partial profits, label buckets, config sync, ensemble stacking, and candidate scanning.
 
 ---
 
@@ -212,6 +219,27 @@ The backtester uses **Optuna Bayesian optimization** -- the same approach used b
 | **Bayesian (TPE)** | **60 trials** | **Learns which regions work, focuses search there** |
 
 The TPE (Tree-Parzen Estimator) sampler builds a probabilistic model of the objective function. After each trial, it updates its belief about which parameter regions are promising and samples more densely from those regions.
+
+### Multi-Objective Pareto Optimization
+
+V6.2 uses multi-objective Optuna with two competing objectives:
+- **Maximize** composite score (PF * WR * sqrt(N))
+- **Minimize** max drawdown
+
+Instead of cramming everything into one score, this produces a **Pareto frontier** -- the set of configs where you can't improve one objective without worsening the other. You pick the config matching your risk appetite.
+
+### Ensemble Model Stacking
+
+Walk-forward training uses a 3-model ensemble instead of XGBoost alone:
+1. **XGBoost** -- tree-based gradient boosting (primary model)
+2. **LightGBM** -- faster tree-based learner with different splitting strategy
+3. **Ridge Regression** -- linear model for stability
+
+A Ridge meta-learner is trained on out-of-fold predictions from all three, producing final predictions that are more robust than any single model.
+
+### Config Sync (Backtester -> Bot)
+
+After optimization completes, the backtester automatically saves the best parameters to `optimal_params.json`. When the bot starts, it loads this file and merges the optimized values into its SETTINGS dict. This closes the loop between offline optimization and live trading.
 
 ### Search Space (10 dimensions)
 
@@ -297,21 +325,26 @@ Each Optuna trial automatically selects the closest bucket, ensuring label-simul
 
 ### High Priority
 1. **Expand label buckets** -- Add more SL/TP combinations or make labels fully dynamic per Optuna trial for tighter alignment
-2. **Multi-objective Optuna** -- Optimize PF and MaxDD as separate objectives using `optuna.create_study(directions=["maximize", "minimize"])` for a Pareto frontier
-3. **Anchored walk-forward** -- Use expanding (anchored) training windows instead of fixed-width for better use of historical data
-4. **Live parameter sync** -- Automatically push the best backtester parameters to the live bot configuration
+2. **Anchored walk-forward** -- Use expanding (anchored) training windows instead of fixed-width for better use of historical data
+3. **Continue extracting bot.py** -- Break the remaining ~4000 lines into focused modules: `hedge_fund/broker.py`, `hedge_fund/websocket.py`, `hedge_fund/data_providers.py`
+4. **Options data integration** -- Replace the GEX proxy with real gamma exposure from options chains for more accurate regime detection
 
 ### Medium Priority
-5. **Continue extracting bot.py** -- Break the remaining ~4000 lines into focused modules: `hedge_fund/broker.py`, `hedge_fund/scanner.py`, `hedge_fund/websocket.py`
-6. **Options data integration** -- Replace the GEX proxy with real gamma exposure from options chains for more accurate regime detection
-7. **Alternative data** -- Add sentiment features from news/social media, earnings surprise data, or short interest
-8. **Ensemble models** -- Stack XGBoost with LightGBM and a linear model for more robust predictions
+5. **Alternative data** -- Add sentiment features from news/social media, earnings surprise data, or short interest
+6. **Multi-timeframe signals** -- Combine hourly bars with daily and 15-minute for multi-resolution features
+7. **Feature importance visualization** -- Save Optuna's parameter importance plots and walk-forward feature importance to files
+8. **SHAP explanations** -- Add per-trade SHAP values to understand why the model predicted each signal
 
 ### Low Priority
-9. **Feature importance visualization** -- Save Optuna's parameter importance plots and walk-forward feature importance to files
-10. **Multi-timeframe signals** -- Combine hourly bars with daily and 15-minute for multi-resolution features
-11. **Futures/crypto expansion** -- Extend the framework to trade ES futures or crypto for 24/7 market coverage
-12. **Cloud deployment** -- Migrate from Colab to a dedicated cloud VM with monitoring and alerting
+9. **Futures/crypto expansion** -- Extend the framework to trade ES futures or crypto for 24/7 market coverage
+10. **Cloud deployment** -- Migrate from Colab to a dedicated cloud VM with monitoring and alerting
+11. **Live dashboard web UI** -- Replace Rich console with a web dashboard (Streamlit or Dash) for remote monitoring
+
+### Already Completed (V6.2)
+- ~~Multi-objective Optuna~~ -- Pareto frontier for PF vs MaxDD
+- ~~Ensemble models~~ -- XGBoost + LightGBM + Ridge stacked
+- ~~Live parameter sync~~ -- Config sync via JSON (backtester -> bot)
+- ~~Extract scanner/dashboard~~ -- `hedge_fund/scanner.py`, `hedge_fund/dashboard.py`
 
 ---
 
