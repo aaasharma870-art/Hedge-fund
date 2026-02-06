@@ -168,6 +168,9 @@ from hedge_fund.optimization import PortfolioOptimizer
 from hedge_fund.risk import OvernightGapModel, SlippageCalculator
 from hedge_fund.analysis import run_attribution_analysis
 from hedge_fund.features import CrossSectionalRanker
+from hedge_fund.config import load_optimal_params, apply_to_settings
+from hedge_fund.dashboard import Dashboard as SharedDashboard
+from hedge_fund.scanner import CandidateScanner
 
 # Optional UI
 try:
@@ -370,6 +373,13 @@ SETTINGS = {
     "TIER_A_EV": 0.10,           # Lowered: 0.10R EV is still a positive-expectancy trade
     "TIER_A_CONF": 0.51,         # Lowered: direction-aware model is more calibrated
 }
+
+# --- Auto-load optimized params from backtester ---
+_optimal = load_optimal_params()
+if _optimal:
+    _updates = apply_to_settings(SETTINGS, _optimal)
+    if _updates:
+        logging.info(f"Applied {len(_updates)} params from backtester optimization")
 
 MODEL_LOCK = threading.RLock()
 KILL_TRIGGERED = False
