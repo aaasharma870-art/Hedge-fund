@@ -32,7 +32,7 @@ class Alpaca_Helper:
     def __init__(self, api, db, settings, keys=None,
                  mc_governor=None, perf_monitor=None,
                  error_tracker=None, send_alert_fn=None,
-                 get_daily_atr_fn=None):
+                 get_daily_atr_fn=None, health_monitor=None):
         """
         Args:
             api: alpaca_trade_api.REST instance (already authenticated).
@@ -54,6 +54,7 @@ class Alpaca_Helper:
         self._error_tracker = error_tracker
         self._send_alert = send_alert_fn or (lambda s, b, p="normal": None)
         self._get_daily_atr = get_daily_atr_fn or (lambda t: None)
+        self._health_monitor = health_monitor
 
         self.pos_cache = {}
         self._pos_lock = threading.RLock()
@@ -346,6 +347,8 @@ class Alpaca_Helper:
                     logging.info(f"Position synced from broker: {side} {symbol}")
 
             self.refresh_equity()
+            if self._health_monitor:
+                self._health_monitor.mark_broker_sync()
             logging.info(f"Sync: {len(self.pos_cache)} positions, {len(self.pending_orders)} pending")
         except Exception as e:
             if self._error_tracker:
@@ -452,6 +455,7 @@ class Alpaca_Helper:
         self.db.upsert_order(client_oid, t, side, qty, "BRACKET", "INTENT_DECLARED",
                              raw_json=json.dumps({'sl': sl, 'tp': tp, 'price': current_price}))
 
+        order_start = time.perf_counter()
         try:
             order_side = 'buy' if side == 'LONG' else 'sell'
 
@@ -489,6 +493,8 @@ class Alpaca_Helper:
                 }
 
             logging.info(f"Bracket Sent: {t} {side} (ID: {order.id})")
+            if self._health_monitor:
+                self._health_monitor.record_order_submission_latency(time.perf_counter() - order_start)
             return True
 
         except Exception as e:
@@ -502,7 +508,18 @@ class Alpaca_Helper:
                 self._error_tracker.record_failure(f"Order_{t}", str(e))
             self.db.upsert_order(client_oid, t, side, int(qty), "BRACKET", "FAILED", raw_json=str(e))
             logging.error(f"Bracket Failed {t}: {e}")
+            if self._health_monitor:
+                self._health_monitor.record_order_submission_latency(time.perf_counter() - order_start)
             return False
+
+    def shutdown(self):
+        """Close network sessions/resources cleanly."""
+        try:
+            session = getattr(self.api, "_session", None)
+            if session is not None:
+                session.close()
+        except Exception as e:
+            logging.debug(f"Broker session close failed: {e}")
 
     def close(self, symbol, reason="Manual"):
         """Close a position, calculate P&L, and log outcome."""

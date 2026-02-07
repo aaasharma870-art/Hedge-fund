@@ -121,7 +121,7 @@ print("\n" + "="*60)
 print("🚀 LAUNCHING HEDGE FUND MONITOR...")
 print("="*60 + "\n")
 
-import threading, time, json, sqlite3, logging, warnings, gc, math, traceback, random
+import threading, time, json, sqlite3, logging, warnings, gc, math, traceback, random, signal
 import datetime
 from datetime import timedelta, timezone
 import concurrent.futures, requests
@@ -180,6 +180,7 @@ from hedge_fund.data_providers import (
 )
 from hedge_fund.websocket import ScanBarCache as _ScanBarCache, PolygonBarStream as _PolygonBarStream
 from hedge_fund.broker import Alpaca_Helper as _Alpaca_Helper
+from hedge_fund.health import RuntimeHealth
 
 # Optional UI
 try:
@@ -381,6 +382,11 @@ SETTINGS = {
     "EV_GATE_R": 0.02,           # Lowered: let more candidates through initial gate
     "TIER_A_EV": 0.10,           # Lowered: 0.10R EV is still a positive-expectancy trade
     "TIER_A_CONF": 0.51,         # Lowered: direction-aware model is more calibrated
+    "HEALTH_HEARTBEAT_PATH": "/tmp/hedge_fund_health.json",
+    "HEALTH_MARKET_DATA_STALE_SEC": 180,
+    "HEALTH_BROKER_SYNC_STALE_SEC": 240,
+    "HEALTH_EXCEPTION_WINDOW": 200,
+    "HEALTH_LATENCY_WINDOW": 200,
 }
 
 # --- Auto-load optimized params from backtester ---
@@ -626,6 +632,15 @@ class Database_Helper:
                  datetime.datetime.now().isoformat())
             )
             self.conn.commit()
+
+    def flush(self):
+        with self.lock:
+            self.conn.commit()
+
+    def close(self):
+        with self.lock:
+            self.conn.commit()
+            self.conn.close()
 
     def log_trade_outcome(self, symbol, side, entry_price, exit_price, pnl, pnl_r, outcome, features, reason="Signal"):
         """
@@ -2257,13 +2272,14 @@ class SeekingAlpha_Helper(_SeekingAlpha_Helper):
 
 class Alpaca_Helper(_Alpaca_Helper):
     """Alpaca broker interface (core logic in hedge_fund/broker.py)"""
-    def __init__(self, db, mc_governor=None, perf_monitor=None):
+    def __init__(self, db, mc_governor=None, perf_monitor=None, health_monitor=None):
         api = tradeapi.REST(KEYS['ALPACA_KEY'], KEYS['ALPACA_SEC'], ALPACA_URL, 'v2')
         super().__init__(
             api=api, db=db, settings=SETTINGS, keys=KEYS,
             mc_governor=mc_governor, perf_monitor=perf_monitor,
             error_tracker=ERROR_TRACKER, send_alert_fn=send_alert,
             get_daily_atr_fn=get_daily_atr,
+            health_monitor=health_monitor,
         )
 
     def check_kill(self):
@@ -4165,13 +4181,22 @@ def run_god_mode():
     print("   Multi-Signal Scanner + ATR-Bracket Trades")
     print("=" * 60)
 
+    shutdown_event = threading.Event()
+
     db = Database_Helper()
     poly = Polygon_Helper()
     bar_stream = PolygonBarStream(KEYS['POLY'])
+    health = RuntimeHealth(
+        heartbeat_path=SETTINGS.get("HEALTH_HEARTBEAT_PATH", "/tmp/hedge_fund_health.json"),
+        market_data_stale_s=SETTINGS.get("HEALTH_MARKET_DATA_STALE_SEC", 180),
+        broker_sync_stale_s=SETTINGS.get("HEALTH_BROKER_SYNC_STALE_SEC", 240),
+        latency_window=SETTINGS.get("HEALTH_LATENCY_WINDOW", 200),
+        exception_window=SETTINGS.get("HEALTH_EXCEPTION_WINDOW", 200),
+    )
     fmp = FMP_Helper()
     mc_governor = MonteCarloGovernor(SETTINGS) # Monte Carlo Risk Governor
     perf_monitor = PerformanceMonitor(baseline_winrate=0.50)  # ENHANCED: Adaptive retraining
-    alpaca = Alpaca_Helper(db, mc_governor, perf_monitor)  # Pass perf_monitor
+    alpaca = Alpaca_Helper(db, mc_governor, perf_monitor, health_monitor=health)  # Pass perf_monitor
     vix_helper = VIX_Helper()
     gex_helper = GEX_Helper()  # DIX/GEX for sizing and entry gating
     portfolio_risk = PortfolioRisk()  # v15: Instance-based for correlation caching
@@ -4203,6 +4228,32 @@ def run_god_mode():
     except:
         universe = list(CORE)
 
+    def _handle_shutdown_signal(signum, _frame):
+        sig_name = signal.Signals(signum).name if signum in [signal.SIGTERM, signal.SIGINT] else str(signum)
+        logging.warning(f"Received {sig_name}. Initiating graceful shutdown...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
+    def _graceful_shutdown():
+        try:
+            bar_stream.stop()
+        except Exception as e:
+            logging.debug(f"bar_stream.stop failed: {e}")
+        try:
+            db.flush()
+        except Exception as e:
+            logging.debug(f"db.flush failed: {e}")
+        try:
+            alpaca.shutdown()
+        except Exception as e:
+            logging.debug(f"alpaca.shutdown failed: {e}")
+        try:
+            db.close()
+        except Exception as e:
+            logging.debug(f"db.close failed: {e}")
+
     dashboard.render_loading("Starting AI Training...")
     ai.train(universe, poly, db=db, progress_callback=lambda msg: dashboard.render_loading(msg), core_tickers=set(CORE))
 
@@ -4231,7 +4282,7 @@ def run_god_mode():
     bar_stream.start()
     bar_stream.subscribe(universe)
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             if alpaca.check_kill():
                 time.sleep(60)
@@ -4302,7 +4353,7 @@ def run_god_mode():
                         'logs': [f"💤 Market closed. Sleeping {sleep_sec:.0f}s..."]
                     })
 
-                    time.sleep(sleep_sec)
+                    shutdown_event.wait(timeout=sleep_sec)
                     continue
             except Exception as e:
                 # FIX: Fallback to proper ET time if API fails
@@ -4320,7 +4371,7 @@ def run_god_mode():
                     ((now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)) and now_et.hour < 16)
                 )
                 if not is_market_hours:
-                    time.sleep(60)
+                    shutdown_event.wait(timeout=60)
                     continue
             hedger.check_hedge(regime)
 
@@ -4793,6 +4844,11 @@ def run_god_mode():
                     logging.debug(f"Pairs trading error: {e_pairs}")
 
             # --- Execution Phase (Top-K + Portfolio Optimization) ---
+            if health.in_safe_mode:
+                reason = health.current_reason()
+                logging.warning(f"🛡️ SAFE_MODE active ({reason}) - managing exits only.")
+                scored_candidates = []
+
             scored_candidates.sort(key=lambda x: x['score'], reverse=True)
 
             open_positions = len(alpaca.pos_cache) + len(alpaca.pending_orders)
@@ -4882,6 +4938,9 @@ def run_god_mode():
                     )
 
             # Legacy loop removed. Optimizer handles execution.
+
+            if prices:
+                health.mark_market_data_update()
 
             # Manage positions
             # FIX: Ensure we have prices for all held positions (even if scan failed)
@@ -5057,6 +5116,13 @@ def run_god_mode():
                 last_equity_log = datetime.datetime.now()
 
             db.save_dashboard_state(alpaca.equity, regime, len(universe), hedger.is_hedged, vix)
+            health.record_exception(False)
+            health.write_heartbeat(extra={
+                "universe_size": len(universe),
+                "positions": len(alpaca.pos_cache),
+                "pending_orders": len(alpaca.pending_orders),
+                "shutdown_requested": shutdown_event.is_set(),
+            })
 
             # Hybrid wait: WS bar-close event OR REST fallback timeout
             if bar_stream.is_connected:
@@ -5072,12 +5138,15 @@ def run_god_mode():
 
         except KeyboardInterrupt:
             logging.info("\n🛑 Stopped")
-            bar_stream.stop()
-            break
+            shutdown_event.set()
         except Exception as e:
+            health.record_exception(True)
             ERROR_TRACKER.record_failure("MainLoop", str(e))
             logging.error(f"Loop: {e}\n{traceback.format_exc()}")
+            health.write_heartbeat(extra={"loop_exception": str(e), "shutdown_requested": shutdown_event.is_set()})
             time.sleep(60)
+
+    _graceful_shutdown()
 
 if __name__ == "__main__":
     try:
