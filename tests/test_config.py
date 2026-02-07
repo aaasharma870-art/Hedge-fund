@@ -5,7 +5,13 @@ import os
 import tempfile
 import pytest
 
-from hedge_fund.config import save_optimal_params, load_optimal_params, apply_to_settings
+from hedge_fund.config import (
+    AppConfig,
+    load_app_config,
+    save_optimal_params,
+    load_optimal_params,
+    apply_to_settings,
+)
 
 
 class TestSaveOptimalParams:
@@ -146,3 +152,39 @@ class TestApplyToSettings:
         updated = apply_to_settings(settings, {})
         assert settings["STOP_MULT"] == 1.5
         assert updated == []
+
+
+class TestAppConfig:
+    def test_loads_env_driven_paths(self, monkeypatch, tmp_path):
+        data_root = tmp_path / "runtime"
+        log_dir = tmp_path / "logs"
+        params_path = tmp_path / "cfg" / "optimal.json"
+
+        monkeypatch.setenv("DATA_ROOT", str(data_root))
+        monkeypatch.setenv("LOG_DIR", str(log_dir))
+        monkeypatch.setenv("OPTIMAL_PARAMS_PATH", str(params_path))
+
+        config = load_app_config()
+
+        assert isinstance(config, AppConfig)
+        assert config.data_root == str(data_root.resolve())
+        assert config.log_dir == str(log_dir.resolve())
+        assert config.optimal_params_path == str(params_path.resolve())
+        assert os.path.isdir(config.db_dir)
+        assert os.path.isdir(config.model_dir)
+
+    def test_uses_config_path_for_optimal_params_roundtrip(self, tmp_path):
+        config = AppConfig(
+            data_root=str((tmp_path / "data").resolve()),
+            log_dir=str((tmp_path / "logs").resolve()),
+            optimal_params_path=str((tmp_path / "data" / "optimal_params.json").resolve()),
+        )
+        config.ensure_directories()
+
+        payload = {"SL": 1.7, "R:R": "1:2.0", "Thresh": 0.21}
+        save_optimal_params(payload, config=config)
+        loaded = load_optimal_params(config=config)
+
+        assert loaded["STOP_MULT"] == 1.7
+        assert loaded["TP_MULT"] == 3.4
+        assert loaded["MIN_CONFIDENCE"] == 0.21

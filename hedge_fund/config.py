@@ -8,29 +8,97 @@ The bot reads them on startup to use the latest optimized settings.
 import json
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Optional
 
 
-# Default config paths (searched in order)
-_CONFIG_PATHS = [
-    "optimal_params.json",
-    "data/optimal_params.json",
-    "/content/drive/MyDrive/HedgeFund_GodMode/optimal_params.json",
-]
+def _normalize_path(path: str) -> str:
+    """Normalize user-provided and env-provided paths."""
+    return os.path.abspath(os.path.expanduser(path))
 
 
-def _resolve_path(path=None):
+def _env_or_default(name: str, default: str) -> str:
+    """Read an environment variable with a fallback default."""
+    value = os.getenv(name, default)
+    return _normalize_path(value)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Canonical app configuration loaded once at startup."""
+
+    data_root: str
+    log_dir: str
+    optimal_params_path: str
+
+    @property
+    def db_dir(self) -> str:
+        return os.path.join(self.data_root, "db")
+
+    @property
+    def db_path(self) -> str:
+        return os.path.join(self.db_dir, "godmode.db")
+
+    @property
+    def model_dir(self) -> str:
+        return os.path.join(self.data_root, "models")
+
+    @property
+    def market_cache_dir(self) -> str:
+        return os.path.join(self.data_root, "market_cache")
+
+    def ensure_directories(self) -> None:
+        """Create required directories for runtime state and logs."""
+        os.makedirs(self.data_root, exist_ok=True)
+        os.makedirs(self.log_dir, exist_ok=True)
+        os.makedirs(self.market_cache_dir, exist_ok=True)
+        os.makedirs(self.model_dir, exist_ok=True)
+        os.makedirs(self.db_dir, exist_ok=True)
+
+
+_DEFAULT_CONFIG = AppConfig(
+    data_root=_env_or_default("DATA_ROOT", "./data"),
+    log_dir=_env_or_default("LOG_DIR", "./data/logs"),
+    optimal_params_path=_env_or_default("OPTIMAL_PARAMS_PATH", "./data/optimal_params.json"),
+)
+
+
+def load_app_config() -> AppConfig:
+    """Load and return the canonical app config from environment variables."""
+    config = AppConfig(
+        data_root=_env_or_default("DATA_ROOT", _DEFAULT_CONFIG.data_root),
+        log_dir=_env_or_default("LOG_DIR", _DEFAULT_CONFIG.log_dir),
+        optimal_params_path=_env_or_default("OPTIMAL_PARAMS_PATH", _DEFAULT_CONFIG.optimal_params_path),
+    )
+    config.ensure_directories()
+    return config
+
+
+def _config_paths(config: Optional[AppConfig] = None):
+    """Compute candidate optimal-params paths in lookup order."""
+    cfg = config or load_app_config()
+    return [
+        cfg.optimal_params_path,
+        os.path.join(cfg.data_root, "optimal_params.json"),
+        os.path.join(os.getcwd(), "optimal_params.json"),
+    ]
+
+
+def _resolve_path(path=None, config: Optional[AppConfig] = None):
     """Resolve config file path."""
     if path:
-        return path
-    for p in _CONFIG_PATHS:
+        return _normalize_path(path)
+
+    for p in _config_paths(config=config):
         if os.path.exists(p):
             return p
-    return _CONFIG_PATHS[0]  # default write location
+
+    return _config_paths(config=config)[0]
 
 
 def save_optimal_params(best_config, metrics=None, holdout_metrics=None,
-                        path=None):
+                        path=None, config: Optional[AppConfig] = None):
     """
     Save the best parameters from backtester optimization to JSON.
 
@@ -42,8 +110,9 @@ def save_optimal_params(best_config, metrics=None, holdout_metrics=None,
         metrics: Optional in-sample metrics dict.
         holdout_metrics: Optional holdout validation metrics dict.
         path: File path to write. Uses default if None.
+        config: Optional AppConfig object.
     """
-    path = _resolve_path(path)
+    path = _resolve_path(path, config=config)
 
     params = {
         # Trading parameters (what the bot uses)
@@ -106,7 +175,7 @@ def save_optimal_params(best_config, metrics=None, holdout_metrics=None,
     return path
 
 
-def load_optimal_params(path=None):
+def load_optimal_params(path=None, config: Optional[AppConfig] = None):
     """
     Load optimal parameters from JSON config file.
 
@@ -115,11 +184,12 @@ def load_optimal_params(path=None):
 
     Args:
         path: File path to read. Searches defaults if None.
+        config: Optional AppConfig object.
 
     Returns:
         Dict with parameter keys, or empty dict if no config found.
     """
-    path = _resolve_path(path)
+    path = _resolve_path(path, config=config)
 
     if not os.path.exists(path):
         logging.warning(f"No optimal params file found at {path}")
