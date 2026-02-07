@@ -168,7 +168,7 @@ from hedge_fund.optimization import PortfolioOptimizer
 from hedge_fund.risk import OvernightGapModel, SlippageCalculator
 from hedge_fund.analysis import run_attribution_analysis
 from hedge_fund.features import CrossSectionalRanker
-from hedge_fund.config import load_optimal_params, apply_to_settings
+from hedge_fund.config import load_app_config, load_optimal_params, apply_to_settings
 from hedge_fund.dashboard import Dashboard as SharedDashboard
 from hedge_fund.scanner import CandidateScanner
 from hedge_fund.data_providers import (
@@ -269,22 +269,17 @@ logging.info(f"🔥 HARDWARE: {NUM_CORES} CS | {IO_WORKERS} I/O Workers | Optimi
 
 # --- MAIN BOT LOGIC ---
 # --- STORAGE SETUP ---
+APP_CONFIG = load_app_config()
+DRIVE_ROOT = APP_CONFIG.data_root
+
 try:
     from google.colab import drive
     drive.mount('/content/drive')
     import sys, subprocess
     # FIX: Install optuna/joblib for Colab if missing
     subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'optuna', 'joblib'], check=True)
-
-    ENV = 'colab'
-    DRIVE_ROOT = "/content/drive/MyDrive/HedgeFund_GodMode"
 except ImportError:
-    ENV = 'local'
-    DRIVE_ROOT = "data"
-
-if not os.path.exists(DRIVE_ROOT): os.makedirs(DRIVE_ROOT, exist_ok=True)
-for d in ["logs", "market_cache", "models", "db"]:
-    os.makedirs(os.path.join(DRIVE_ROOT, d), exist_ok=True)
+    pass
 
 # API Keys - env vars only (no hardcoded secrets)
 def require_env(name):
@@ -384,7 +379,7 @@ SETTINGS = {
 }
 
 # --- Auto-load optimized params from backtester ---
-_optimal = load_optimal_params()
+_optimal = load_optimal_params(config=APP_CONFIG)
 if _optimal:
     _updates = apply_to_settings(SETTINGS, _optimal)
     if _updates:
@@ -397,7 +392,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO,
     handlers=[
-        RotatingFileHandler(os.path.join(DRIVE_ROOT, "logs/bot.log"), maxBytes=1e7, backupCount=5),
+        RotatingFileHandler(os.path.join(APP_CONFIG.log_dir, "bot.log"), maxBytes=1e7, backupCount=5),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -428,8 +423,9 @@ ERROR_TRACKER = ErrorTracker()
 # 2. DATABASE
 # ==============================================================================
 class Database_Helper:
-    def __init__(self):
-        db_path = os.path.join(DRIVE_ROOT, 'db/godmode.db')
+    def __init__(self, config=APP_CONFIG):
+        self.config = config
+        db_path = self.config.db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.lock = threading.Lock()
 
@@ -2772,7 +2768,7 @@ class WalkForwardAI:
         self.tune_lock = threading.Lock()
 
         # FIX: Save to DRIVE_ROOT/models, not CWD (persists across restarts)
-        self.params_path = os.path.join(DRIVE_ROOT, "models", "best_params.json")
+        self.params_path = os.path.join(APP_CONFIG.model_dir, "best_params.json")
         self._load_best_params()
 
     def _load_best_params(self):

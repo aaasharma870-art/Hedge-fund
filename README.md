@@ -99,6 +99,66 @@ export ALPACA_API_KEY="your-alpaca-key"           # Required for live bot
 export ALPACA_SECRET_KEY="your-alpaca-secret"     # Required for live bot
 ```
 
+
+### Runtime Paths (production-safe defaults)
+
+The application now uses environment-driven runtime paths instead of hardcoded Colab locations:
+
+```bash
+export DATA_ROOT="./data"                           # Base directory for models/cache/db
+export LOG_DIR="./data/logs"                        # Bot log directory
+export OPTIMAL_PARAMS_PATH="./data/optimal_params.json"  # Backtester/bot sync file
+```
+
+## Deployment (EC2 / ECS)
+
+### Required environment variables
+
+```bash
+# Broker/data keys
+export ALPACA_API_KEY="your-alpaca-key"
+export ALPACA_SECRET_KEY="your-alpaca-secret"
+export POLYGON_API_KEY="your-polygon-key"
+
+# Optional integrations
+export FMP_API_KEY="your-fmp-key"
+export DISCORD_WEBHOOK="https://..."
+export RAPIDAPI_KEY="..."
+
+# Runtime filesystem config
+export DATA_ROOT="/var/lib/hedge-fund"
+export LOG_DIR="/var/log/hedge-fund"
+export OPTIMAL_PARAMS_PATH="/var/lib/hedge-fund/optimal_params.json"
+```
+
+### Persistent volume paths
+
+Persist these paths across restarts/releases:
+
+- `${DATA_ROOT}/db` (SQLite state, open/past positions)
+- `${DATA_ROOT}/models` (persisted model params)
+- `${DATA_ROOT}/market_cache` (market data cache)
+- `${OPTIMAL_PARAMS_PATH}` (backtester → bot parameter handoff)
+- `${LOG_DIR}` (rotating bot logs)
+
+### Process manager choices
+
+Use one of:
+
+- **systemd (EC2 VM)** for direct host process management (`Restart=always`).
+- **supervisor (EC2 VM)** if you already standardize on Supervisor.
+- **containers (ECS/Fargate/EKS)** with the included `Dockerfile` + `docker/entrypoint.sh` as the default startup command.
+
+### Restart policy + health checks
+
+- Restart policy should be **always/on-failure** with exponential backoff.
+- For VM services, set `Restart=always` and `RestartSec=5` (systemd equivalent).
+- In containers, use Docker/ECS restart policy and a health check; the provided image includes a process-level `HEALTHCHECK`.
+- Recommended external health checks:
+  - process alive
+  - recent heartbeat log line in `${LOG_DIR}/bot.log`
+  - writable `${DATA_ROOT}` and `${LOG_DIR}` mounts
+
 ---
 
 ## How to Run
