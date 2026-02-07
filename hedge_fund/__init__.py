@@ -34,6 +34,15 @@ from hedge_fund.config import save_optimal_params, load_optimal_params, apply_to
 from hedge_fund.dashboard import Dashboard
 from hedge_fund.scanner import CandidateScanner
 from hedge_fund.ensemble import EnsembleModel
+from hedge_fund.data_providers import (
+    VIX_Helper,
+    Polygon_Helper,
+    FMP_Helper,
+    FundamentalGuard,
+    SeekingAlpha_Helper,
+)
+from hedge_fund.websocket import ScanBarCache, PolygonBarStream
+from hedge_fund.broker import Alpaca_Helper
 
 __all__ = [
     "ManualTA",
@@ -64,4 +73,12 @@ __all__ = [
     "Dashboard",
     "CandidateScanner",
     "EnsembleModel",
+    "VIX_Helper",
+    "Polygon_Helper",
+    "FMP_Helper",
+    "FundamentalGuard",
+    "SeekingAlpha_Helper",
+    "ScanBarCache",
+    "PolygonBarStream",
+    "Alpaca_Helper",
 ]
