@@ -12,40 +12,36 @@ import logging
 import threading
 import json
 
+from hedge_fund.reliability import FailureThresholds, ReliabilityMonitor, structured_failure_log
 
-# ---------------------------------------------------------------------------
-# Scan Bar Cache
-# ---------------------------------------------------------------------------
 
 class ScanBarCache:
-    """
-    In-memory cache for live-scan 15-min bar data.
-    Tracks which 15-minute slot each ticker was last fetched in.
-    If the slot hasn't changed, returns cached bars (no API call).
-    Reduces API calls by ~93% (14 of every 15 scan cycles skip fetch).
-    """
+    """In-memory cache for live-scan 15-min bar data."""
 
     def __init__(self, tz=None):
-        """
-        Args:
-            tz: timezone object for current time (e.g. ZoneInfo('America/New_York')).
-                If None, uses system local time.
-        """
         self._data = {}
         self._last_slot = {}
         self._lock = threading.Lock()
         self._tz = tz
+        self._reliability = ReliabilityMonitor("scan_bar_cache", FailureThresholds(degraded_after=5, safe_stop_after=20))
 
     def _current_slot(self):
-        """Current 15-min slot as (hour, quarter). E.g. 9:37 -> (9, 2)."""
         try:
             now = datetime.datetime.now(self._tz) if self._tz else datetime.datetime.now()
-        except Exception:
+        except Exception as e:
+            retries = self._reliability.record_failure("slot")
+            structured_failure_log(
+                component="scan_bar_cache",
+                symbol="slot",
+                endpoint="datetime.now",
+                retry_count=retries,
+                error=e,
+                logger=logging.debug,
+            )
             now = datetime.datetime.now()
         return (now.hour, now.minute // 15)
 
     def get_if_same_slot(self, ticker):
-        """Return cached df if we're in the same 15-min slot as last fetch."""
         slot = self._current_slot()
         with self._lock:
             if ticker in self._last_slot and self._last_slot[ticker] == slot:
@@ -53,13 +49,11 @@ class ScanBarCache:
         return None
 
     def put(self, ticker, df):
-        """Cache bar data and record current slot."""
         with self._lock:
             self._data[ticker] = df
             self._last_slot[ticker] = self._current_slot()
 
     def invalidate(self, ticker=None):
-        """Clear cache for a ticker (or all)."""
         with self._lock:
             if ticker:
                 self._data.pop(ticker, None)
@@ -69,24 +63,10 @@ class ScanBarCache:
                 self._last_slot.clear()
 
 
-# ---------------------------------------------------------------------------
-# Polygon Bar Stream
-# ---------------------------------------------------------------------------
-
 class PolygonBarStream:
-    """
-    WebSocket stream for Polygon aggregate minute bars.
-    Detects 15-min bar closes and exposes ready tickers to the main loop.
-    Hybrid: REST stays for snapshots/history, WS only triggers scan timing.
-    """
+    """WebSocket stream for Polygon aggregate minute bars."""
 
     def __init__(self, api_key, tz=None, ws_module=None):
-        """
-        Args:
-            api_key: Polygon API key for WS auth.
-            tz: timezone object for bar boundary detection.
-            ws_module: websocket module (websocket-client). If None, attempts import.
-        """
         self._api_key = api_key
         self._tz = tz
         self._ws_module = ws_module
@@ -98,6 +78,7 @@ class PolygonBarStream:
         self._ready = set()
         self._event = threading.Event()
         self._connected = False
+        self._reliability = ReliabilityMonitor("polygon_ws", FailureThresholds(degraded_after=3, safe_stop_after=10))
 
         if self._ws_module is None:
             try:
@@ -115,7 +96,6 @@ class PolygonBarStream:
         return self._connected
 
     def start(self):
-        """Start the WS listener in a background daemon thread."""
         if not self.has_ws:
             logging.warning("websocket-client not installed. WS bar stream disabled.")
             return
@@ -125,12 +105,19 @@ class PolygonBarStream:
         logging.info("Polygon WebSocket bar stream started")
 
     def _run_loop(self):
-        """Reconnecting event loop."""
         while self._running:
             try:
                 self._connect()
             except Exception as e:
-                logging.debug(f"WS connect error: {e}")
+                retries = self._reliability.record_failure("connect")
+                structured_failure_log(
+                    component="polygon_ws_connect",
+                    symbol="all",
+                    endpoint="wss://socket.polygon.io/stocks",
+                    retry_count=retries,
+                    error=e,
+                    logger=logging.debug,
+                )
             self._connected = False
             if self._running:
                 time.sleep(5)
@@ -152,6 +139,7 @@ class PolygonBarStream:
                         st = msg.get('status', '')
                         if st == 'auth_success':
                             self._connected = True
+                            self._reliability.record_success("connect")
                             logging.info("Polygon WS authenticated")
                             self._send_subscriptions(ws)
                         elif st == 'auth_failed':
@@ -168,14 +156,39 @@ class PolygonBarStream:
                                     with self._lock:
                                         self._ready.add(sym)
                                     self._event.set()
-                            except Exception:
-                                pass
-            except Exception:
-                pass
+                                    self._reliability.record_success(sym)
+                            except Exception as e:
+                                retries = self._reliability.record_failure(sym or "unknown")
+                                structured_failure_log(
+                                    component="polygon_ws_bar_parse",
+                                    symbol=sym or "unknown",
+                                    endpoint="AM event",
+                                    retry_count=retries,
+                                    error=e,
+                                    logger=logging.debug,
+                                )
+            except Exception as e:
+                retries = self._reliability.record_failure("message")
+                structured_failure_log(
+                    component="polygon_ws_message",
+                    symbol="all",
+                    endpoint="on_message",
+                    retry_count=retries,
+                    error=e,
+                    logger=logging.debug,
+                )
 
         def on_error(ws, error):
-            logging.debug(f"WS error: {error}")
             self._connected = False
+            retries = self._reliability.record_failure("socket")
+            structured_failure_log(
+                component="polygon_ws_error",
+                symbol="all",
+                endpoint="on_error",
+                retry_count=retries,
+                error=error if isinstance(error, Exception) else Exception(str(error)),
+                logger=logging.debug,
+            )
 
         def on_close(ws, code, msg):
             self._connected = False
@@ -186,7 +199,7 @@ class PolygonBarStream:
             on_open=on_open,
             on_message=on_message,
             on_error=on_error,
-            on_close=on_close
+            on_close=on_close,
         )
         self._ws.run_forever(ping_interval=30, ping_timeout=10)
 
@@ -199,7 +212,6 @@ class PolygonBarStream:
             logging.info(f"Subscribed to AM.* for {len(tickers)} tickers")
 
     def subscribe(self, tickers):
-        """Update subscription list. Safe to call anytime."""
         with self._lock:
             new = set(tickers) - self._subscribed
             self._subscribed = set(tickers)
@@ -207,11 +219,19 @@ class PolygonBarStream:
             try:
                 params = ",".join(f"AM.{t}" for t in new)
                 self._ws.send(json.dumps({"action": "subscribe", "params": params}))
-            except Exception:
-                pass
+                self._reliability.record_success("subscribe")
+            except Exception as e:
+                retries = self._reliability.record_failure("subscribe")
+                structured_failure_log(
+                    component="polygon_ws_subscribe",
+                    symbol=",".join(sorted(new))[:64] or "all",
+                    endpoint="subscribe",
+                    retry_count=retries,
+                    error=e,
+                    logger=logging.debug,
+                )
 
     def get_ready_tickers(self):
-        """Return tickers with fresh 15-min bars and clear the set."""
         with self._lock:
             ready = set(self._ready)
             self._ready.clear()
@@ -219,7 +239,6 @@ class PolygonBarStream:
         return ready
 
     def wait_for_bars(self, timeout=60.0):
-        """Block until bar-close event or timeout. Returns True if bars ready."""
         return self._event.wait(timeout=timeout)
 
     def stop(self):
@@ -227,5 +246,13 @@ class PolygonBarStream:
         if self._ws:
             try:
                 self._ws.close()
-            except Exception:
-                pass
+            except Exception as e:
+                retries = self._reliability.record_failure("stop")
+                structured_failure_log(
+                    component="polygon_ws_stop",
+                    symbol="all",
+                    endpoint="ws.close",
+                    retry_count=retries,
+                    error=e,
+                    logger=logging.debug,
+                )
