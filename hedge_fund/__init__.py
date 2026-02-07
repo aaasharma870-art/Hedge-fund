@@ -30,6 +30,25 @@ from hedge_fund.objectives import profit_factor_objective, asymmetric_loss_objec
 from hedge_fund.optimization import PortfolioOptimizer
 from hedge_fund.governance import MonteCarloGovernor
 from hedge_fund.analysis import run_attribution_analysis
+from hedge_fund.config import (
+    AppConfig,
+    load_app_config,
+    save_optimal_params,
+    load_optimal_params,
+    apply_to_settings,
+)
+from hedge_fund.dashboard import Dashboard
+from hedge_fund.scanner import CandidateScanner
+from hedge_fund.ensemble import EnsembleModel
+from hedge_fund.data_providers import (
+    VIX_Helper,
+    Polygon_Helper,
+    FMP_Helper,
+    FundamentalGuard,
+    SeekingAlpha_Helper,
+)
+from hedge_fund.websocket import ScanBarCache, PolygonBarStream
+from hedge_fund.broker import Alpaca_Helper
 
 __all__ = [
     "ManualTA",
@@ -54,4 +73,20 @@ __all__ = [
     "PortfolioOptimizer",
     "MonteCarloGovernor",
     "run_attribution_analysis",
+    "AppConfig",
+    "load_app_config",
+    "save_optimal_params",
+    "load_optimal_params",
+    "apply_to_settings",
+    "Dashboard",
+    "CandidateScanner",
+    "EnsembleModel",
+    "VIX_Helper",
+    "Polygon_Helper",
+    "FMP_Helper",
+    "FundamentalGuard",
+    "SeekingAlpha_Helper",
+    "ScanBarCache",
+    "PolygonBarStream",
+    "Alpaca_Helper",
 ]

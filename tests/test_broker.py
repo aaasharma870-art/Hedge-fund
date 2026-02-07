@@ -190,3 +190,93 @@ class TestMockAlpacaSubmission:
         api.replace_order.assert_called_once_with(
             "stop-order-123", stop_price=new_stop
         )
+
+
+# ==============================================================================
+# Tests for extracted hedge_fund.broker.Alpaca_Helper
+# ==============================================================================
+
+from hedge_fund.broker import Alpaca_Helper as ExtractedAlpacaHelper
+
+
+class _FakeDB:
+    """Minimal DB mock for extracted Alpaca_Helper."""
+    def __init__(self):
+        self.pending_orders = {}
+
+    def load_pending_orders(self):
+        return self.pending_orders
+
+    def save_pending_order(self, *a, **kw): pass
+    def delete_pending_order(self, oid): self.pending_orders.pop(oid, None)
+    def update_position(self, *a, **kw): pass
+    def delete_position(self, sym): pass
+    def log_trade(self, *a, **kw): pass
+    def log_trade_outcome(self, **kw): pass
+    def upsert_order(self, *a, **kw): pass
+    def get_trade_outcomes(self, days=180): return []
+
+
+class _FakeAccount:
+    def __init__(self, eq=100000):
+        self.equity = str(eq)
+
+
+def _mock_api(equity=100000):
+    api = MagicMock()
+    api.get_account.return_value = _FakeAccount(equity)
+    api.list_positions.return_value = []
+    api.list_orders.return_value = []
+    return api
+
+
+class TestExtractedAlpacaHelperInit:
+    def test_basic_init(self):
+        helper = ExtractedAlpacaHelper(api=_mock_api(), db=_FakeDB(),
+                                       settings={'RISK_PER_TRADE': 0.01, 'KILL_SWITCH_DD': 0.10})
+        assert helper.equity == 100000.0
+        assert not helper.kill_triggered
+
+    def test_equity_fallback(self):
+        api = MagicMock()
+        api.get_account.side_effect = Exception("fail")
+        api.list_positions.return_value = []
+        api.list_orders.return_value = []
+        helper = ExtractedAlpacaHelper(api=api, db=_FakeDB(),
+                                       settings={'RISK_PER_TRADE': 0.01, 'KILL_SWITCH_DD': 0.10})
+        assert helper.equity == 50000.0
+
+
+class TestExtractedPositionSizing:
+    def test_sizing(self):
+        helper = ExtractedAlpacaHelper(api=_mock_api(), db=_FakeDB(),
+                                       settings={'RISK_PER_TRADE': 0.01, 'KILL_SWITCH_DD': 0.10, 'USE_MARKET_ORDERS': False})
+        qty = helper.calculate_position_size(100.0, 98.0)
+        assert qty == 200  # capped by 20% equity
+
+    def test_zero_distance(self):
+        helper = ExtractedAlpacaHelper(api=_mock_api(), db=_FakeDB(),
+                                       settings={'RISK_PER_TRADE': 0.01, 'KILL_SWITCH_DD': 0.10, 'USE_MARKET_ORDERS': False})
+        assert helper.calculate_position_size(100.0, 100.0) == 0
+
+    def test_haircut(self):
+        helper = ExtractedAlpacaHelper(api=_mock_api(), db=_FakeDB(),
+                                       settings={'RISK_PER_TRADE': 0.01, 'KILL_SWITCH_DD': 0.10,
+                                                  'USE_MARKET_ORDERS': True, 'SLIPPAGE_HAIRCUT': 0.10})
+        qty = helper.calculate_position_size(100.0, 95.0)
+        assert qty == 180
+
+
+class TestExtractedKillSwitch:
+    def test_no_kill_safe(self):
+        helper = ExtractedAlpacaHelper(api=_mock_api(95000), db=_FakeDB(),
+                                       settings={'RISK_PER_TRADE': 0.01, 'KILL_SWITCH_DD': 0.10})
+        helper.peak_equity = 100000
+        assert helper.check_kill() is False
+
+    def test_kill_on_drawdown(self):
+        helper = ExtractedAlpacaHelper(api=_mock_api(85000), db=_FakeDB(),
+                                       settings={'RISK_PER_TRADE': 0.01, 'KILL_SWITCH_DD': 0.10})
+        helper.peak_equity = 100000
+        assert helper.check_kill() is True
+        assert helper.kill_triggered is True
