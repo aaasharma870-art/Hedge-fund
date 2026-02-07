@@ -26,6 +26,11 @@ import pandas as pd
 import requests
 
 from hedge_fund.data import RateLimiter
+from hedge_fund.reliability import (
+    FailureThresholds,
+    ReliabilityMonitor,
+    structured_failure_log,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +51,7 @@ class VIX_Helper:
         self.cache = {'value': None, 'ts': 0}
         self.cache_ttl = 60
         self.data_valid = False
+        self._reliability = ReliabilityMonitor("vix", FailureThresholds(degraded_after=2, safe_stop_after=5))
 
     def get_vix(self):
         now = time.time()
@@ -74,7 +80,15 @@ class VIX_Helper:
             if not hist.empty:
                 return float(hist['Close'].iloc[-1])
         except Exception as e:
-            logging.debug(f"yfinance VIX: {e}")
+            retries = self._reliability.record_failure("^VIX")
+            structured_failure_log(
+                component="vix_yfinance",
+                symbol="^VIX",
+                endpoint="yfinance://ticker/^VIX/history",
+                retry_count=retries,
+                error=e,
+                logger=logging.debug,
+            )
         return None
 
     def _try_fmp(self):
@@ -84,7 +98,15 @@ class VIX_Helper:
             if res:
                 return float(res[0].get('price', 0))
         except Exception as e:
-            logging.debug(f"FMP VIX: {e}")
+            retries = self._reliability.record_failure("^VIX")
+            structured_failure_log(
+                component="vix_fmp",
+                symbol="^VIX",
+                endpoint="https://financialmodelingprep.com/api/v3/quote/%5EVIX",
+                retry_count=retries,
+                error=e,
+                logger=logging.debug,
+            )
         return None
 
 
@@ -113,6 +135,7 @@ class Polygon_Helper:
         self._lock = threading.Lock()
         self._mem_cache = {}
         self._rate_limiter = RateLimiter(rate_per_sec=6.0, burst=10)
+        self._reliability = ReliabilityMonitor("polygon", FailureThresholds(degraded_after=3, safe_stop_after=8))
 
     def _throttle(self):
         self._rate_limiter.acquire()
@@ -148,7 +171,15 @@ class Polygon_Helper:
                     return []
                 return r.json().get("tickers", [])
             except Exception as e:
-                logging.debug(f"Snapshot fetch failed: {e}")
+                retries = self._reliability.record_failure("snapshot")
+                structured_failure_log(
+                    component="polygon_snapshot",
+                    symbol=",".join(chunk[:3]) if chunk else "unknown",
+                    endpoint=f"{self.base}/v2/snapshot/locale/us/markets/stocks/tickers",
+                    retry_count=retries,
+                    error=e,
+                    logger=logging.debug,
+                )
                 return []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._io_workers) as executor:
@@ -237,7 +268,25 @@ class Polygon_Helper:
                         break
                 except Exception as e:
                     retries += 1
-                    logging.debug(f"Polygon error {t}: {e}")
+                    failure_count = self._reliability.record_failure(t)
+                    structured_failure_log(
+                        component="polygon_aggs",
+                        symbol=t,
+                        endpoint=url,
+                        retry_count=retries,
+                        error=e,
+                        logger=logging.warning,
+                    )
+                    if self._reliability.is_degraded(t):
+                        logging.warning(
+                            "Polygon monitor degraded",
+                            extra={"component": "polygon_aggs", "symbol": t, "failure_count": failure_count},
+                        )
+                    if self._reliability.should_safe_stop(t):
+                        logging.critical(
+                            "Polygon monitor safe-stop threshold reached",
+                            extra={"component": "polygon_aggs", "symbol": t, "failure_count": failure_count},
+                        )
                     time.sleep(3)
 
             if retries >= max_retries:
@@ -277,7 +326,14 @@ class Polygon_Helper:
                         else:
                             logging.debug(f"FMP {t}: status {r_fmp.status_code}")
             except Exception as ef:
-                logging.warning(f"FMP fallback failed for {t}: {ef}")
+                retries = self._reliability.record_failure(t)
+                structured_failure_log(
+                    component="polygon_failover_fmp",
+                    symbol=t,
+                    endpoint="https://financialmodelingprep.com/api/v3/historical-chart/15min",
+                    retry_count=retries,
+                    error=ef,
+                )
 
             # FAILOVER 2: yfinance
             try:
@@ -304,11 +360,21 @@ class Polygon_Helper:
                     logging.info(f"✅ YFinance {t}: Fetched {len(df_yf)} bars")
                     return df_yf
             except Exception as ey:
-                logging.debug(f"YFinance fallback failed: {ey}")
+                retries = self._reliability.record_failure(t)
+                structured_failure_log(
+                    component="polygon_failover_yfinance",
+                    symbol=t,
+                    endpoint="yfinance://download",
+                    retry_count=retries,
+                    error=ey,
+                    logger=logging.debug,
+                )
 
             if self._error_tracker:
                 self._error_tracker.record_failure(f"Data_{t}", "No data (Poly+YF)")
             return pd.DataFrame()
+
+        self._reliability.record_success(t)
 
         df = pd.DataFrame(all_rows).rename(columns={
             't': 'Datetime', 'c': 'Close', 'o': 'Open',
@@ -361,7 +427,15 @@ class Polygon_Helper:
                 self._mem_cache[key] = (now, df)
             return df
         except Exception as e:
-            logging.debug(f"fetch_daily_data({t}) failed: {e}")
+            retries = self._reliability.record_failure(t)
+            structured_failure_log(
+                component="polygon_daily",
+                symbol=t,
+                endpoint=url,
+                retry_count=retries,
+                error=e,
+                logger=logging.debug,
+            )
             return pd.DataFrame()
 
     def fetch_batch_bars(self, tickers, days=30):

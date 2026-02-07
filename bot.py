@@ -180,6 +180,7 @@ from hedge_fund.data_providers import (
 )
 from hedge_fund.websocket import ScanBarCache as _ScanBarCache, PolygonBarStream as _PolygonBarStream
 from hedge_fund.broker import Alpaca_Helper as _Alpaca_Helper
+from hedge_fund.reliability import FailureThresholds, ReliabilityMonitor, classify_failure, structured_failure_log
 
 # Optional UI
 try:
@@ -403,18 +404,33 @@ class ErrorTracker:
     def __init__(self):
         self.failures = defaultdict(int)
         self.last_success = defaultdict(lambda: datetime.datetime.now())
+        self.reliability = ReliabilityMonitor("bot", FailureThresholds(degraded_after=3, safe_stop_after=5))
 
-    def record_failure(self, component, error):
+    def record_failure(self, component, error, symbol="global", endpoint="internal", retry_count=0):
         self.failures[component] += 1
-        logging.error(f"❌ {component} failed ({self.failures[component]}x): {error}")
-        if self.failures[component] >= 5:
-            logging.critical(f"🚨 {component} has failed {self.failures[component]} times!")
+        self.reliability.record_failure(component)
+        err = error if isinstance(error, Exception) else Exception(str(error))
+        structured_failure_log(
+            component=component,
+            symbol=symbol,
+            endpoint=endpoint,
+            retry_count=retry_count,
+            error=err,
+            logger=logging.error,
+        )
+        cls = classify_failure(err)
+        logging.error(f"❌ {component} failed ({self.failures[component]}x, {cls}): {error}")
+        if self.reliability.is_degraded(component):
+            logging.warning(f"⚠️ {component} entering degraded mode")
+        if self.reliability.should_safe_stop(component):
+            logging.critical(f"🚨 {component} safe-stop threshold reached ({self.failures[component]} failures)")
             send_alert(f"🚨 {component} BROKEN", f"Failed {self.failures[component]}x", "high")
 
     def record_success(self, component):
         if self.failures[component] > 0:
             logging.info(f"✅ {component} recovered")
         self.failures[component] = 0
+        self.reliability.record_success(component)
         self.last_success[component] = datetime.datetime.now()
 
 ERROR_TRACKER = ErrorTracker()
