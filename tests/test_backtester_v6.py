@@ -338,3 +338,23 @@ class TestRiskMetricsV6:
         assert m['Trades'] == 4
         assert m['Resolved'] == 3
         assert m['PF_Res'] > 0
+
+
+class TestAnchoredWalkForward:
+    """Tests for anchored (expanding) walk-forward mode."""
+
+    def test_anchored_flag_exists(self):
+        from backtester import ANCHORED_WF
+        assert isinstance(ANCHORED_WF, bool)
+
+    def test_walk_forward_accepts_anchored_param(self):
+        from backtester import walk_forward_train_predict
+        import inspect
+        sig = inspect.signature(walk_forward_train_predict)
+        assert 'anchored' in sig.parameters
+
+    def test_pruned_accepts_anchored_param(self):
+        from backtester import _walk_forward_pruned
+        import inspect
+        sig = inspect.signature(_walk_forward_pruned)
+        assert 'anchored' in sig.parameters

@@ -1,6 +1,9 @@
 # ==============================================================================
-# GOD MODE BACKTESTER V6.2: OPTUNA BAYESIAN + ENSEMBLE + PARETO
+# GOD MODE BACKTESTER V6.3: OPTUNA BAYESIAN + ENSEMBLE + PARETO
 # ==============================================================================
+# V6.3 additions:
+#   1. Anchored (expanding) walk-forward: training window grows from bar 0
+#      instead of sliding. Uses all available history for each fold.
 # V6.2 additions:
 #   1. Ensemble model stacking (XGBoost + LightGBM + Ridge -> meta-learner)
 #   2. Multi-objective Optuna: Pareto frontier for PF vs MaxDD
@@ -155,6 +158,9 @@ HOLDOUT_BARS = 500  # Reserve last ~3 months as final validation
 
 # --- Ensemble settings ---
 USE_ENSEMBLE = True  # Use XGBoost + LightGBM + Ridge stacked ensemble
+
+# --- Walk-forward mode ---
+ANCHORED_WF = True  # True = expanding (anchored) window; False = rolling fixed-width
 
 # --- Multi-objective settings ---
 MULTI_OBJECTIVE = True  # Pareto frontier: maximize PF, minimize MaxDD
@@ -409,9 +415,12 @@ def compute_bracket_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=20, atr_col='A
 
 def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
                                train_bars=WF_TRAIN_BARS, test_bars=WF_TEST_BARS,
-                               step_bars=WF_STEP_BARS, prune=PRUNE_FEATURES):
+                               step_bars=WF_STEP_BARS, prune=PRUNE_FEATURES,
+                               anchored=ANCHORED_WF):
     """
-    Walk-forward validation: train on rolling window, predict on next window.
+    Walk-forward validation: train on window, predict on next window.
+    anchored=True  -> expanding (anchored) window: train always starts at 0
+    anchored=False -> rolling fixed-width window: train slides forward
     Returns concatenated test predictions across all windows and the pruned
     feature list (if pruning enabled).
     """
@@ -430,7 +439,8 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
         train_end = start + train_bars
         test_end = min(train_end + test_bars, n)
 
-        train_df = df.iloc[start:train_end]
+        train_start = 0 if anchored else start
+        train_df = df.iloc[train_start:train_end]
         test_df = df.iloc[train_end:test_end].copy()
 
         if len(train_df) < 200 or len(test_df) < 30:
@@ -484,14 +494,14 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
         if dropped:
             print(f"      [Pruned] Dropped {len(dropped)} weak features: {', '.join(dropped[:5])}...")
             return _walk_forward_pruned(df, pruned_features, sl_mult, tp_mult, max_bars,
-                                        train_bars, test_bars, step_bars), pruned_features
+                                        train_bars, test_bars, step_bars, anchored), pruned_features
 
     combined = pd.concat(all_test_dfs)
     return combined, pruned_features
 
 
 def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
-                         train_bars, test_bars, step_bars):
+                         train_bars, test_bars, step_bars, anchored=ANCHORED_WF):
     """Re-run walk-forward with pruned feature set."""
     n = len(df)
     all_test_dfs = []
@@ -500,7 +510,8 @@ def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
     while start + train_bars + test_bars <= n:
         train_end = start + train_bars
         test_end = min(train_end + test_bars, n)
-        train_df = df.iloc[start:train_end]
+        train_start = 0 if anchored else start
+        train_df = df.iloc[train_start:train_end]
         test_df = df.iloc[train_end:test_end].copy()
 
         if len(train_df) < 200 or len(test_df) < 30:
