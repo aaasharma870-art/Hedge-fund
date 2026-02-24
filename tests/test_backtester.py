@@ -143,8 +143,11 @@ class TestMonteCarloTest:
 
     def test_strong_signal_low_pvalue(self):
         # System with very high PF should have low p-value
-        trades = [(2.0, True, 1.0, 'A')] * 50 + [(-0.5, True, 1.0, 'A')] * 20
-        p = monte_carlo_test(trades, observed_pf=5.0, n_simulations=200)
+        # Uses magnitudes that are symmetric so sign-randomization creates
+        # meaningful variation in PF. 50 wins@2R, 20 losses@2R -> PF=5.0
+        trades = [(2.0, True, 1.0, 'A')] * 50 + [(-2.0, True, 1.0, 'A')] * 20
+        observed_pf = sum(x for x, _, _, _ in trades if x > 0) / abs(sum(x for x, _, _, _ in trades if x < 0))
+        p = monte_carlo_test(trades, observed_pf=observed_pf, n_simulations=500)
         assert p < 0.10
 
     def test_random_signal_high_pvalue(self):

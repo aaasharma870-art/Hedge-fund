@@ -569,6 +569,103 @@ class Alpaca_Helper:
         """Alias for close()."""
         return self.close(symbol, reason)
 
+    def partial_close(self, symbol, close_qty, side):
+        """
+        Safely close a partial position without breaking bracket order legs.
+
+        Cancels the existing SL/TP bracket legs, submits the partial close,
+        then re-submits new bracket legs for the remaining quantity.
+
+        Args:
+            symbol: Ticker symbol.
+            close_qty: Number of shares to close.
+            side: 'LONG' or 'SHORT'.
+
+        Returns:
+            True if partial close succeeded, False otherwise.
+        """
+        if close_qty <= 0:
+            return False
+
+        with self._pos_lock:
+            cached = self.pos_cache.get(symbol)
+            if not cached:
+                logging.warning(f"partial_close: {symbol} not in pos_cache")
+                return False
+
+            current_qty = cached.get('qty', 0)
+            if close_qty >= current_qty:
+                logging.warning(f"partial_close: close_qty ({close_qty}) >= current_qty ({current_qty}), use close() instead")
+                return False
+
+            current_sl = cached.get('sl', 0)
+            current_tp = cached.get('tp', 0)
+
+        # 1. Cancel existing bracket legs (SL and TP orders) for this symbol
+        try:
+            open_orders = self.api.list_orders(status='open', nested=True)
+            for o in open_orders:
+                if getattr(o, 'symbol', None) != symbol:
+                    continue
+                otype = getattr(o, 'type', None)
+                if otype in ('stop', 'stop_limit', 'limit'):
+                    try:
+                        self.api.cancel_order(o.id)
+                        logging.debug(f"Cancelled bracket leg {o.id} ({otype}) for {symbol}")
+                    except Exception as e_cancel:
+                        logging.warning(f"Failed to cancel bracket leg {o.id}: {e_cancel}")
+        except Exception as e:
+            logging.warning(f"partial_close: failed to cancel bracket legs for {symbol}: {e}")
+            return False
+
+        # 2. Submit partial close market order
+        try:
+            close_side = 'sell' if side == 'LONG' else 'buy'
+            self.api.submit_order(
+                symbol=symbol,
+                qty=close_qty,
+                side=close_side,
+                type='market',
+                time_in_force='day'
+            )
+        except Exception as e:
+            logging.error(f"partial_close: market order failed for {symbol}: {e}")
+            # Re-submit bracket legs for original qty to maintain protection
+            self._resubmit_bracket_legs(symbol, current_qty, side, current_sl, current_tp)
+            return False
+
+        remaining_qty = current_qty - close_qty
+
+        # 3. Re-submit bracket legs (SL + TP) for remaining quantity
+        self._resubmit_bracket_legs(symbol, remaining_qty, side, current_sl, current_tp)
+
+        # 4. Update pos_cache
+        with self._pos_lock:
+            if symbol in self.pos_cache:
+                self.pos_cache[symbol]['qty'] = remaining_qty
+
+        return True
+
+    def _resubmit_bracket_legs(self, symbol, qty, side, sl, tp):
+        """Re-submit SL and TP orders as an OCO for the given quantity."""
+        if qty <= 0 or sl <= 0:
+            return
+        try:
+            close_side = 'sell' if side == 'LONG' else 'buy'
+            self.api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=close_side,
+                type='limit',
+                time_in_force='gtc',
+                order_class='oco',
+                stop_loss={'stop_price': str(round(sl, 2))},
+                take_profit={'limit_price': str(round(tp, 2))},
+            )
+            logging.debug(f"Re-submitted OCO legs for {symbol}: SL=${sl:.2f} TP=${tp:.2f} qty={qty}")
+        except Exception as e:
+            logging.error(f"Failed to resubmit bracket legs for {symbol}: {e}. POSITION IS UNPROTECTED!")
+
     def check_kill(self):
         if self._kill_triggered:
             return True

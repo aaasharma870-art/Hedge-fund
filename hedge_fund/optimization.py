@@ -88,18 +88,37 @@ class PortfolioOptimizer:
                     betas[i] = cov_sm / market_var
 
         # 4. Optimization
+        # FIX: Allow negative weights for SHORT candidates so the optimizer
+        # can properly express short exposure. Long candidates get [0, 0.40],
+        # short candidates get [-0.40, 0]. This was previously [0, 0.40] for
+        # all positions, which meant the optimizer could never properly weight
+        # short positions.
         num_assets = len(symbols)
         initial_weights = np.ones(num_assets) / num_assets
-        bounds = tuple((0.0, 0.40) for _ in range(num_assets))
+        bounds = []
+        for c in candidates:
+            side = c.get('side', 'LONG')
+            if side == 'SHORT':
+                bounds.append((-0.40, 0.0))
+                # Negative initial weight for shorts
+                initial_weights[candidates.index(c)] = -1.0 / num_assets
+            else:
+                bounds.append((0.0, 0.40))
+        bounds = tuple(bounds)
 
         # Constraints
-        # A. Fully Invested
-        cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}]
+        # A. Gross exposure (sum of absolute weights) = 1.0
+        # This handles long/short portfolios where net exposure may not equal 1.
+        has_shorts = any(c.get('side') == 'SHORT' for c in candidates)
+        if has_shorts:
+            cons = [{'type': 'eq', 'fun': lambda x: np.sum(np.abs(x)) - 1.0}]
+        else:
+            cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0}]
 
-        # B. Beta Constraint: Portfolio Beta <= 0.90
+        # B. Beta Constraint: Portfolio |Beta| <= 0.90
         def beta_constraint(x):
             port_beta = np.sum(x * betas)
-            return 0.90 - port_beta
+            return 0.90 - abs(port_beta)
 
         cons.append({'type': 'ineq', 'fun': beta_constraint})
 
