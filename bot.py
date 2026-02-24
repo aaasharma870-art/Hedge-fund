@@ -171,6 +171,8 @@ from hedge_fund.features import CrossSectionalRanker
 from hedge_fund.config import load_app_config, load_optimal_params, apply_to_settings
 from hedge_fund.dashboard import Dashboard as SharedDashboard
 from hedge_fund.scanner import CandidateScanner
+from hedge_fund.math_utils import get_kalman_filter, get_hurst
+from hedge_fund.objectives import asymmetric_loss_objective, profit_factor_objective
 from hedge_fund.data_providers import (
     VIX_Helper as _VIX_Helper,
     Polygon_Helper as _Polygon_Helper,
@@ -1460,75 +1462,13 @@ def send_alert(subject, body, priority="normal"):
         try:
             color = 65280 if priority=="trade" else 16711680 if priority=="high" else 3447003
             requests.post(KEYS['DISCORD'], json={"embeds": [{"title": subject, "description": body, "color": color}]}, timeout=5)
-        except: pass
+        except Exception:
+            pass
 
 # ==============================================================================
 # 5. ANALYTICS (FIX #6: Direction-aware historical hit-rate)
 # ==============================================================================
-def get_kalman_filter(series, q_base=0.01, r_base=0.1, vol_span=20):
-    """
-    Adaptive Kalman filter with volatility-scaled noise parameters.
-    High vol: q increases (track faster), r decreases (trust observations).
-    Low vol: q decreases (smooth more), r increases (trust model).
-    """
-    n = len(series)
-    if n == 0:
-        return np.array([])
-    if n == 1:
-        return np.array([series[0]])
-
-    abs_returns = np.abs(np.diff(series, prepend=series[0]))
-
-    alpha_ema = 2.0 / (vol_span + 1)
-    vol_ema = np.empty(n)
-    vol_ema[0] = abs_returns[0] if abs_returns[0] > 0 else 1e-8
-    for i in range(1, n):
-        vol_ema[i] = alpha_ema * abs_returns[i] + (1 - alpha_ema) * vol_ema[i - 1]
-
-    # FIX: Use trimmed mean (10-90th pct) instead of median for more robust baseline
-    # Median can be skewed in low-activity periods; trimmed mean resists outliers
-    sorted_vol = np.sort(vol_ema)
-    trim_lo = max(1, int(n * 0.10))
-    trim_hi = max(trim_lo + 1, int(n * 0.90))
-    vol_baseline = float(np.mean(sorted_vol[trim_lo:trim_hi]))
-    if vol_baseline <= 0:
-        vol_baseline = 1e-8
-
-    x = series[0]
-    p = 1.0
-    estimates = np.empty(n)
-
-    for i in range(n):
-        ratio = max(0.1, min(10.0, vol_ema[i] / vol_baseline))
-        q = max(0.001, min(0.1, q_base * ratio))
-        r = max(0.01, min(1.0, r_base / ratio))
-
-        z = series[i]
-        p = p + q
-        k = p / (p + r)
-        x = x + k * (z - x)
-        p = (1 - k) * p
-        estimates[i] = x
-
-    return estimates
-
-def get_hurst(series):
-    """
-    Estimate Hurst exponent via variance of lagged differences.
-    H < 0.5 = mean-reverting, H = 0.5 = random walk, H > 0.5 = trending.
-    """
-    try:
-        if len(series) < 100: return 0.5
-        lags = range(2, 20)
-        # FIX: Standard formula - slope of log(std of lagged diffs) vs log(lag)
-        # No sqrt wrapper, no 2x multiplier - those distorted the exponent
-        tau = [np.std(np.subtract(series[lag:], series[:-lag])) for lag in lags]
-        if any(t <= 0 for t in tau):
-            return 0.5
-        slope = np.polyfit(np.log(list(lags)), np.log(tau), 1)[0]
-        return float(np.clip(slope, 0.0, 1.0))
-    except Exception:
-        return 0.5
+# get_kalman_filter and get_hurst are now imported from hedge_fund.math_utils
 
 def get_historical_hitrate(df, side, lookback=100, atr_mult_sl=1.5, atr_mult_tp=3.0, atr_col='ATR', max_bars=20):
     """
@@ -2214,99 +2154,8 @@ class Alpaca_Helper(_Alpaca_Helper):
 # INSTITUTIONAL-GRADE LOSS FUNCTIONS & MICROSTRUCTURE FEATURES
 # ==============================================================================
 
-def asymmetric_loss_objective(y_true, y_pred):
-    """
-    Custom XGBoost objective: Asymmetric Loss for High Win Rate
-    Penalizes false signals (wrong direction) 10x more than missed opportunities
-    This forces the model to only predict when highly confident
-
-    Loss = {
-        10.0 * (y_true - y_pred)^2  if sign(y_true) != sign(y_pred)  (WRONG DIRECTION)
-        1.0 * (y_true - y_pred)^2   if sign(y_true) == sign(y_pred)  (RIGHT DIRECTION)
-    }
-
-    Returns: (gradient, hessian)
-    """
-    grad = np.zeros_like(y_pred)
-    hess = np.zeros_like(y_pred)
-
-    residual = y_true - y_pred
-    wrong_direction = np.sign(y_true) != np.sign(y_pred)
-
-    # Asymmetric penalty: 10x for wrong direction
-    penalty = np.where(wrong_direction, 10.0, 1.0)
-
-    # Gradient: d/dy_pred [ penalty * (y_true - y_pred)^2 ] = -2 * penalty * (y_true - y_pred)
-    grad = -2.0 * penalty * residual
-
-    # Hessian: d^2/dy_pred^2 = 2 * penalty
-    hess = 2.0 * penalty
-
-    return grad, hess
-
-
-def profit_factor_objective(y_true, y_pred):
-    """
-    🎯 INSTITUTIONAL-GRADE: Differentiable Profit Factor Objective
-
-    Directly optimizes for Profit Factor = Gross_Wins / Gross_Losses
-    This is THE KEY to achieving >1.5 PF systematically.
-
-    Mathematical Strategy:
-    1. Classify predictions as "winners" or "losers" using soft sigmoid
-    2. Calculate Gross Profit (sum of winning R-values)
-    3. Calculate Gross Loss (sum of losing R-values)
-    4. Minimize -log(PF) = -log(GP) + log(GL)
-
-    The sigmoid smoothing makes the objective differentiable while
-    maintaining the economic interpretation of profit factor.
-
-    Returns: (gradient, hessian) for XGBoost
-    """
-    epsilon = 1e-6
-
-    # Agreement score: y_true * y_pred
-    # Positive = correct direction, negative = wrong direction
-    agreement = y_true * y_pred
-
-    # Soft classification using sigmoid for differentiability
-    # sigmoid(agreement/temp) = probability this trade is a "winner"
-    temp = 2.0  # Temperature (lower = sharper, higher = smoother)
-    soft_win_prob = 1.0 / (1.0 + np.exp(-agreement / temp))
-    soft_loss_prob = 1.0 - soft_win_prob
-
-    # Weighted returns (use absolute value of y_true as magnitude)
-    win_contribution = soft_win_prob * np.abs(y_true)
-    loss_contribution = soft_loss_prob * np.abs(y_true)
-
-    # Batch-level gross profit and gross loss
-    gross_profit = np.sum(win_contribution) + epsilon
-    gross_loss = np.sum(loss_contribution) + epsilon
-
-    # Profit Factor
-    pf = gross_profit / gross_loss
-
-    # We MAXIMIZE PF by MINIMIZING -log(PF)
-    # Gradient calculation:
-    # d(-log(PF))/d(y_pred) = d(-log(GP) + log(GL))/d(y_pred)
-
-    # Sigmoid derivative: sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))
-    sigmoid_derivative = soft_win_prob * (1.0 - soft_win_prob)
-
-    # Chain rule:
-    # d(win_prob)/d(y_pred) = sigmoid'(agreement/temp) * y_true / temp
-    d_win_prob = sigmoid_derivative * y_true / temp
-    d_loss_prob = -d_win_prob  # Loss prob decreases when win prob increases
-
-    # Gradient of loss w.r.t. y_pred
-    grad = -(1.0 / gross_profit) * d_win_prob * np.abs(y_true) + \
-           (1.0 / gross_loss) * d_loss_prob * np.abs(y_true)
-
-    # Hessian approximation (constant diagonal for stability)
-    # Use sigmoid curvature as proxy
-    hess = sigmoid_derivative * (1.0 / (temp**2)) * np.abs(y_true) + epsilon
-
-    return grad, hess
+# asymmetric_loss_objective and profit_factor_objective are now imported
+# from hedge_fund.objectives
 
 
 # FIX: Import microstructure features from hedge_fund/ to eliminate code duplication
@@ -2438,14 +2287,14 @@ class WalkForwardAI:
             'Vol_Surge', 'Money_Flow',
             # Regime features
             'Volatility_Rank', 'Trend_Consistency',
-            # ENHANCED: Sentiment features (SA API)
-            'sa_news_count_3d', 'sa_sentiment_score',
-            # ENHANCED: Time features (intraday patterns)
+            # FIX: Removed 6 features that were constant during training but
+            # populated with real data during live inference (distribution shift):
+            #   sa_news_count_3d, sa_sentiment_score, earnings_surprise,
+            #   revenue_growth_yoy, pe_ratio, news_impact_weight
+            # SA/FMP APIs are still used for news hard/soft skip gates and
+            # fundamental guards, which operate independently of the ML model.
+            # Time features (intraday patterns)
             'Hour', 'Day_of_Week',
-            # Fundamental features
-            'earnings_surprise', 'revenue_growth_yoy', 'pe_ratio',
-            # Dynamic news weighting
-            'news_impact_weight',
             # Market context features (cross-asset signals)
             'SPY_ROC_5', 'SPY_ROC_20', 'VIX_Level', 'VIX_ROC',
             # Cross-sectional factor ranks
@@ -2681,17 +2530,11 @@ class WalkForwardAI:
                     df['Hour'] = df.index.hour
                     df['Day_of_Week'] = df.index.dayofweek  # 0=Monday, 4=Friday
 
-                    # ENHANCED: Sentiment features (will be 0 during training, populated during live scanning)
-                    df['sa_news_count_3d'] = 0  # Placeholder for training
-                    df['sa_sentiment_score'] = 0  # Populated live from SA API
-
-                    # Fundamental features (populated live from FMP, default 0 for training)
-                    df['earnings_surprise'] = 0.0
-                    df['revenue_growth_yoy'] = 0.0
-                    df['pe_ratio'] = 20.0
-
-                    # Dynamic news weighting (populated live, default 0 for training)
-                    df['news_impact_weight'] = 0.0
+                    # FIX: Removed placeholder sentiment/fundamental features that were
+                    # constant during training (sa_news_count_3d, sa_sentiment_score,
+                    # earnings_surprise, revenue_growth_yoy, pe_ratio, news_impact_weight).
+                    # These caused distribution shift: model trained on zeros but received
+                    # real values during live inference.
 
                     # Market context: SPY momentum + VIX regime
                     if spy_ctx is not None:
@@ -3035,90 +2878,31 @@ class WalkForwardAI:
             except Exception as e:
                 logging.debug(f"Feature pruning failed: {e}")
 
-            # ── MODEL STACKING: LightGBM + Ridge + Meta-learner (OOF) ──
-            # FIX: Use out-of-fold predictions to train meta-learner instead of
-            # fitting directly on the test set (which caused data leakage).
+            # ── MODEL STACKING via EnsembleModel (OOF-safe) ──
+            # Uses hedge_fund/ensemble.py which trains a Ridge meta-learner on
+            # out-of-fold predictions from TimeSeriesSplit, preventing data leakage.
             try:
-                from sklearn.model_selection import TimeSeriesSplit
-
-                # Base learner 2: LightGBM (different inductive bias from XGB)
-                if HAS_LGB:
-                    self.lgb_model = lgb.LGBMRegressor(
-                        n_estimators=xgb_params.get('n_estimators', 100),
-                        max_depth=xgb_params.get('max_depth', 4),
-                        learning_rate=xgb_params.get('learning_rate', 0.05),
-                        verbosity=-1, n_jobs=CPU_WORKERS
-                    )
-                    self.lgb_model.fit(X_train, y_train)
-                    logging.info(f"   LightGBM trained (R²={self.lgb_model.score(X_test, y_test):.3f})")
-
-                # Base learner 3: Ridge regression (linear, catches what trees miss)
-                self.ridge_model = Ridge(alpha=1.0)
-                self.ridge_model.fit(X_train, y_train)
-                logging.info(f"   Ridge trained (R²={self.ridge_model.score(X_test, y_test):.3f})")
-
-                # Meta-learner: train on out-of-fold (OOF) predictions from training set
-                # This prevents leakage: meta-learner never sees test labels.
-                n_base = 3 if self.lgb_model else 2
-                n_splits = 3
-                X_train_arr = np.array(X_train)
-                y_train_arr = np.array(y_train)
-
-                if len(X_train_arr) >= n_splits * 50:
-                    tscv = TimeSeriesSplit(n_splits=n_splits)
-                    oof_preds = np.zeros((len(X_train_arr), n_base))
-
-                    for fold_idx, (tr_idx, val_idx) in enumerate(tscv.split(X_train_arr)):
-                        # XGBoost OOF
-                        fold_xgb = XGBRegressor(**xgb_params, tree_method='hist', verbosity=0)
-                        fold_xgb.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
-                        oof_preds[val_idx, 0] = fold_xgb.predict(X_train_arr[val_idx])
-
-                        # Ridge OOF
-                        fold_ridge = Ridge(alpha=1.0)
-                        fold_ridge.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
-                        oof_preds[val_idx, 1] = fold_ridge.predict(X_train_arr[val_idx])
-
-                        # LightGBM OOF (if available)
-                        if self.lgb_model and HAS_LGB:
-                            fold_lgb = lgb.LGBMRegressor(
-                                n_estimators=xgb_params.get('n_estimators', 100),
-                                max_depth=xgb_params.get('max_depth', 4),
-                                learning_rate=xgb_params.get('learning_rate', 0.05),
-                                verbosity=-1, n_jobs=CPU_WORKERS
-                            )
-                            fold_lgb.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
-                            oof_preds[val_idx, 2] = fold_lgb.predict(X_train_arr[val_idx])
-
-                    # Train meta-learner on OOF predictions (exclude first fold with no OOF)
-                    first_val_start = list(tscv.split(X_train_arr))[0][1][0]
-                    meta_X = oof_preds[first_val_start:]
-                    meta_y = y_train_arr[first_val_start:]
-                    mask = np.any(meta_X != 0, axis=1)
-
-                    if mask.sum() > 20:
-                        self.stack_meta = Ridge(alpha=0.5)
-                        self.stack_meta.fit(meta_X[mask], meta_y[mask])
-                        # Evaluate on held-out test set for honest metric
-                        test_base_preds = np.column_stack([
-                            self.model.predict(X_test),
-                            self.ridge_model.predict(X_test),
-                        ] + ([self.lgb_model.predict(X_test)] if self.lgb_model else []))
-                        meta_r2 = self.stack_meta.score(test_base_preds, y_test)
-                        logging.info(f"Stacking meta-learner trained via OOF (test meta R²={meta_r2:.3f})")
-                    else:
-                        logging.warning("Not enough OOF samples for meta-learner, using XGB-only")
-                        self.stack_meta = None
-                else:
-                    # Not enough data for OOF cross-validation, skip stacking
-                    logging.info("Insufficient training data for OOF stacking, using XGB-only")
-                    self.stack_meta = None
-
+                from hedge_fund.ensemble import EnsembleModel
+                lgb_params = {
+                    'n_estimators': xgb_params.get('n_estimators', 100),
+                    'max_depth': xgb_params.get('max_depth', 4),
+                    'learning_rate': xgb_params.get('learning_rate', 0.05),
+                    'n_jobs': CPU_WORKERS,
+                    'verbosity': -1,
+                }
+                self.ensemble = EnsembleModel(
+                    xgb_params=xgb_params,
+                    lgb_params=lgb_params if HAS_LGB else None,
+                    ridge_alpha=1.0,
+                )
+                self.ensemble.fit(X_train, y_train)
+                # Keep self.model pointing to XGB for feature importances / quantiles
+                self.model = self.ensemble.xgb_model
+                ensemble_r2 = self.ensemble.score(X_test, y_test)
+                logging.info(f"EnsembleModel trained via OOF stacking (test R²={ensemble_r2:.3f})")
             except Exception as e:
-                logging.warning(f"Model stacking failed (XGB-only fallback): {e}")
-                self.lgb_model = None
-                self.ridge_model = None
-                self.stack_meta = None
+                logging.warning(f"EnsembleModel failed (XGB-only fallback): {e}")
+                self.ensemble = None
 
             # Train quantile models for prediction intervals (q10, q90)
             try:
@@ -3327,28 +3111,20 @@ class WalkForwardAI:
                         else:
                             uncertainty = 0.5  # Single specialist = moderate uncertainty
                     else:
-                        # Fallback: use stacked prediction if available
-                        xgb_pred = float(self.model.predict(features)[0])
-                        if self.stack_meta and self.lgb_model and self.ridge_model:
-                            lgb_pred = float(self.lgb_model.predict(features)[0])
-                            ridge_pred = float(self.ridge_model.predict(features)[0])
-                            meta_X = np.array([[xgb_pred, lgb_pred, ridge_pred]])
-                            predicted_r = float(self.stack_meta.predict(meta_X)[0])
-                            uncertainty = float(np.std([xgb_pred, lgb_pred, ridge_pred]))
+                        # Fallback: use EnsembleModel stacked prediction
+                        if getattr(self, 'ensemble', None) is not None:
+                            predicted_r = float(self.ensemble.predict(features)[0])
+                            uncertainty = 0.5
                         else:
-                            predicted_r = xgb_pred
+                            predicted_r = float(self.model.predict(features)[0])
                             uncertainty = 0.75
                 else:
-                    # Stacked model prediction (XGB + LGB + Ridge → meta)
-                    xgb_pred = float(self.model.predict(features)[0])
-                    if self.stack_meta and self.lgb_model and self.ridge_model:
-                        lgb_pred = float(self.lgb_model.predict(features)[0])
-                        ridge_pred = float(self.ridge_model.predict(features)[0])
-                        meta_X = np.array([[xgb_pred, lgb_pred, ridge_pred]])
-                        predicted_r = float(self.stack_meta.predict(meta_X)[0])
-                        uncertainty = float(np.std([xgb_pred, lgb_pred, ridge_pred]))
+                    # EnsembleModel stacked prediction (XGB + LGB + Ridge -> meta)
+                    if getattr(self, 'ensemble', None) is not None:
+                        predicted_r = float(self.ensemble.predict(features)[0])
+                        uncertainty = 0.5
                     else:
-                        predicted_r = xgb_pred
+                        predicted_r = float(self.model.predict(features)[0])
                         uncertainty = 0.5
 
                 # 3. Apply dampener (reduce predictions if overfitting detected)
@@ -3984,6 +3760,19 @@ def run_god_mode():
     bar_stream.start()
     bar_stream.subscribe(universe)
 
+    # FIX: Non-blocking retraining. Training runs in a background thread
+    # so the main loop continues managing positions, checking stops, and
+    # running the kill switch during the 10-30min training window.
+    _retrain_thread = None
+
+    def _background_retrain(univ, poly_ref, db_ref, core_set):
+        """Train in background, model swap is handled by MODEL_LOCK."""
+        try:
+            ai.train(univ, poly_ref, db=db_ref, core_tickers=core_set)
+            logging.info("Background retrain complete - model swapped")
+        except Exception as e:
+            logging.error(f"Background retrain failed: {e}")
+
     while True:
         try:
             if alpaca.check_kill():
@@ -3994,6 +3783,19 @@ def run_god_mode():
             alpaca.refresh_equity()
             alpaca.sync_positions()
 
+            # FIX #9: Position reconciliation - detect ghost positions in cache
+            # that no longer exist at the broker (e.g. manual close, margin call).
+            try:
+                broker_symbols = set(alpaca.pos_cache.keys())
+                actual_positions = {p.symbol for p in alpaca.api.list_positions()}
+                ghosts = broker_symbols - actual_positions
+                if ghosts:
+                    logging.warning(f"Position reconciliation: removing {len(ghosts)} ghost(s): {ghosts}")
+                    for g in ghosts:
+                        alpaca.pos_cache.pop(g, None)
+            except Exception as e:
+                logging.debug(f"Position reconciliation check failed: {e}")
+
             # Apply Monte Carlo Risk Adjustments
             if mc_governor:
                 mc_governor.apply_adjustments()
@@ -4003,29 +3805,37 @@ def run_god_mode():
             # FIX: Update Universe Correlation Matrix (Batch)
             portfolio_risk.update_universe_cache(universe)
 
-            # ENHANCED: Adaptive retraining based on performance drift
-            # Check for drift first
+            _needs_retrain = False
+            _retrain_reason = ""
+
             if perf_monitor.should_retrain():
-                logging.warning("🔄 DRIFT DETECTED - Forcing immediate retraining...")
-                universe = list(set(CORE + fmp.get_dynamic_universe(exclude=set(CORE))))
-                ai.train(universe, poly, db=db, core_tickers=set(CORE))
-                gc.collect()
-                scan_cache.invalidate()  # Force fresh bars after retrain
-                bar_stream.subscribe(universe)  # Update WS subscriptions
-                last_refresh = datetime.datetime.now()
-                # Update baseline after retraining
+                _needs_retrain = True
+                _retrain_reason = "DRIFT DETECTED"
                 if len(perf_monitor.recent_trades) >= 20:
                     new_baseline = sum(perf_monitor.recent_trades) / len(perf_monitor.recent_trades)
-                    perf_monitor.update_baseline(max(0.45, new_baseline))  # Don't go below 45%
-
-            # Regular refresh every 45 mins (if no drift detected)
+                    perf_monitor.update_baseline(max(0.45, new_baseline))
             elif (datetime.datetime.now() - last_refresh).total_seconds() > 2700:
-                universe = list(set(CORE + fmp.get_dynamic_universe(exclude=set(CORE))))
-                ai.train(universe, poly, db=db, core_tickers=set(CORE))
-                gc.collect()
-                scan_cache.invalidate()  # Force fresh bars after retrain
-                bar_stream.subscribe(universe)  # Update WS subscriptions
-                last_refresh = datetime.datetime.now()
+                _needs_retrain = True
+                _retrain_reason = "Scheduled refresh"
+
+            if _needs_retrain:
+                # Only start if no retrain is already running
+                if _retrain_thread is None or not _retrain_thread.is_alive():
+                    logging.info(f"Starting background retrain ({_retrain_reason})...")
+                    try:
+                        universe = list(set(CORE + fmp.get_dynamic_universe(exclude=set(CORE))))
+                    except Exception as e:
+                        logging.warning(f"Dynamic universe failed, using CORE only: {e}")
+                        universe = list(CORE)
+                    _retrain_thread = threading.Thread(
+                        target=_background_retrain,
+                        args=(universe, poly, db, set(CORE)),
+                        daemon=True
+                    )
+                    _retrain_thread.start()
+                    scan_cache.invalidate()
+                    bar_stream.subscribe(universe)
+                    last_refresh = datetime.datetime.now()
 
             vix = vix_helper.get_vix()
             vix_mult = vix_helper.get_size_multiplier()
@@ -4279,12 +4089,70 @@ def run_god_mode():
                     df_15m['VIX_Level'] = live_vix_level
                     df_15m['VIX_ROC'] = live_vix_roc
 
-                    # Cross-sectional factor ranks (computed once per scan cycle)
-                    _ranks = cs_ranker.get_ranks(t)
-                    df_15m['momentum_rank'] = _ranks['momentum_rank']
-                    df_15m['volume_rank'] = _ranks['volume_rank']
-                    df_15m['value_rank'] = _ranks['value_rank']
-                    df_15m['composite_rank'] = _ranks['composite_rank']
+                    # FIX: Use self-relative rolling percentiles to match training.
+                    # Training computes rank features as rolling percentiles within each
+                    # stock's own history. The old code used cs_ranker.get_ranks(t) which
+                    # ranked cross-sectionally across the universe — a fundamentally
+                    # different distribution that caused train/live mismatch.
+                    df_15m['momentum_rank'] = df_15m['ROC_20'].rolling(100, min_periods=20).rank(pct=True).fillna(0.5)
+                    df_15m['volume_rank'] = (df_15m['Volume'] / df_15m['Volume'].rolling(20).mean()).rolling(100, min_periods=20).rank(pct=True).fillna(0.5)
+                    df_15m['value_rank'] = (100 - df_15m['RSI']).rolling(100, min_periods=20).rank(pct=True).fillna(0.5)
+                    df_15m['composite_rank'] = ((df_15m['momentum_rank'] + df_15m['volume_rank']) / 2).fillna(0.5)
+
+                    # INSTITUTIONAL MICROSTRUCTURE FEATURES (must match training path)
+                    try:
+                        df_15m['VPIN'] = calculate_vpin(df_15m, window=50)
+                    except Exception:
+                        df_15m['VPIN'] = 0.0
+
+                    try:
+                        vwap_feats = calculate_enhanced_vwap_features(df_15m)
+                        df_15m['VWAP_ZScore'] = vwap_feats['VWAP_ZScore'].fillna(0.0)
+                        df_15m['VWAP_Slope'] = vwap_feats['VWAP_Slope'].fillna(0.0)
+                        df_15m['VWAP_Volume_Ratio'] = vwap_feats['VWAP_Volume_Ratio'].fillna(1.0)
+                    except Exception:
+                        df_15m['VWAP_ZScore'] = 0.0
+                        df_15m['VWAP_Slope'] = 0.0
+                        df_15m['VWAP_Volume_Ratio'] = 1.0
+
+                    try:
+                        regime_gex, vol_regime_label = calculate_volatility_regime(df_15m)
+                        df_15m['Regime_GEX_Proxy'] = regime_gex.fillna(0)
+                        regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
+                        df_15m['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
+                    except Exception:
+                        df_15m['Regime_GEX_Proxy'] = 0
+                        df_15m['Volatility_Regime_Score'] = 0
+
+                    try:
+                        df_15m['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df_15m, window=20)
+                    except Exception:
+                        df_15m['Amihud_Illiquidity'] = 0.5
+
+                    try:
+                        # SPY data for RRS and Beta - fetch if available
+                        _spy_live = poly.fetch_data('SPY', days=12, mult=15)
+                        if _spy_live is not None and len(_spy_live) > 20:
+                            _spy_df_rrs = pd.DataFrame({'Close': _spy_live['Close']})
+                            rrs = calculate_real_relative_strength(df_15m, _spy_df_rrs)
+                            df_15m['RRS_Cumulative'] = rrs.fillna(0.0)
+                            stock_ret = df_15m['Close'].pct_change()
+                            spy_ret = _spy_df_rrs['Close'].pct_change().reindex(df_15m.index, method='ffill')
+                            cov = stock_ret.rolling(50).cov(spy_ret)
+                            spy_var = spy_ret.rolling(50).var()
+                            df_15m['Beta_To_SPY'] = (cov / (spy_var + 1e-9)).fillna(1.0).clip(-3, 3)
+                        else:
+                            df_15m['RRS_Cumulative'] = 0.0
+                            df_15m['Beta_To_SPY'] = 1.0
+                    except Exception:
+                        df_15m['RRS_Cumulative'] = 0.0
+                        df_15m['Beta_To_SPY'] = 1.0
+
+                    try:
+                        df_15m['Liquidity_Sweep'] = calculate_liquidity_sweep(df_15m, lookback=16)
+                    except Exception:
+                        df_15m['Liquidity_Sweep'] = 0
+
                     # --- END FEATURE PARITY FIX ---
 
                     row = df_15m.iloc[-2].to_dict()
@@ -4566,7 +4434,8 @@ def run_god_mode():
                 try:
                     # Quick fetch of daily data for correlation (more robust than 15m for broad covariance)
                     cov_prices = poly.fetch_batch_bars(fetch_symbols, days=30)
-                except:
+                except Exception as e:
+                    logging.warning(f"Covariance data fetch failed: {e}")
                     cov_prices = pd.DataFrame() # Fallback
 
                 # 2. Run Optimizer
@@ -4735,30 +4604,11 @@ def run_god_mode():
                                     alpaca.pos_cache[t]['ratcheted'] = True
                                     logging.info(f"🛡️ RATCHET {t}: SL -> ${new_sl:.2f} (+{r_val:.2f}R)")
 
-                    # ENHANCED: PARTIAL PROFIT TAKING at 1.5R and 2.5R
-                    # FIX: Use partial_close() which properly cancels/re-submits
-                    # bracket legs to avoid TP leg trying to sell more shares than held.
-                    if r_val >= 1.5 and not p.get('scaled_1', False) and p['qty'] >= 3:
-                        # Take 1/3 off at 1.5R
-                        close_qty = p['qty'] // 3
-                        if close_qty > 0:
-                            try:
-                                if alpaca.partial_close(t, close_qty, side):
-                                    alpaca.pos_cache[t]['scaled_1'] = True
-                                    logging.info(f"SCALED 1/3 of {t} @ +{r_val:.2f}R (qty: {close_qty})")
-                            except Exception as e:
-                                logging.debug(f"Partial close 1 failed for {t}: {e}")
-
-                    if r_val >= 2.5 and not p.get('scaled_2', False) and p['qty'] >= 2:
-                        # Take half of remaining at 2.5R
-                        close_qty = p['qty'] // 2
-                        if close_qty > 0:
-                            try:
-                                if alpaca.partial_close(t, close_qty, side):
-                                    alpaca.pos_cache[t]['scaled_2'] = True
-                                    logging.info(f"SCALED 50% remaining of {t} @ +{r_val:.2f}R (qty: {close_qty})")
-                            except Exception as e:
-                                logging.debug(f"Partial close 2 failed for {t}: {e}")
+                    # TODO: Partial profit taking disabled - standalone market orders break bracket TP legs.
+                    # To re-enable, must close full bracket and re-enter with reduced qty + updated SL/TP.
+                    # The broker.partial_close() method handles the cancel/resubmit correctly, but
+                    # this needs more testing before enabling in production.
+                    # See hedge_fund/broker.py:partial_close() for the safe implementation.
 
                     # v15.10: TRAILING STOP (Start after +2R, regime-adaptive distance)
                     if r_val >= SETTINGS.get("TRAIL_START_R", 2.0) and atr > 0:

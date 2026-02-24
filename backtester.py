@@ -972,34 +972,35 @@ def per_ticker_breakdown(trades):
 
 def monte_carlo_test(trades, observed_pf, n_simulations=MONTE_CARLO_RUNS):
     """
-    Sign-randomization test for profit factor significance.
+    Bootstrap significance test for strategy profitability.
 
-    Under the null hypothesis that the strategy has no directional edge,
-    each trade's sign (win vs loss) is equally likely. We randomly reassign
-    signs while preserving trade magnitudes, then compute PF.
+    Tests whether the observed mean return is significantly greater than zero
+    using a centered bootstrap under the null hypothesis of zero mean.
 
-    FIX: The original test both shuffled order AND flipped signs independently.
-    Order shuffling is unnecessary (PF is order-invariant). Sign-randomization
-    alone is the correct null hypothesis test for directional edge.
+    FIX: The original test shuffled order AND randomly flipped trade signs,
+    which (a) is order-invariant for PF, and (b) creates artificial trades
+    that don't reflect the strategy's actual risk profile. A centered bootstrap
+    on the mean is a proper test for non-zero edge.
 
-    Returns p-value (fraction of randomized runs that beat observed PF).
+    Returns p-value (fraction of bootstrap samples with mean >= observed mean).
     """
     if len(trades) < 10:
         return 1.0
 
-    outcomes = [t[0] for t in trades]
-    magnitudes = [abs(x) for x in outcomes]
+    outcomes = np.array([t[0] for t in trades])
+    observed_mean = np.mean(outcomes)
+
+    if observed_mean <= 0:
+        return 1.0
+
+    # Center under null hypothesis of zero mean
+    centered = outcomes - observed_mean
     beat_count = 0
 
     for _ in range(n_simulations):
-        # Randomly assign signs to magnitudes (null = no directional edge)
-        randomized = [m * random.choice([1, -1]) for m in magnitudes]
-
-        gross_win = sum(x for x in randomized if x > 0)
-        gross_loss = abs(sum(x for x in randomized if x < 0))
-        pf_randomized = gross_win / gross_loss if gross_loss > 0 else 0
-
-        if pf_randomized >= observed_pf:
+        boot = np.random.choice(centered, size=len(centered), replace=True)
+        boot_mean = np.mean(boot)
+        if boot_mean >= observed_mean:
             beat_count += 1
 
     return beat_count / n_simulations

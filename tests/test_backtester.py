@@ -139,19 +139,18 @@ class TestPerTickerBreakdown:
 
 
 class TestMonteCarloTest:
-    """Tests for Monte Carlo significance testing."""
+    """Tests for bootstrap significance testing."""
 
     def test_strong_signal_low_pvalue(self):
-        # System with very high PF should have low p-value
-        # Uses magnitudes that are symmetric so sign-randomization creates
-        # meaningful variation in PF. 50 wins@2R, 20 losses@2R -> PF=5.0
-        trades = [(2.0, True, 1.0, 'A')] * 50 + [(-2.0, True, 1.0, 'A')] * 20
+        # System with clearly positive mean return should have low p-value
+        # 50 wins@2R, 10 losses@1R -> strong positive mean
+        trades = [(2.0, True, 1.0, 'A')] * 50 + [(-1.0, True, 1.0, 'A')] * 10
         observed_pf = sum(x for x, _, _, _ in trades if x > 0) / abs(sum(x for x, _, _, _ in trades if x < 0))
         p = monte_carlo_test(trades, observed_pf=observed_pf, n_simulations=500)
         assert p < 0.10
 
     def test_random_signal_high_pvalue(self):
-        # System with PF near 1.0 should have high p-value
+        # System with PF near 1.0 (near-zero mean) should have high p-value
         trades = [(1.0, True, 1.0, 'A')] * 30 + [(-1.0, True, 1.0, 'A')] * 30
         p = monte_carlo_test(trades, observed_pf=1.0, n_simulations=200)
         assert p > 0.20
