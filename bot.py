@@ -249,7 +249,7 @@ def reserve_gpu():
             _ = torch.ones((10000, 10000)).cuda()
             logging.info(f"🔥 GPU ACTIVATED: {torch.cuda.get_device_name(0)} (VRAM Reserved)")
             return True
-    except:
+    except Exception:
         pass
     return False
 
@@ -505,7 +505,7 @@ class Database_Helper:
                 for col in new_cols:
                     try:
                         c.execute(f'ALTER TABLE trade_outcomes ADD COLUMN {col}')
-                    except:
+                    except Exception:
                         pass  # Column already exists
             except Exception as e:
                 logging.debug(f"Schema migration: {e}")
@@ -703,7 +703,7 @@ class Database_Helper:
                 try:
                     ts = pd.to_datetime(row[31]) if row[31] else datetime.datetime.now()
                     days_ago = (datetime.datetime.now() - ts).days
-                except:
+                except Exception:
                     days_ago = 0
 
                 results.append({
@@ -1151,8 +1151,8 @@ class PortfolioRisk:
                     df = yf.Ticker(t).history(period='3mo', interval='1d')[-60:]
                     if not df.empty:
                         self.holdings_history[t] = df['Close']
-                except:
-                    pass
+                except Exception as e:
+                    logging.debug(f"Failed to fetch history for {t}: {e}")
 
     def update_universe_cache(self, universe_list):
         """
@@ -1527,7 +1527,7 @@ def get_hurst(series):
             return 0.5
         slope = np.polyfit(np.log(list(lags)), np.log(tau), 1)[0]
         return float(np.clip(slope, 0.0, 1.0))
-    except:
+    except Exception:
         return 0.5
 
 def get_historical_hitrate(df, side, lookback=100, atr_mult_sl=1.5, atr_mult_tp=3.0, atr_col='ATR', max_bars=20):
@@ -1669,35 +1669,26 @@ def get_bayesian_p_safe(wins, losses, confidence_level=0.10):
 
 def kelly_3_outcome(pW, pL, pH, b, d=0.15, f_max=0.04):
     """
-    3-Outcome Log-Utility Kelly (User Option B).
-    Maximizes E[log(growth)] accounting for Wins, Losses, and Holds (Decay).
-    pW: Prob win, pL: Prob loss, pH: Prob hold.
-    b: Reward multiple (e.g. 2.0).
-    d: Hold penalty (e.g. 0.15R).
+    3-Outcome Kelly criterion wrapper.
+    Delegates to hedge_fund.risk.kelly_criterion for consistency with the backtester.
+
+    pW: Prob win, pL: Prob loss, pH: Prob hold (timeout).
+    b: Reward multiple (e.g. 2.0R).
+    d: Hold penalty (e.g. 0.15R, used as avg_timeout_r).
     f_max: Cap on fraction (e.g. 0.04).
     """
-    import numpy as np
-
-    # Grid search for max log-growth
-    # Safety: f must satisfy 1-f > 0, 1-f*d > 0
-    def obj(f):
-        if f <= 1e-6: return -1e9
-        if (1 - f) <= 1e-9 or (1 - f*d) <= 1e-9 or (1 + f*b) <= 1e-9:
-            return -1e9
-        return (pW * np.log(1 + f * b) +
-                pL * np.log(1 - f) +
-                pH * np.log(1 - f * d))
-
-    # Search in [0, f_max]
-    grid = np.linspace(0, f_max, 200)
-    vals = np.array([obj(f) for f in grid])
-    best = grid[np.argmax(vals)]
-
-    # If objective is negative or nan, return 0
-    if np.max(vals) == -1e9 or np.isnan(np.max(vals)):
-        return 0.0
-
-    return float(best)
+    from hedge_fund.risk import kelly_criterion
+    return kelly_criterion(
+        win_rate=pW,
+        avg_win_r=b,
+        avg_loss_r=1.0,  # Loss = 1R by definition
+        timeout_rate=pH,
+        avg_timeout_r=-d,  # Hold penalty is negative (cost of capital)
+        shrinkage=0.35,
+        confidence_boost=0.5,
+        min_risk=0.0,
+        max_risk=f_max,
+    )
 
 # Backward compatibility wrapper if needed
 def aggressive_kelly_risk_pct(*args, **kwargs): return 0.01
@@ -1842,96 +1833,26 @@ def get_daily_atr_polygon(poly, ticker: str, period=14, cache_ttl_sec=6*3600):
 def compute_bracket_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=20, atr_col='ATR', **_kwargs):
     """
     EV-style continuous labels with direction encoded in sign.
-      +x  => LONG with expected R ~ x
-      -x  => SHORT with expected R ~ |x|
-       0  => HOLD / no trade (both directions negative EV)
-
-    Timeouts use mark-to-market at horizon (continuous gradient, not flat -0.15).
-    atr_col: use 'ATR_D' for daily ATR to match live bracket geometry.
+    Delegates to hedge_fund.simulation.compute_bracket_labels which uses
+    simulate_exit with trailing stop support for consistency with the backtester.
     """
-    n = len(df)
-    labels = np.zeros(n, dtype=float)
+    from hedge_fund.simulation import compute_bracket_labels as _compute_labels
+    return _compute_labels(df, sl_mult=sl_mult, tp_mult=tp_mult,
+                           max_bars=max_bars, atr_col=atr_col, mode='regression').values
 
-    atr = df[atr_col].values
-    close = df['Close'].values
-    high = df['High'].values
-    low = df['Low'].values
-
-    rr = tp_mult / sl_mult  # e.g. 3.0/1.5 = 2.0R reward
-
-    for i in range(n - max_bars - 1):
-        a = atr[i]
-        if not np.isfinite(a) or a <= 0:
-            continue
-
-        entry = close[i]
-        risk = sl_mult * a
-        if risk <= 0:
-            continue
-
-        # --- LONG bracket ---
-        long_sl = entry - risk
-        long_tp = entry + tp_mult * a
-        long_out = _simulate_exit(high[i+1:i+max_bars+1], low[i+1:i+max_bars+1],
-                                  long_sl, long_tp, 'LONG')
-        if long_out == 'win':
-            long_r = rr
-        elif long_out == 'loss':
-            long_r = -1.0
-        else:
-            # Mark-to-market at horizon with small decay for dead money
-            mtm = (close[i + max_bars] - entry) / risk
-            long_r = float(np.clip(mtm - 0.05, -1.0, rr))
-
-        # --- SHORT bracket ---
-        short_sl = entry + risk
-        short_tp = entry - tp_mult * a
-        short_out = _simulate_exit(high[i+1:i+max_bars+1], low[i+1:i+max_bars+1],
-                                   short_sl, short_tp, 'SHORT')
-        if short_out == 'win':
-            short_r = rr
-        elif short_out == 'loss':
-            short_r = -1.0
-        else:
-            mtm = (entry - close[i + max_bars]) / risk
-            short_r = float(np.clip(mtm - 0.05, -1.0, rr))
-
-        # --- Choose best POSITIVE EV only; otherwise HOLD = 0 ---
-        best = max(long_r, short_r)
-        if best <= 0.0:
-            labels[i] = 0.0                    # Both directions negative EV => don't trade
-        elif long_r >= short_r:
-            labels[i] = float(best)            # + => go long
-        else:
-            labels[i] = float(-best)           # - => go short
-
-    return labels
-
-def _simulate_exit(highs, lows, sl, tp, side):
+def _simulate_exit(highs, lows, sl, tp, side, trail_dist=None):
     """
-    Simulate bracket exit using High/Low of future bars
-    Returns 'win' if TP hit first, 'loss' if SL hit first, 'timeout' if neither
+    Simulate bracket exit using High/Low of future bars.
+    Delegates to hedge_fund.simulation.simulate_exit which supports trailing stops.
+    Returns 'win' if TP hit first, 'loss' if SL hit first, 'timeout' if neither.
+    For backward compatibility, returns just the outcome string when called without
+    trail_dist, or (outcome, exit_price) tuple when trail_dist is provided.
     """
-    for i in range(len(highs)):
-        h = highs[i]
-        l = lows[i]
-
-        if side == 'LONG':
-            # SL hit if low goes below SL
-            if l <= sl:
-                return 'loss'
-            # TP hit if high goes above TP
-            if h >= tp:
-                return 'win'
-        else:  # SHORT
-            # SL hit if high goes above SL
-            if h >= sl:
-                return 'loss'
-            # TP hit if low goes below TP
-            if l <= tp:
-                return 'win'
-
-    return 'timeout'
+    from hedge_fund.simulation import simulate_exit as _sim_exit
+    outcome, exit_price = _sim_exit(highs, lows, sl, tp, side, trail_dist=trail_dist)
+    if trail_dist is not None:
+        return outcome, exit_price
+    return outcome
 
 # ==============================================================================
 # LIQUIDITY FILTER: Skip thin/illiquid trades
@@ -2046,7 +1967,8 @@ class HedgeManager:
         try:
             self.alpaca.api.close_position(SETTINGS['HEDGE_TICKER'])
             self.is_hedged = False
-        except:
+        except Exception as e:
+            logging.debug(f"Remove hedge failed: {e}")
             self.is_hedged = False
 
 # ==============================================================================
@@ -2387,260 +2309,19 @@ def profit_factor_objective(y_true, y_pred):
     return grad, hess
 
 
-def calculate_vpin(df, volume_bucket_size=None, window=50):
-    """
-    Calculate VPIN (Volume-Synchronized Probability of Informed Trading)
-
-    VPIN measures order flow toxicity - high VPIN = informed traders present = avoid trading
-
-    Args:
-        df: DataFrame with ['Close', 'Volume', 'High', 'Low']
-        volume_bucket_size: Volume per bucket (default: daily_vol / 50)
-        window: Number of buckets for rolling VPIN
-
-    Returns:
-        Series of VPIN values (0-1, higher = more toxic)
-    """
-    if df is None or len(df) < window:
-        return pd.Series(0.0, index=df.index if df is not None else [])
-
-    # Auto-determine bucket size if not provided
-    if volume_bucket_size is None:
-        avg_daily_volume = df['Volume'].rolling(20).mean().median()
-        volume_bucket_size = max(1, int(avg_daily_volume / 50))
-
-    # Classify buy/sell volume using Bulk Volume Classification (BVC)
-    # When price goes up, volume is buy-side; when down, sell-side
-    price_change = df['Close'].diff()
-    price_std = price_change.rolling(20).std()
-
-    # Standardized price change → probability via CDF
-    z_score = price_change / (price_std + 1e-9)
-    buy_prob = norm.cdf(z_score)  # Probability this bar was buy-initiated
-
-    df['Buy_Volume'] = df['Volume'] * buy_prob
-    df['Sell_Volume'] = df['Volume'] * (1 - buy_prob)
-
-    # Create volume buckets
-    cumulative_volume = df['Volume'].cumsum()
-    bucket_id = (cumulative_volume / volume_bucket_size).astype(int)
-
-    # Aggregate by bucket
-    bucket_imbalance = df.groupby(bucket_id).apply(
-        lambda x: abs(x['Buy_Volume'].sum() - x['Sell_Volume'].sum())
-    )
-    bucket_volume = df.groupby(bucket_id)['Volume'].sum()
-
-    # VPIN = Rolling average of |Buy - Sell| / Total Volume
-    vpin_buckets = bucket_imbalance / (bucket_volume + 1)
-    vpin_rolling = vpin_buckets.rolling(window, min_periods=10).mean()
-
-    # Map back to original index
-    bucket_to_vpin = vpin_rolling.to_dict()
-    df['VPIN'] = df.groupby(bucket_id).ngroup().map(bucket_to_vpin).fillna(0)
-
-    return df['VPIN'].clip(0, 1)  # Constrain to [0, 1]
-
-
-def calculate_enhanced_vwap_features(df):
-    """
-    Enhanced VWAP features for institutional-grade mean reversion signals
-
-    Returns dict of features:
-        - VWAP_ZScore: Standardized distance from VWAP
-        - VWAP_Slope: Rate of VWAP change (trending vs ranging)
-        - VWAP_Volume_Ratio: Current volume vs VWAP period volume
-    """
-    features = {}
-
-    # Standard VWAP (20-period)
-    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-    vwap = (typical_price * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
-
-    # 1. VWAP Z-Score (standardized distance)
-    vwap_dist = df['Close'] - vwap
-    vwap_std = vwap_dist.rolling(20).std()
-    features['VWAP_ZScore'] = vwap_dist / (vwap_std + 1e-9)
-
-    # 2. VWAP Slope (momentum of VWAP itself)
-    vwap_roc = vwap.pct_change(5)
-    features['VWAP_Slope'] = vwap_roc.rolling(10).mean()
-
-    # 3. Volume Confirmation (is current volume supporting the move?)
-    avg_vwap_volume = df['Volume'].rolling(20).mean()
-    features['VWAP_Volume_Ratio'] = df['Volume'] / (avg_vwap_volume + 1)
-
-    return features
-
-
-def calculate_volatility_regime(df):
-    """
-    GEX Proxy: Volatility Regime Detection
-
-    Since real GEX requires options data, we proxy it via realized volatility patterns:
-    - Low RV + Contracting ATR = Positive GEX Regime (mean reversion)
-    - High RV + Expanding ATR = Negative GEX Regime (trending/breakouts)
-
-    Returns:
-        - Regime_GEX_Proxy: -1 (negative GEX), 0 (neutral), +1 (positive GEX)
-        - Volatility_Regime: 'LOW', 'MEDIUM', 'HIGH'
-    """
-    # Calculate realized volatility (20-period rolling std of returns)
-    returns = df['Close'].pct_change()
-    realized_vol = returns.rolling(20).std() * np.sqrt(252)  # Annualized
-
-    # Calculate ATR expansion/contraction
-    df['ATR_20'] = df.ta.atr(20)
-    atr_change = df['ATR_20'].pct_change(5)
-
-    # Regime classification
-    vol_percentile = realized_vol.rolling(100).apply(
-        lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5
-    )
-
-    # GEX Proxy Logic
-    regime = pd.Series(0, index=df.index)  # Default neutral
-    regime[(vol_percentile < 0.3) & (atr_change < 0)] = 1   # Positive GEX (low vol + contracting)
-    regime[(vol_percentile > 0.7) & (atr_change > 0)] = -1  # Negative GEX (high vol + expanding)
-
-    # Volatility Regime Labels
-    vol_regime = pd.Series('MEDIUM', index=df.index)
-    vol_regime[vol_percentile < 0.3] = 'LOW'
-    vol_regime[vol_percentile > 0.7] = 'HIGH'
-
-    return regime, vol_regime
-
-
-def calculate_amihud_illiquidity(df, window=20):
-    """
-    Amihud Illiquidity Ratio: Measures price impact per dollar traded
-
-    Illiquidity = |Return| / (Volume * Price)
-
-    High values = low liquidity = high slippage risk = avoid trading
-    """
-    returns = df['Close'].pct_change().abs()
-    dollar_volume = df['Volume'] * df['Close']
-
-    illiquidity = returns / (dollar_volume + 1e-9)
-    illiquidity_ratio = illiquidity.rolling(window).mean()
-
-    # Normalize to percentile rank
-    illiquidity_rank = illiquidity_ratio.rolling(100).apply(
-        lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5
-    )
-
-    return illiquidity_rank
-
-
-def calculate_real_relative_strength(stock_df, spy_df=None):
-    """
-    🔥 CRITICAL ALPHA FEATURE: Real Relative Strength (RRS)
-
-    This is THE feature that separates institutional desks from retail.
-
-    Logic:
-    - If SPY drops 0.5% and NVDA is flat → Institutions are buying NVDA
-    - When SPY bounces, NVDA will outperform massively
-
-    Calculation:
-    RRS = (Stock_Return - Beta * SPY_Return)
-
-    A positive RRS means the stock is STRONGER than expected given market movement.
-    This predicts future outperformance.
-
-    Args:
-        stock_df: DataFrame with 'Close' for the stock
-        spy_df: DataFrame with 'Close' for SPY (market index)
-
-    Returns:
-        Series with RRS values
-    """
-    if spy_df is None or len(spy_df) < 50:
-        # Fallback: use stock's own momentum if no SPY data
-        return stock_df['Close'].pct_change(5)
-
-    # Align indices
-    stock_df = stock_df.copy()
-    spy_df = spy_df.copy()
-
-    # Calculate returns
-    stock_returns = stock_df['Close'].pct_change()
-    spy_returns = spy_df['Close'].pct_change()
-
-    # Align by reindexing
-    spy_returns_aligned = spy_returns.reindex(stock_df.index, method='ffill')
-
-    # Calculate rolling beta (50-period)
-    covariance = stock_returns.rolling(50).cov(spy_returns_aligned)
-    spy_variance = spy_returns_aligned.rolling(50).var()
-    beta = covariance / (spy_variance + 1e-9)
-    beta = beta.fillna(1.0).clip(-3, 3)  # Constrain beta to reasonable range
-
-    # Real Relative Strength = Actual Return - Expected Return (Beta * Market Return)
-    expected_return = beta * spy_returns_aligned
-    rrs = stock_returns - expected_return
-
-    # Cumulative RRS over 5 periods (capture persistent strength)
-    rrs_cumulative = rrs.rolling(5).sum()
-
-    return rrs_cumulative.fillna(0.0)
-
-
-def calculate_liquidity_sweep(df, lookback=16):
-    """
-    🎯 HIGH PROBABILITY REVERSAL: Liquidity Sweep Detection
-
-    "The Fakeout" - Institutions push price beyond a key level to trigger
-    retail stop losses, then reverse for easy profit.
-
-    Logic:
-    1. Price breaks above recent high (triggers retail breakout buyers)
-    2. Price immediately closes BACK INSIDE the range (trap!)
-    3. Volume spike confirms institutional participation
-
-    This is a HIGH WIN RATE mean reversion signal.
-
-    Args:
-        df: DataFrame with OHLCV data
-        lookback: Periods to look back for high/low (default 16 = 4 hours on 15m)
-
-    Returns:
-        Series with signals:
-        +1 = Bullish sweep (fake breakdown → reversal up)
-        -1 = Bearish sweep (fake breakout → reversal down)
-         0 = No sweep
-    """
-    signals = pd.Series(0, index=df.index)
-
-    # Calculate rolling high/low
-    rolling_high = df['High'].rolling(lookback).max()
-    rolling_low = df['Low'].rolling(lookback).min()
-
-    # Volume threshold (must be above average for institutional involvement)
-    avg_volume = df['Volume'].rolling(20).mean()
-    volume_surge = df['Volume'] > (avg_volume * 1.5)
-
-    for i in range(lookback + 1, len(df)):
-        current_bar = df.iloc[i]
-        prev_high = rolling_high.iloc[i-1]
-        prev_low = rolling_low.iloc[i-1]
-
-        # Bearish Sweep (Fake Breakout)
-        # High breaks above recent high BUT close is back inside
-        if (current_bar['High'] > prev_high and
-            current_bar['Close'] < prev_high and
-            volume_surge.iloc[i]):
-            signals.iloc[i] = -1  # Expect reversal DOWN
-
-        # Bullish Sweep (Fake Breakdown)
-        # Low breaks below recent low BUT close is back inside
-        elif (current_bar['Low'] < prev_low and
-              current_bar['Close'] > prev_low and
-              volume_surge.iloc[i]):
-            signals.iloc[i] = 1  # Expect reversal UP
-
-    return signals
+# FIX: Import microstructure features from hedge_fund/ to eliminate code duplication
+# and ensure consistency between training and live inference.
+from hedge_fund.features import (
+    calculate_vpin,
+    calculate_enhanced_vwap_features,
+    calculate_amihud_illiquidity,
+    calculate_real_relative_strength,
+    calculate_liquidity_sweep,
+)
+
+
+# calculate_volatility_regime also imported from hedge_fund.features
+from hedge_fund.features import calculate_volatility_regime
 
 
 def enhance_triple_barrier_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=12, atr_col='ATR'):
@@ -2971,7 +2652,8 @@ class WalkForwardAI:
                     try:
                         df['VWAP'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
                         df['VWAP_Dist'] = (df['Close'] - df['VWAP']) / df['Close']
-                    except:
+                    except Exception as e:
+                        logging.debug(f"VWAP feature calc failed: {e}")
                         df['VWAP_Dist'] = 0.0
 
                     # NEW: Microstructure features
@@ -3336,7 +3018,7 @@ class WalkForwardAI:
                     if fimp < 0.005:  # Near-zero tree importance
                         try:
                             ic = abs(train[fname].corr(train['Target'], method='spearman'))
-                        except:
+                        except Exception:
                             ic = 0
                         if ic < 0.02:
                             logging.info(f"   🗑️ Pruning {fname} (imp={fimp:.4f}, IC={ic:.3f})")
@@ -3353,8 +3035,12 @@ class WalkForwardAI:
             except Exception as e:
                 logging.debug(f"Feature pruning failed: {e}")
 
-            # ── MODEL STACKING: LightGBM + Ridge + Meta-learner ──
+            # ── MODEL STACKING: LightGBM + Ridge + Meta-learner (OOF) ──
+            # FIX: Use out-of-fold predictions to train meta-learner instead of
+            # fitting directly on the test set (which caused data leakage).
             try:
+                from sklearn.model_selection import TimeSeriesSplit
+
                 # Base learner 2: LightGBM (different inductive bias from XGB)
                 if HAS_LGB:
                     self.lgb_model = lgb.LGBMRegressor(
@@ -3371,15 +3057,63 @@ class WalkForwardAI:
                 self.ridge_model.fit(X_train, y_train)
                 logging.info(f"   Ridge trained (R²={self.ridge_model.score(X_test, y_test):.3f})")
 
-                # Meta-learner: blend base predictions via Ridge (blending on test set)
-                xgb_test_pred = self.model.predict(X_test)
-                lgb_test_pred = self.lgb_model.predict(X_test) if self.lgb_model else xgb_test_pred
-                ridge_test_pred = self.ridge_model.predict(X_test)
-                meta_X = np.column_stack([xgb_test_pred, lgb_test_pred, ridge_test_pred])
-                self.stack_meta = Ridge(alpha=0.5)
-                self.stack_meta.fit(meta_X, y_test)
-                meta_r2 = self.stack_meta.score(meta_X, y_test)
-                logging.info(f"✅ Stacking meta-learner trained (meta R²={meta_r2:.3f})")
+                # Meta-learner: train on out-of-fold (OOF) predictions from training set
+                # This prevents leakage: meta-learner never sees test labels.
+                n_base = 3 if self.lgb_model else 2
+                n_splits = 3
+                X_train_arr = np.array(X_train)
+                y_train_arr = np.array(y_train)
+
+                if len(X_train_arr) >= n_splits * 50:
+                    tscv = TimeSeriesSplit(n_splits=n_splits)
+                    oof_preds = np.zeros((len(X_train_arr), n_base))
+
+                    for fold_idx, (tr_idx, val_idx) in enumerate(tscv.split(X_train_arr)):
+                        # XGBoost OOF
+                        fold_xgb = XGBRegressor(**xgb_params, tree_method='hist', verbosity=0)
+                        fold_xgb.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
+                        oof_preds[val_idx, 0] = fold_xgb.predict(X_train_arr[val_idx])
+
+                        # Ridge OOF
+                        fold_ridge = Ridge(alpha=1.0)
+                        fold_ridge.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
+                        oof_preds[val_idx, 1] = fold_ridge.predict(X_train_arr[val_idx])
+
+                        # LightGBM OOF (if available)
+                        if self.lgb_model and HAS_LGB:
+                            fold_lgb = lgb.LGBMRegressor(
+                                n_estimators=xgb_params.get('n_estimators', 100),
+                                max_depth=xgb_params.get('max_depth', 4),
+                                learning_rate=xgb_params.get('learning_rate', 0.05),
+                                verbosity=-1, n_jobs=CPU_WORKERS
+                            )
+                            fold_lgb.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
+                            oof_preds[val_idx, 2] = fold_lgb.predict(X_train_arr[val_idx])
+
+                    # Train meta-learner on OOF predictions (exclude first fold with no OOF)
+                    first_val_start = list(tscv.split(X_train_arr))[0][1][0]
+                    meta_X = oof_preds[first_val_start:]
+                    meta_y = y_train_arr[first_val_start:]
+                    mask = np.any(meta_X != 0, axis=1)
+
+                    if mask.sum() > 20:
+                        self.stack_meta = Ridge(alpha=0.5)
+                        self.stack_meta.fit(meta_X[mask], meta_y[mask])
+                        # Evaluate on held-out test set for honest metric
+                        test_base_preds = np.column_stack([
+                            self.model.predict(X_test),
+                            self.ridge_model.predict(X_test),
+                        ] + ([self.lgb_model.predict(X_test)] if self.lgb_model else []))
+                        meta_r2 = self.stack_meta.score(test_base_preds, y_test)
+                        logging.info(f"Stacking meta-learner trained via OOF (test meta R²={meta_r2:.3f})")
+                    else:
+                        logging.warning("Not enough OOF samples for meta-learner, using XGB-only")
+                        self.stack_meta = None
+                else:
+                    # Not enough data for OOF cross-validation, skip stacking
+                    logging.info("Insufficient training data for OOF stacking, using XGB-only")
+                    self.stack_meta = None
+
             except Exception as e:
                 logging.warning(f"Model stacking failed (XGB-only fallback): {e}")
                 self.lgb_model = None
@@ -3762,7 +3496,8 @@ class BracketBacktest:
                 # ==============================================================================
                 try:
                     df['VPIN'] = calculate_vpin(df, window=50)
-                except:
+                except Exception as e:
+                    logging.debug(f"VPIN backtest calc failed: {e}")
                     df['VPIN'] = 0.0
 
                 try:
@@ -3770,7 +3505,8 @@ class BracketBacktest:
                     df['VWAP_ZScore'] = vwap_features['VWAP_ZScore'].fillna(0.0)
                     df['VWAP_Slope'] = vwap_features['VWAP_Slope'].fillna(0.0)
                     df['VWAP_Volume_Ratio'] = vwap_features['VWAP_Volume_Ratio'].fillna(1.0)
-                except:
+                except Exception as e:
+                    logging.debug(f"VWAP features backtest calc failed: {e}")
                     df['VWAP_ZScore'] = 0.0
                     df['VWAP_Slope'] = 0.0
                     df['VWAP_Volume_Ratio'] = 1.0
@@ -3780,13 +3516,15 @@ class BracketBacktest:
                     df['Regime_GEX_Proxy'] = regime_gex.fillna(0)
                     regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
                     df['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
-                except:
+                except Exception as e:
+                    logging.debug(f"GEX proxy backtest calc failed: {e}")
                     df['Regime_GEX_Proxy'] = 0
                     df['Volatility_Regime_Score'] = 0
 
                 try:
                     df['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df, window=20)
-                except:
+                except Exception as e:
+                    logging.debug(f"Amihud backtest calc failed: {e}")
                     df['Amihud_Illiquidity'] = 0.5
 
                 # RRS and Liquidity Sweep (Critical Alpha Features)
@@ -3794,13 +3532,15 @@ class BracketBacktest:
                     # RRS (no SPY data in backtest, use momentum proxy)
                     df['RRS_Cumulative'] = df['Close'].pct_change(5).rolling(5).sum().fillna(0.0)
                     df['Beta_To_SPY'] = 1.0  # Placeholder for backtest
-                except:
+                except Exception as e:
+                    logging.debug(f"RRS backtest calc failed: {e}")
                     df['RRS_Cumulative'] = 0.0
                     df['Beta_To_SPY'] = 1.0
 
                 try:
                     df['Liquidity_Sweep'] = calculate_liquidity_sweep(df, lookback=16)
-                except:
+                except Exception as e:
+                    logging.debug(f"Liquidity sweep backtest calc failed: {e}")
                     df['Liquidity_Sweep'] = 0
                 # ==============================================================================
 
@@ -4212,7 +3952,8 @@ def run_god_mode():
 
     try:
         universe = list(set(CORE + fmp.get_dynamic_universe(exclude=set(CORE))))
-    except:
+    except Exception as e:
+        logging.warning(f"Dynamic universe failed, using CORE only: {e}")
         universe = list(CORE)
 
     dashboard.render_loading("Starting AI Training...")
@@ -4502,7 +4243,8 @@ def run_god_mode():
                     try:
                         df_15m['VWAP'] = (df_15m['Close'] * df_15m['Volume']).rolling(20).sum() / df_15m['Volume'].rolling(20).sum()
                         df_15m['VWAP_Dist'] = (df_15m['Close'] - df_15m['VWAP']) / df_15m['Close']
-                    except:
+                    except Exception as e:
+                        logging.debug(f"VWAP calc failed for scanner: {e}")
                         df_15m['VWAP_Dist'] = 0.0
 
                     # Microstructure
@@ -4903,8 +4645,8 @@ def run_god_mode():
                         df = poly.fetch_data(t, days=1)
                         if len(df) > 0:
                             prices[t] = df['Close'].iloc[-1]
-                    except:
-                        pass
+                    except Exception as e:
+                        logging.debug(f"Price fetch failed for {t}: {e}")
 
             for t, p in list(alpaca.pos_cache.items()):
                 try:
@@ -4918,7 +4660,9 @@ def run_god_mode():
                     # OVERNIGHT GAP RISK: exit high-risk positions before close
                     if gap_model.is_pre_close():
                         init_risk = p.get('init_risk', 0)
-                        if init_risk <= 0: init_risk = 1.0
+                        # FIX: Use ATR-based fallback instead of $1 when init_risk unknown
+                        if init_risk <= 0:
+                            init_risk = abs(entry - p.get('sl', entry)) if p.get('sl', entry) != entry else (1.5 * atr)
                         amt = (curr - entry) if p['side'] == 'LONG' else (entry - curr)
                         pos_pnl_r = amt / init_risk
                         if gap_model.should_exit_pre_close(t, vix, pos_pnl_r):
@@ -4945,7 +4689,9 @@ def run_god_mode():
 
                     if duration_mins > time_limit:
                         init_risk = p.get('init_risk', 0)
-                        if init_risk <= 0: init_risk = 1.0 # prevent div/0
+                        # FIX: Use ATR-based fallback instead of $1 when init_risk unknown
+                        if init_risk <= 0:
+                            init_risk = abs(entry - current_sl) if current_sl != entry else (1.5 * atr)
 
                         amt = (curr - entry) if p['side'] == 'LONG' else (entry - curr)
                         pnl_r = amt / init_risk
@@ -4990,22 +4736,16 @@ def run_god_mode():
                                     logging.info(f"🛡️ RATCHET {t}: SL -> ${new_sl:.2f} (+{r_val:.2f}R)")
 
                     # ENHANCED: PARTIAL PROFIT TAKING at 1.5R and 2.5R
+                    # FIX: Use partial_close() which properly cancels/re-submits
+                    # bracket legs to avoid TP leg trying to sell more shares than held.
                     if r_val >= 1.5 and not p.get('scaled_1', False) and p['qty'] >= 3:
                         # Take 1/3 off at 1.5R
                         close_qty = p['qty'] // 3
                         if close_qty > 0:
                             try:
-                                # Close partial position
-                                alpaca.api.submit_order(
-                                    symbol=t,
-                                    qty=close_qty,
-                                    side='sell' if side == 'LONG' else 'buy',
-                                    type='market',
-                                    time_in_force='day'
-                                )
-                                alpaca.pos_cache[t]['scaled_1'] = True
-                                alpaca.pos_cache[t]['qty'] -= close_qty
-                                logging.info(f"📉 SCALED 1/3 of {t} @ +{r_val:.2f}R (qty: {close_qty})")
+                                if alpaca.partial_close(t, close_qty, side):
+                                    alpaca.pos_cache[t]['scaled_1'] = True
+                                    logging.info(f"SCALED 1/3 of {t} @ +{r_val:.2f}R (qty: {close_qty})")
                             except Exception as e:
                                 logging.debug(f"Partial close 1 failed for {t}: {e}")
 
@@ -5014,16 +4754,9 @@ def run_god_mode():
                         close_qty = p['qty'] // 2
                         if close_qty > 0:
                             try:
-                                alpaca.api.submit_order(
-                                    symbol=t,
-                                    qty=close_qty,
-                                    side='sell' if side == 'LONG' else 'buy',
-                                    type='market',
-                                    time_in_force='day'
-                                )
-                                alpaca.pos_cache[t]['scaled_2'] = True
-                                alpaca.pos_cache[t]['qty'] -= close_qty
-                                logging.info(f"📉 SCALED 50% remaining of {t} @ +{r_val:.2f}R (qty: {close_qty})")
+                                if alpaca.partial_close(t, close_qty, side):
+                                    alpaca.pos_cache[t]['scaled_2'] = True
+                                    logging.info(f"SCALED 50% remaining of {t} @ +{r_val:.2f}R (qty: {close_qty})")
                             except Exception as e:
                                 logging.debug(f"Partial close 2 failed for {t}: {e}")
 

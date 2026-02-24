@@ -972,25 +972,34 @@ def per_ticker_breakdown(trades):
 
 def monte_carlo_test(trades, observed_pf, n_simulations=MONTE_CARLO_RUNS):
     """
-    Shuffle trade outcomes and re-compute PF to test significance.
-    Returns p-value (fraction of shuffled runs that beat observed PF).
+    Sign-randomization test for profit factor significance.
+
+    Under the null hypothesis that the strategy has no directional edge,
+    each trade's sign (win vs loss) is equally likely. We randomly reassign
+    signs while preserving trade magnitudes, then compute PF.
+
+    FIX: The original test both shuffled order AND flipped signs independently.
+    Order shuffling is unnecessary (PF is order-invariant). Sign-randomization
+    alone is the correct null hypothesis test for directional edge.
+
+    Returns p-value (fraction of randomized runs that beat observed PF).
     """
     if len(trades) < 10:
         return 1.0
 
     outcomes = [t[0] for t in trades]
+    magnitudes = [abs(x) for x in outcomes]
     beat_count = 0
 
     for _ in range(n_simulations):
-        shuffled = list(outcomes)
-        random.shuffle(shuffled)
-        shuffled = [x * random.choice([1, -1]) for x in shuffled]
+        # Randomly assign signs to magnitudes (null = no directional edge)
+        randomized = [m * random.choice([1, -1]) for m in magnitudes]
 
-        gross_win = sum(x for x in shuffled if x > 0)
-        gross_loss = abs(sum(x for x in shuffled if x < 0))
-        pf_shuffled = gross_win / gross_loss if gross_loss > 0 else 0
+        gross_win = sum(x for x in randomized if x > 0)
+        gross_loss = abs(sum(x for x in randomized if x < 0))
+        pf_randomized = gross_win / gross_loss if gross_loss > 0 else 0
 
-        if pf_shuffled >= observed_pf:
+        if pf_randomized >= observed_pf:
             beat_count += 1
 
     return beat_count / n_simulations
