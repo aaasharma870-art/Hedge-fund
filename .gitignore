@@ -2,3 +2,6 @@
 .claude/
 __pycache__/
 *.pyc
+data/governor_state.json
+data/feature_stats.json
+data/feature_importance_history.json

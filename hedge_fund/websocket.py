@@ -63,6 +63,51 @@ class ScanBarCache:
                 self._last_slot.clear()
 
 
+class BarValidator:
+    """Validates incoming bars for duplicates, ordering, and completeness."""
+
+    def __init__(self, bar_size_minutes=15):
+        self.bar_size = bar_size_minutes
+        self._last_bar_time = {}  # symbol -> last complete bar timestamp
+
+    def is_valid_bar(self, symbol, bar_time, current_time=None):
+        """
+        Check if a bar is valid (not duplicate, not out of order, complete).
+
+        Args:
+            symbol: Ticker symbol.
+            bar_time: Timestamp of the bar.
+            current_time: Current time (for completeness check). Uses now() if None.
+
+        Returns:
+            True if the bar is valid and ready for processing.
+        """
+        import pandas as pd
+
+        if current_time is None:
+            try:
+                current_time = datetime.datetime.now(self._tz) if hasattr(self, '_tz') and self._tz else datetime.datetime.now(datetime.timezone.utc)
+            except Exception:
+                current_time = datetime.datetime.now(datetime.timezone.utc)
+
+        # Convert to pandas Timestamp for easier comparison
+        bar_ts = pd.Timestamp(bar_time)
+
+        # Skip duplicate or out-of-order bars
+        last = self._last_bar_time.get(symbol)
+        if last is not None and bar_ts <= last:
+            return False
+
+        # Skip partial bars (bar hasn't fully closed yet)
+        bar_close_time = bar_ts + pd.Timedelta(minutes=self.bar_size)
+        now_ts = pd.Timestamp(current_time)
+        if now_ts < bar_close_time - pd.Timedelta(seconds=5):
+            return False
+
+        self._last_bar_time[symbol] = bar_ts
+        return True
+
+
 class PolygonBarStream:
     """WebSocket stream for Polygon aggregate minute bars."""
 

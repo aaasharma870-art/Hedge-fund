@@ -40,6 +40,7 @@ def calculate_position_size(equity, entry_price, stop_price, risk_pct=0.015,
     if stop_distance <= 0:
         return 0
 
+    risk_pct = min(risk_pct, 0.02)  # Hard cap: never risk more than 2% per trade
     risk_per_trade = equity * risk_pct
     qty = int((risk_per_trade * vix_mult) / stop_distance)
     max_qty = int(equity * max_pct_of_equity / entry_price)
@@ -53,7 +54,7 @@ def calculate_position_size(equity, entry_price, stop_price, risk_pct=0.015,
 
 def kelly_criterion(win_rate, avg_win_r, avg_loss_r, timeout_rate=0.0,
                     avg_timeout_r=0.0, shrinkage=0.35, confidence_boost=0.5,
-                    min_risk=0.003, max_risk=0.03):
+                    min_risk=0.003, max_risk=0.02):
     """
     3-outcome Kelly criterion for optimal bet sizing.
 

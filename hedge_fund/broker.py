@@ -685,3 +685,41 @@ class Alpaca_Helper:
             if self._error_tracker:
                 self._error_tracker.record_failure("KillCheck", str(e))
         return False
+
+    def verify_all_stops_active(self):
+        """Safety check: ensure every open position has an active stop-loss order."""
+        try:
+            positions = self.api.list_positions()
+            open_orders = self.api.list_orders(status='open')
+            stop_symbols = set()
+            for o in open_orders:
+                if getattr(o, 'type', None) in ['stop', 'stop_limit']:
+                    stop_symbols.add(o.symbol)
+
+            for position in positions:
+                if position.symbol not in stop_symbols:
+                    logging.critical(f"UNPROTECTED POSITION: {position.symbol} has no stop-loss! Submitting emergency stop.")
+                    qty = abs(float(position.qty))
+                    entry = float(position.avg_entry_price)
+                    side = 'sell' if float(position.qty) > 0 else 'buy'
+                    emergency_stop = entry * 0.95 if side == 'sell' else entry * 1.05
+                    self._submit_emergency_stop(position.symbol, int(qty), side, emergency_stop)
+        except Exception as e:
+            logging.error(f"verify_all_stops_active failed: {e}")
+
+    def _submit_emergency_stop(self, symbol, qty, close_side, stop_price):
+        """Submit an emergency stop-loss order for an unprotected position."""
+        try:
+            self.api.submit_order(
+                symbol=symbol,
+                qty=int(qty),
+                side=close_side,
+                type='stop',
+                time_in_force='gtc',
+                stop_price=round(float(stop_price), 2),
+            )
+            logging.critical(f"EMERGENCY STOP submitted: {symbol} {close_side} {qty} @ ${stop_price:.2f}")
+            self._send_alert("EMERGENCY STOP", f"{symbol}: stop @ ${stop_price:.2f}", "high")
+        except Exception as e:
+            logging.critical(f"EMERGENCY STOP FAILED for {symbol}: {e}")
+            self._send_alert("EMERGENCY STOP FAILED", f"{symbol}: {e}", "high")

@@ -434,14 +434,16 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
     window_count = 0
     active_features = list(features)
 
+    embargo = max_bars  # Prevent label look-ahead leak from train into test
     start = 0
-    while start + train_bars + test_bars <= n:
+    while start + train_bars + embargo + test_bars <= n:
         train_end = start + train_bars
-        test_end = min(train_end + test_bars, n)
+        test_start = train_end + embargo  # Gap to avoid label leakage
+        test_end = min(test_start + test_bars, n)
 
         train_start = 0 if anchored else start
         train_df = df.iloc[train_start:train_end]
-        test_df = df.iloc[train_end:test_end].copy()
+        test_df = df.iloc[test_start:test_end].copy()
 
         if len(train_df) < 200 or len(test_df) < 30:
             start += step_bars
@@ -505,14 +507,16 @@ def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
     """Re-run walk-forward with pruned feature set."""
     n = len(df)
     all_test_dfs = []
+    embargo = max_bars  # Prevent label look-ahead leak from train into test
     start = 0
 
-    while start + train_bars + test_bars <= n:
+    while start + train_bars + embargo + test_bars <= n:
         train_end = start + train_bars
-        test_end = min(train_end + test_bars, n)
+        test_start = train_end + embargo  # Gap to avoid label leakage
+        test_end = min(test_start + test_bars, n)
         train_start = 0 if anchored else start
         train_df = df.iloc[train_start:train_end]
-        test_df = df.iloc[train_end:test_end].copy()
+        test_df = df.iloc[test_start:test_end].copy()
 
         if len(train_df) < 200 or len(test_df) < 30:
             start += step_bars

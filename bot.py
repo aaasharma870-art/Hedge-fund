@@ -435,6 +435,44 @@ class ErrorTracker:
 
 ERROR_TRACKER = ErrorTracker()
 
+class DailyRiskManager:
+    """Daily loss limit: halt trading if intraday losses exceed threshold."""
+
+    def __init__(self, max_daily_loss_pct=0.02):
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self.session_start_equity = None
+        self.trading_halted = False
+        self.halt_reason = None
+
+    def initialize_session(self, current_equity):
+        """Call at market open to set the baseline equity for daily P&L tracking."""
+        self.session_start_equity = current_equity
+        self.trading_halted = False
+        self.halt_reason = None
+        logging.info(f"DailyRisk: Session started. Equity=${current_equity:,.2f}, "
+                     f"Max loss=${current_equity * self.max_daily_loss_pct:,.2f}")
+
+    def check_can_trade(self, current_equity):
+        """Returns True if trading is allowed, False if daily loss limit hit."""
+        if self.trading_halted:
+            return False
+        if self.session_start_equity is None:
+            return True
+
+        daily_pnl = current_equity - self.session_start_equity
+        daily_pnl_pct = daily_pnl / self.session_start_equity
+
+        if daily_pnl_pct <= -self.max_daily_loss_pct:
+            self.trading_halted = True
+            self.halt_reason = f"Daily loss limit hit: {daily_pnl_pct:.2%} (${daily_pnl:,.2f})"
+            logging.critical(f"TRADING HALTED: {self.halt_reason}")
+            try:
+                send_alert("DAILY LOSS LIMIT", self.halt_reason, "high")
+            except Exception:
+                pass
+            return False
+        return True
+
 # ==============================================================================
 # 2. DATABASE
 # ==============================================================================
@@ -1465,70 +1503,7 @@ def send_alert(subject, body, priority="normal"):
 # ==============================================================================
 # 5. ANALYTICS (FIX #6: Direction-aware historical hit-rate)
 # ==============================================================================
-def get_kalman_filter(series, q_base=0.01, r_base=0.1, vol_span=20):
-    """
-    Adaptive Kalman filter with volatility-scaled noise parameters.
-    High vol: q increases (track faster), r decreases (trust observations).
-    Low vol: q decreases (smooth more), r increases (trust model).
-    """
-    n = len(series)
-    if n == 0:
-        return np.array([])
-    if n == 1:
-        return np.array([series[0]])
-
-    abs_returns = np.abs(np.diff(series, prepend=series[0]))
-
-    alpha_ema = 2.0 / (vol_span + 1)
-    vol_ema = np.empty(n)
-    vol_ema[0] = abs_returns[0] if abs_returns[0] > 0 else 1e-8
-    for i in range(1, n):
-        vol_ema[i] = alpha_ema * abs_returns[i] + (1 - alpha_ema) * vol_ema[i - 1]
-
-    # FIX: Use trimmed mean (10-90th pct) instead of median for more robust baseline
-    # Median can be skewed in low-activity periods; trimmed mean resists outliers
-    sorted_vol = np.sort(vol_ema)
-    trim_lo = max(1, int(n * 0.10))
-    trim_hi = max(trim_lo + 1, int(n * 0.90))
-    vol_baseline = float(np.mean(sorted_vol[trim_lo:trim_hi]))
-    if vol_baseline <= 0:
-        vol_baseline = 1e-8
-
-    x = series[0]
-    p = 1.0
-    estimates = np.empty(n)
-
-    for i in range(n):
-        ratio = max(0.1, min(10.0, vol_ema[i] / vol_baseline))
-        q = max(0.001, min(0.1, q_base * ratio))
-        r = max(0.01, min(1.0, r_base / ratio))
-
-        z = series[i]
-        p = p + q
-        k = p / (p + r)
-        x = x + k * (z - x)
-        p = (1 - k) * p
-        estimates[i] = x
-
-    return estimates
-
-def get_hurst(series):
-    """
-    Estimate Hurst exponent via variance of lagged differences.
-    H < 0.5 = mean-reverting, H = 0.5 = random walk, H > 0.5 = trending.
-    """
-    try:
-        if len(series) < 100: return 0.5
-        lags = range(2, 20)
-        # FIX: Standard formula - slope of log(std of lagged diffs) vs log(lag)
-        # No sqrt wrapper, no 2x multiplier - those distorted the exponent
-        tau = [np.std(np.subtract(series[lag:], series[:-lag])) for lag in lags]
-        if any(t <= 0 for t in tau):
-            return 0.5
-        slope = np.polyfit(np.log(list(lags)), np.log(tau), 1)[0]
-        return float(np.clip(slope, 0.0, 1.0))
-    except Exception:
-        return 0.5
+from hedge_fund.math_utils import get_kalman_filter, get_hurst
 
 def get_historical_hitrate(df, side, lookback=100, atr_mult_sl=1.5, atr_mult_tp=3.0, atr_col='ATR', max_bars=20):
     """
@@ -2439,7 +2414,7 @@ class WalkForwardAI:
             # Regime features
             'Volatility_Rank', 'Trend_Consistency',
             # ENHANCED: Sentiment features (SA API)
-            'sa_news_count_3d', 'sa_sentiment_score',
+            'sa_news_count_3d', 'sa_sentiment_score', 'sentiment_valid',
             # ENHANCED: Time features (intraday patterns)
             'Hour', 'Day_of_Week',
             # Fundamental features
@@ -2684,6 +2659,7 @@ class WalkForwardAI:
                     # ENHANCED: Sentiment features (will be 0 during training, populated during live scanning)
                     df['sa_news_count_3d'] = 0  # Placeholder for training
                     df['sa_sentiment_score'] = 0  # Populated live from SA API
+                    df['sentiment_valid'] = 0  # Flag: 0=placeholder, 1=real SA data
 
                     # Fundamental features (populated live from FMP, default 0 for training)
                     df['earnings_surprise'] = 0.0
@@ -2886,6 +2862,15 @@ class WalkForwardAI:
                 return
 
             train = pd.concat(all_train)
+
+            # Save training feature statistics for live distribution validation
+            try:
+                from hedge_fund.features import save_feature_stats
+                save_feature_stats(train[valid_cols] if valid_cols else train[self.cols])
+                logging.info("Saved training feature statistics for distribution validation")
+            except Exception as e:
+                logging.warning(f"Failed to save feature stats: {e}")
+
             # FIX: Use all_calib for the calibration set (previously undefined all_test)
             test = pd.concat(all_calib) if all_calib else train.sample(frac=0.2)
 
@@ -3937,6 +3922,7 @@ def run_god_mode():
     optimizer = PortfolioOptimizer(target_vol=0.25) # Aggressive Optimization
     pairs_scanner = PairsScanner(poly, lookback_days=60, rescan_hours=6)
     gap_model = OvernightGapModel(earnings_guard=earnings)
+    daily_risk = DailyRiskManager(max_daily_loss_pct=0.02)
     cs_ranker = CrossSectionalRanker()
     dashboard = Dashboard()
 
@@ -3992,11 +3978,27 @@ def run_god_mode():
 
             # FIX: Refresh equity and sync positions EVERY loop
             alpaca.refresh_equity()
+
+            # Initialize daily risk session on first loop or new trading day
+            if daily_risk.session_start_equity is None:
+                daily_risk.initialize_session(alpaca.equity)
+
+            # Check daily loss limit before any trading
+            if not daily_risk.check_can_trade(alpaca.equity):
+                time.sleep(60)
+                continue
+
             alpaca.sync_positions()
 
             # Apply Monte Carlo Risk Adjustments
             if mc_governor:
                 mc_governor.apply_adjustments()
+
+            # Periodic safety check: verify all positions have stops
+            try:
+                alpaca.verify_all_stops_active()
+            except Exception as e_verify:
+                logging.warning(f"Stop verification failed: {e_verify}")
 
             # v15: Update holdings data for correlation check
             portfolio_risk.update_holdings_data(alpaca.pos_cache)
@@ -4285,6 +4287,71 @@ def run_god_mode():
                     df_15m['volume_rank'] = _ranks['volume_rank']
                     df_15m['value_rank'] = _ranks['value_rank']
                     df_15m['composite_rank'] = _ranks['composite_rank']
+
+                    # ==============================================================
+                    # FIX Issue 3: Institutional microstructure features were MISSING
+                    # in live scanning but computed during training. This caused the
+                    # model to see real VPIN/Amihud/etc during training but defaults
+                    # (0.0) during live prediction → distribution mismatch.
+                    # ==============================================================
+
+                    # 1. VPIN (Order Flow Toxicity)
+                    try:
+                        df_15m['VPIN'] = calculate_vpin(df_15m, window=50)
+                    except Exception:
+                        df_15m['VPIN'] = 0.0
+
+                    # 2. Enhanced VWAP Features
+                    try:
+                        vwap_features = calculate_enhanced_vwap_features(df_15m)
+                        df_15m['VWAP_ZScore'] = vwap_features['VWAP_ZScore'].fillna(0.0)
+                        df_15m['VWAP_Slope'] = vwap_features['VWAP_Slope'].fillna(0.0)
+                        df_15m['VWAP_Volume_Ratio'] = vwap_features['VWAP_Volume_Ratio'].fillna(1.0)
+                    except Exception:
+                        df_15m['VWAP_ZScore'] = 0.0
+                        df_15m['VWAP_Slope'] = 0.0
+                        df_15m['VWAP_Volume_Ratio'] = 1.0
+
+                    # 3. GEX Proxy (Volatility Regime Detection)
+                    try:
+                        regime_gex, vol_regime_label = calculate_volatility_regime(df_15m)
+                        df_15m['Regime_GEX_Proxy'] = regime_gex.fillna(0)
+                        regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
+                        df_15m['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
+                    except Exception:
+                        df_15m['Regime_GEX_Proxy'] = 0
+                        df_15m['Volatility_Regime_Score'] = 0
+
+                    # 4. Amihud Illiquidity
+                    try:
+                        df_15m['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df_15m, window=20)
+                    except Exception:
+                        df_15m['Amihud_Illiquidity'] = 0.5
+
+                    # 5. Real Relative Strength + Beta
+                    try:
+                        _spy_for_rrs = None
+                        if _spy_scan is not None and len(_spy_scan) > 0:
+                            _spy_for_rrs = pd.DataFrame({'Close': _spy_scan['Close']})
+                        rrs = calculate_real_relative_strength(df_15m, _spy_for_rrs)
+                        df_15m['RRS_Cumulative'] = rrs.fillna(0.0)
+                        if _spy_for_rrs is not None:
+                            stock_returns = df_15m['Close'].pct_change()
+                            spy_returns = _spy_for_rrs['Close'].pct_change().reindex(df_15m.index, method='ffill')
+                            covariance = stock_returns.rolling(50).cov(spy_returns)
+                            spy_variance = spy_returns.rolling(50).var()
+                            df_15m['Beta_To_SPY'] = (covariance / (spy_variance + 1e-9)).fillna(1.0).clip(-3, 3)
+                        else:
+                            df_15m['Beta_To_SPY'] = 1.0
+                    except Exception:
+                        df_15m['RRS_Cumulative'] = 0.0
+                        df_15m['Beta_To_SPY'] = 1.0
+
+                    # 6. Liquidity Sweep Detection
+                    try:
+                        df_15m['Liquidity_Sweep'] = calculate_liquidity_sweep(df_15m, lookback=16)
+                    except Exception:
+                        df_15m['Liquidity_Sweep'] = 0
                     # --- END FEATURE PARITY FIX ---
 
                     row = df_15m.iloc[-2].to_dict()
@@ -4293,9 +4360,11 @@ def run_god_mode():
                     if sa_helper.key:
                         row.update(sa_helper.get_news_features(t))
                         row.update(sa_helper.get_ratings(t))
+                        row['sentiment_valid'] = 1.0
                     else:
                         row['sa_news_count_3d'] = 0
                         row['sa_sentiment_score'] = 0
+                        row['sentiment_valid'] = 0.0
 
                     # Fundamental features from FMP
                     fund_feats = fmp.get_fundamental_features(t)
@@ -4304,6 +4373,15 @@ def run_god_mode():
                     # Dynamic news weighting
                     _ns = all_news_scores.get(t, 0)
                     row['news_impact_weight'] = float(_ns) if _ns else 0.0
+
+                    # Validate live features against training distribution
+                    try:
+                        from hedge_fund.features import validate_feature_distributions, load_feature_stats
+                        if not validate_feature_distributions.__defaults__:
+                            load_feature_stats()
+                        validate_feature_distributions({k: row.get(k, 0) for k in ai.active_features})
+                    except Exception:
+                        pass
 
                     # Hygiene
                     bad_feats = [k for k in ai.active_features if k in row and not np.isfinite(row[k])]
