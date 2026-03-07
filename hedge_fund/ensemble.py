@@ -139,15 +139,26 @@ class EnsembleModel:
         self._feature_importances = self.xgb_model.feature_importances_
 
     def _fit_direct(self, X, y):
-        """Train all models directly (no cross-val meta-learner)."""
+        """Train all models directly when data is too small for OOF splits.
+
+        FIX: Previously trained meta-learner on in-sample base predictions,
+        which is data leakage (meta sees same data base models trained on).
+        Now uses equal-weight averaging via fixed meta coefficients instead.
+        """
         self.xgb_model.fit(X, y)
         self.ridge_model.fit(X, y)
         if self._has_lgb:
             self.lgb_model.fit(X, y)
 
-        # Simple averaging meta-model
-        base_preds = self._base_predictions(X)
-        self.meta_model.fit(base_preds, y)
+        # FIX: Set meta-learner to equal-weight averaging instead of fitting
+        # on in-sample predictions (which leaks information).
+        n_base = self._n_base_models()
+        dummy_X = np.eye(n_base)
+        dummy_y = np.ones(n_base) / n_base
+        self.meta_model.fit(dummy_X, dummy_y)
+        # Override with explicit equal weights
+        self.meta_model.coef_ = np.ones(n_base) / n_base
+        self.meta_model.intercept_ = 0.0
 
         self._is_fitted = True
         self._feature_importances = self.xgb_model.feature_importances_

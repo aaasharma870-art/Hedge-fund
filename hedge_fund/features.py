@@ -363,3 +363,186 @@ class CrossSectionalRanker:
         r = self.get_ranks(ticker)
         comp = r['composite_rank']
         return float(np.clip(0.7 + 0.6 * comp, 0.7, 1.3))
+
+
+import json
+import os
+
+FEATURE_STATS = {}
+_FEATURE_STATS_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'feature_stats.json')
+
+def load_feature_stats(path=None):
+    """Load training feature statistics for live validation."""
+    global FEATURE_STATS
+    p = path or _FEATURE_STATS_PATH
+    if os.path.exists(p):
+        with open(p) as f:
+            FEATURE_STATS = json.load(f)
+    return FEATURE_STATS
+
+def save_feature_stats(feature_df, path=None):
+    """Save feature statistics from training for live distribution validation."""
+    p = path or _FEATURE_STATS_PATH
+    stats = {}
+    for col in feature_df.columns:
+        if col == 'Target':
+            continue
+        try:
+            vals = feature_df[col].dropna()
+            if len(vals) > 0:
+                stats[col] = {
+                    'mean': float(vals.mean()),
+                    'std': float(vals.std()),
+                    'min': float(vals.min()),
+                    'max': float(vals.max()),
+                    'median': float(vals.median()),
+                }
+        except Exception:
+            pass
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, 'w') as f:
+        json.dump(stats, f, indent=2)
+    return stats
+
+def validate_feature_distributions(live_features, training_stats=None):
+    """Check if live features are within expected ranges from training."""
+    stats = training_stats or FEATURE_STATS
+    if not stats:
+        return
+    warnings = []
+    for feat_name, live_val in live_features.items():
+        if feat_name not in stats:
+            continue
+        try:
+            train_mean = stats[feat_name]['mean']
+            train_std = stats[feat_name]['std']
+            if train_std > 0:
+                z_score = abs((live_val - train_mean) / (train_std + 1e-8))
+                if z_score > 4.0:
+                    warnings.append(f"Feature {feat_name} is {z_score:.1f} std devs from training mean. Live={live_val:.4f}, Train mean={train_mean:.4f}")
+        except (KeyError, TypeError):
+            pass
+    for w in warnings:
+        logging.warning(w)
+    return warnings
+
+
+class FeatureImportanceTracker:
+    """Track rolling feature importances across XGBoost training cycles.
+
+    Persists a history of top-10 feature rankings to disk and warns when
+    a feature's rank shifts by more than 3 positions between consecutive
+    training cycles, which may indicate data drift or regime change.
+    """
+
+    TOP_N = 10
+    DRIFT_THRESHOLD = 3
+
+    def __init__(self, state_dir='data'):
+        self._state_dir = state_dir
+        self._state_path = os.path.join(state_dir, 'feature_importance_history.json')
+        self._history = []  # list of dicts: [{"feature_name": importance, ...}, ...]
+        self._logger = logging.getLogger(__name__)
+        self._load_state()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update(self, feature_names, importances):
+        """Record importances from the latest training cycle.
+
+        Args:
+            feature_names: list of feature name strings.
+            importances: list/array of importance values (same order).
+        """
+        if len(feature_names) != len(importances):
+            self._logger.warning(
+                "feature_names length (%d) != importances length (%d); skipping update",
+                len(feature_names), len(importances),
+            )
+            return
+
+        current = {name: float(imp) for name, imp in zip(feature_names, importances)}
+        self._history.append(current)
+
+        # Log drift warnings when we have at least two snapshots
+        if len(self._history) >= 2:
+            drift = self.get_drift_report()
+            for feat, info in drift.items():
+                self._logger.warning(
+                    "Feature importance drift: '%s' moved from rank %d to %d (shift=%d)",
+                    feat, info['prev_rank'], info['curr_rank'], info['shift'],
+                )
+
+        self._save_state()
+
+    def get_drift_report(self):
+        """Compare the two most recent snapshots and return significant rank changes.
+
+        Returns:
+            dict keyed by feature name with values:
+                {'prev_rank': int, 'curr_rank': int, 'shift': int}
+            Only features whose rank changed by more than DRIFT_THRESHOLD
+            are included.  Ranks are 1-based within the top-N union.
+        """
+        if len(self._history) < 2:
+            return {}
+
+        prev_ranking = self._top_n_ranking(self._history[-2])
+        curr_ranking = self._top_n_ranking(self._history[-1])
+
+        # Build a unified set of features that appeared in either top-N
+        all_features = set(prev_ranking.keys()) | set(curr_ranking.keys())
+
+        # Features absent from a top-N list get a sentinel rank of TOP_N + 1
+        sentinel = self.TOP_N + 1
+        report = {}
+        for feat in all_features:
+            prev_rank = prev_ranking.get(feat, sentinel)
+            curr_rank = curr_ranking.get(feat, sentinel)
+            shift = abs(curr_rank - prev_rank)
+            if shift > self.DRIFT_THRESHOLD:
+                report[feat] = {
+                    'prev_rank': prev_rank,
+                    'curr_rank': curr_rank,
+                    'shift': shift,
+                }
+        return report
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def _save_state(self):
+        """Persist the importance history to disk."""
+        os.makedirs(self._state_dir, exist_ok=True)
+        try:
+            with open(self._state_path, 'w') as f:
+                json.dump(self._history, f, indent=2)
+        except OSError as exc:
+            self._logger.error("Failed to save feature importance history: %s", exc)
+
+    def _load_state(self):
+        """Load previous importance history from disk if available."""
+        if os.path.exists(self._state_path):
+            try:
+                with open(self._state_path) as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self._history = data
+                    self._logger.info(
+                        "Loaded %d feature importance snapshots from %s",
+                        len(self._history), self._state_path,
+                    )
+            except (OSError, json.JSONDecodeError) as exc:
+                self._logger.error("Failed to load feature importance history: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _top_n_ranking(self, importance_dict):
+        """Return {feature: 1-based rank} for the top-N features by importance."""
+        sorted_features = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
+        return {name: rank for rank, (name, _) in enumerate(sorted_features[:self.TOP_N], start=1)}

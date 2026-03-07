@@ -7,7 +7,9 @@ restores it during healthy performance.
 """
 
 import datetime
+import json
 import logging
+import os
 from collections import deque
 
 
@@ -25,7 +27,7 @@ class MonteCarloGovernor:
     """
 
     def __init__(self, settings=None, dd_warning=0.05, dd_critical=0.08,
-                 lookback_trades=50, update_interval=300):
+                 lookback_trades=50, update_interval=300, state_dir='data'):
         """
         Args:
             settings: Optional settings dict (for forward compatibility).
@@ -43,6 +45,8 @@ class MonteCarloGovernor:
         self.DD_CRITICAL = dd_critical
         self.LOOKBACK_TRADES = lookback_trades
         self._update_interval = update_interval
+        self._state_file = os.path.join(state_dir, 'governor_state.json')
+        self._load_state()
         logging.info("Monte Carlo Governor initialized")
 
     def add_trade(self, pnl, risk_dollars, side='LONG', timestamp=None):
@@ -65,6 +69,7 @@ class MonteCarloGovernor:
             'r_multiple': r_multiple,
             'side': side,
         })
+        self._save_state()
 
     def apply_adjustments(self):
         """
@@ -112,6 +117,46 @@ class MonteCarloGovernor:
             cumulative += t['pnl']
             curve.append(cumulative)
         return curve
+
+    def _save_state(self):
+        """Persist trade history and risk scalar to disk for crash recovery."""
+        try:
+            os.makedirs(os.path.dirname(self._state_file), exist_ok=True)
+            state = {
+                'recent_trades': [
+                    {'pnl': t['pnl'], 'risk': t['risk'], 'r_multiple': t['r_multiple'],
+                     'side': t.get('side', 'LONG'),
+                     'timestamp': t['timestamp'].isoformat() if hasattr(t['timestamp'], 'isoformat') else str(t['timestamp'])}
+                    for t in list(self.trade_history)[-self.LOOKBACK_TRADES:]
+                ],
+                'risk_scalar': self.risk_scalar,
+                'in_drawdown': self.in_drawdown,
+            }
+            with open(self._state_file, 'w') as f:
+                json.dump(state, f)
+        except Exception as e:
+            logging.warning(f"Failed to save Governor state: {e}")
+
+    def _load_state(self):
+        """Restore trade history from disk on startup."""
+        if not os.path.exists(self._state_file):
+            return
+        try:
+            with open(self._state_file) as f:
+                state = json.load(f)
+            for t in state.get('recent_trades', []):
+                self.trade_history.append({
+                    'timestamp': datetime.datetime.fromisoformat(t['timestamp']) if isinstance(t.get('timestamp'), str) else datetime.datetime.now(),
+                    'pnl': t.get('pnl', 0),
+                    'risk': t.get('risk', 1),
+                    'r_multiple': t.get('r_multiple', 0),
+                    'side': t.get('side', 'LONG'),
+                })
+            self.risk_scalar = state.get('risk_scalar', 1.0)
+            self.in_drawdown = state.get('in_drawdown', False)
+            logging.info(f"Governor state restored: {len(self.trade_history)} trades, scalar={self.risk_scalar}")
+        except Exception as e:
+            logging.warning(f"Failed to load Governor state: {e}")
 
     def get_risk_scalar(self):
         """Return current risk scalar (0.5 - 1.0)."""

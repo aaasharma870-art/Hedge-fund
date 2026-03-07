@@ -70,13 +70,13 @@ def get_hurst(series):
       H > 0.5: Trending (persistent)
 
     Args:
-        series: 1-D array-like of prices (minimum 20 observations).
+        series: 1-D array-like of prices (minimum 100 observations).
 
     Returns:
         Float in [0, 1]. Returns 0.5 (random walk) on insufficient data or errors.
     """
     try:
-        if len(series) < 20:
+        if len(series) < 100:
             return 0.5
         lags = range(2, 20)
         tau = [np.std(np.subtract(series[lag:], series[:-lag])) for lag in lags]
