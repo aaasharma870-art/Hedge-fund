@@ -14,6 +14,21 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 
+EXPECTED_FEATURES = [
+    # Microstructure / Flow
+    'OFI', 'VPIN', 'Amihud_Illiquidity', 'GEX_Proxy', 'VPT_Acceleration',
+    # Momentum
+    'Kalman_Trend', 'Kalman_Velocity', 'Overnight_Gap', 'Intraday_Mom',
+    'Beta_Alpha', 'Relative_Return_Strength',
+    # Regime / Structure
+    'Hurst_Exponent', 'Efficiency_Ratio', 'RV_Ratio', 'ADX', 'VWAP_ZScore',
+    'ATR_Channel_Pos',
+    # Bar Microstructure
+    'Upper_Wick', 'Lower_Wick', 'Body_Ratio',
+    # Normalizers
+    'ATR_Pct',
+]
+
 
 def calculate_vpin(df, volume_bucket_size=None, window=50):
     """
@@ -425,6 +440,106 @@ def validate_feature_distributions(live_features, training_stats=None):
     for w in warnings:
         logging.warning(w)
     return warnings
+
+
+def compute_ofi(df, smooth_span=10, norm_window=50):
+    """Order Flow Imbalance from OHLCV."""
+    bar_range = (df['High'] - df['Low']).clip(lower=1e-10)
+    close_pos = (df['Close'] - df['Low']) / bar_range
+    buy_vol = df['Volume'] * close_pos
+    sell_vol = df['Volume'] * (1.0 - close_pos)
+    total_vol = buy_vol + sell_vol + 1e-10
+    ofi_raw = (buy_vol - sell_vol) / total_vol
+    ofi_smooth = ofi_raw.ewm(span=smooth_span, min_periods=3).mean()
+    roll_mean = ofi_smooth.rolling(norm_window, min_periods=20).mean()
+    roll_std = ofi_smooth.rolling(norm_window, min_periods=20).std().clip(lower=1e-10)
+    ofi_z = (ofi_smooth - roll_mean) / roll_std
+    return ofi_z.clip(-4, 4).rename('OFI')
+
+
+def compute_rv_ratio(df, short=5, long=20):
+    """Ratio of short-term to long-term realized volatility."""
+    log_returns = np.log(df['Close'] / df['Close'].shift(1))
+    rv_short = log_returns.rolling(short, min_periods=3).std() * np.sqrt(252 * 6.5)
+    rv_long = log_returns.rolling(long, min_periods=10).std() * np.sqrt(252 * 6.5)
+    rv_ratio = rv_short / rv_long.clip(lower=1e-6)
+    return rv_ratio.clip(0, 5).rename('RV_Ratio')
+
+
+def compute_momentum_decomp(df, session_bars=6):
+    """Decompose momentum into overnight gap and intraday components."""
+    prev_session_close = df['Close'].shift(session_bars)
+    overnight_gap = (df['Open'] - prev_session_close) / prev_session_close.clip(lower=1e-10)
+    overnight_gap = overnight_gap.rolling(3, min_periods=1).mean()
+    session_open = df['Open'].shift(session_bars - 1)
+    intraday_mom = (df['Close'] - session_open) / session_open.clip(lower=1e-10)
+    intraday_mom = intraday_mom.rolling(3, min_periods=1).mean()
+    return (overnight_gap.clip(-0.10, 0.10).rename('Overnight_Gap'),
+            intraday_mom.clip(-0.10, 0.10).rename('Intraday_Mom'))
+
+
+def compute_efficiency_ratio(df, window=10):
+    """Kaufman Efficiency Ratio: net_change / path_length."""
+    price = df['Close']
+    net_change = (price - price.shift(window)).abs()
+    bar_changes = price.diff().abs()
+    path_length = bar_changes.rolling(window, min_periods=3).sum().clip(lower=1e-10)
+    er = net_change / path_length
+    return er.clip(0, 1).rename('Efficiency_Ratio')
+
+
+def compute_vpt_acceleration(df, slope_window=5, accel_window=3, norm_window=50):
+    """Volume Price Trend acceleration - institutional flow signal."""
+    log_returns = np.log(df['Close'] / df['Close'].shift(1)).fillna(0)
+    vpt = (log_returns * df['Volume']).cumsum()
+    vpt_slope = vpt.diff(slope_window) / slope_window
+    vpt_accel = vpt_slope.diff(accel_window)
+    roll_mean = vpt_accel.rolling(norm_window, min_periods=20).mean()
+    roll_std = vpt_accel.rolling(norm_window, min_periods=20).std().clip(lower=1e-10)
+    vpt_accel_z = (vpt_accel - roll_mean) / roll_std
+    return vpt_accel_z.clip(-4, 4).rename('VPT_Acceleration')
+
+
+def compute_bar_patterns(df, smooth=3):
+    """Bar anatomy: upper wick, lower wick, body ratio."""
+    bar_range = (df['High'] - df['Low']).clip(lower=1e-10)
+    bar_top = df[['Open', 'Close']].max(axis=1)
+    bar_bottom = df[['Open', 'Close']].min(axis=1)
+    upper_wick = (df['High'] - bar_top) / bar_range
+    lower_wick = (bar_bottom - df['Low']) / bar_range
+    body_ratio = (bar_top - bar_bottom) / bar_range
+    upper_wick_s = upper_wick.rolling(smooth, min_periods=1).mean()
+    lower_wick_s = lower_wick.rolling(smooth, min_periods=1).mean()
+    body_ratio_s = body_ratio.rolling(smooth, min_periods=1).mean()
+    return (upper_wick_s.rename('Upper_Wick'),
+            lower_wick_s.rename('Lower_Wick'),
+            body_ratio_s.rename('Body_Ratio'))
+
+
+def compute_beta_alpha(df, proxy_returns, beta_window=20, alpha_window=20, norm_window=60):
+    """Beta-adjusted alpha (excess return over market proxy)."""
+    ticker_returns = df['Close'].pct_change()
+    cov = ticker_returns.rolling(beta_window, min_periods=10).cov(proxy_returns)
+    var = proxy_returns.rolling(beta_window, min_periods=10).var().clip(lower=1e-10)
+    beta = (cov / var).clip(-3, 3)
+    expected_return = beta * proxy_returns
+    alpha = ticker_returns - expected_return
+    cum_alpha = alpha.rolling(alpha_window, min_periods=5).sum()
+    roll_mean = cum_alpha.rolling(norm_window, min_periods=20).mean()
+    roll_std = cum_alpha.rolling(norm_window, min_periods=20).std().clip(lower=1e-10)
+    return ((cum_alpha - roll_mean) / roll_std).clip(-4, 4).rename('Beta_Alpha')
+
+
+def compute_atr_channel_pos(df, atr_window=14, channel_window=20, atr_multiplier=1.5):
+    """Close position within ATR-adaptive channel, centered at 0."""
+    from hedge_fund.indicators import ManualTA
+    atr = ManualTA.atr(df['High'], df['Low'], df['Close'], length=atr_window)
+    midline = df['Close'].rolling(channel_window, min_periods=5).mean()
+    upper = midline + atr_multiplier * atr
+    lower = midline - atr_multiplier * atr
+    channel_width = (upper - lower).clip(lower=1e-10)
+    position = (df['Close'] - lower) / channel_width
+    return (position.clip(0, 1) - 0.5).rename('ATR_Channel_Pos')
 
 
 class FeatureImportanceTracker:

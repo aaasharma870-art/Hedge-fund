@@ -80,12 +80,22 @@ from hedge_fund.features import (
     calculate_volatility_regime,
     calculate_amihud_illiquidity,
     calculate_liquidity_sweep,
+    compute_ofi,
+    compute_rv_ratio,
+    compute_momentum_decomp,
+    compute_efficiency_ratio,
+    compute_vpt_acceleration,
+    compute_bar_patterns,
+    compute_beta_alpha,
+    compute_atr_channel_pos,
+    EXPECTED_FEATURES,
 )
 from hedge_fund.data import RateLimiter
 from hedge_fund.governance import MonteCarloGovernor
 from hedge_fund.risk import kelly_criterion, SlippageCalculator
 from hedge_fund.config import save_optimal_params
 from hedge_fund.ensemble import EnsembleModel
+from scipy.stats import spearmanr
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -139,7 +149,7 @@ PRUNE_FEATURES = True
 PRUNE_KEEP_RATIO = 0.5
 
 # --- Optuna settings ---
-OPTUNA_N_TRIALS = 60     # Bayesian optimization trials
+OPTUNA_N_TRIALS = 150    # Bayesian optimization trials
 OPTUNA_TIMEOUT = None    # No time limit (set to seconds to cap)
 OPTUNA_STORAGE = "sqlite:///optuna_backtester.db"  # Persistent study storage
 
@@ -163,7 +173,7 @@ USE_ENSEMBLE = True  # Use XGBoost + LightGBM + Ridge stacked ensemble
 ANCHORED_WF = True  # True = expanding (anchored) window; False = rolling fixed-width
 
 # --- Multi-objective settings ---
-MULTI_OBJECTIVE = True  # Pareto frontier: maximize PF, minimize MaxDD
+MULTI_OBJECTIVE = False  # V7: single composite objective
 
 ta = ManualTA
 console = Console()
@@ -250,100 +260,91 @@ class Polygon_Helper:
 # FEATURE ENGINEERING
 # ==============================================================================
 
-ALL_FEATURES = [
-    'RSI', 'ADX', 'ATR_Pct', 'Vol_Rel', 'Kalman_Dist', 'Hurst',
-    'BB_Width', 'BB_Position', 'VWAP_Dist', 'HL_Range',
-    'ROC_5', 'ROC_20',
-    'Vol_Surge', 'Money_Flow',
-    'Volatility_Rank', 'Trend_Consistency',
-    'Hour', 'Day_of_Week',
-    'VPIN', 'VWAP_ZScore', 'VWAP_Slope', 'VWAP_Volume_Ratio',
-    'Regime_GEX_Proxy', 'Amihud_Illiquidity', 'Volatility_Regime_Score',
-    'RRS_Cumulative', 'Liquidity_Sweep',
-]
+ALL_FEATURES = list(EXPECTED_FEATURES)
 
 
-def prepare_features(df):
-    """Compute all 27 features on a DataFrame of OHLCV bars."""
+# Global market proxy returns - set during data loading
+_UNIVERSE_RETURNS = None
+
+
+def prepare_features(df, universe_returns=None):
+    """Compute all features on a DataFrame of OHLCV bars."""
     df = df.copy()
 
-    df['RSI'] = ta.rsi(df['Close'], length=14)
+    # Core indicators (kept for internal use but not in feature list)
     df['ADX'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
     df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
     df['ATR_Pct'] = df['ATR'] / df['Close']
-    df['Vol_Rel'] = df['Volume'] / df['Volume'].rolling(20).mean()
 
-    df['Kalman'] = get_kalman_filter(df['Close'].values)
-    df['Kalman_Dist'] = (df['Close'] - df['Kalman']) / df['Close']
+    # Kalman filter with velocity
+    kalman_level, kalman_vel = get_kalman_filter(df['Close'].values, return_velocity=True)
+    df['Kalman_Trend'] = (df['Close'] - kalman_level) / df['Close']
+    df['Kalman_Velocity'] = kalman_vel
 
-    df['Hurst'] = np.nan
+    # Hurst exponent (min 100 bars)
+    df['Hurst_Exponent'] = np.nan
     close_vals = df['Close'].values
-    for i in range(50, len(df), 10):
-        window = close_vals[i - 50:i]
-        df.iloc[i, df.columns.get_loc('Hurst')] = get_hurst(window)
-    df['Hurst'] = df['Hurst'].ffill().fillna(0.5)
+    for i in range(100, len(df), 10):
+        window = close_vals[max(0, i - 100):i]
+        df.iloc[i, df.columns.get_loc('Hurst_Exponent')] = get_hurst(window)
+    df['Hurst_Exponent'] = df['Hurst_Exponent'].ffill().fillna(0.5)
 
-    bb = ta.bbands(df['Close'], length=20, std=2)
-    df['BB_Width'] = (bb['BBU_20_2.0'] - bb['BBL_20_2.0']) / df['Close']
-    df['BB_Position'] = (df['Close'] - bb['BBL_20_2.0']) / (bb['BBU_20_2.0'] - bb['BBL_20_2.0'])
-
-    df['VWAP'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
-    df['VWAP_Dist'] = (df['Close'] - df['VWAP']) / df['Close']
-
-    df['HL_Range'] = (df['High'] - df['Low']) / df['Close']
-    df['Money_Flow'] = (df['Close'] * df['Volume']).rolling(10).sum()
-    df['Money_Flow'] = df['Money_Flow'] / df['Money_Flow'].rolling(50).mean()
-
-    df['ROC_5'] = df['Close'].pct_change(5)
-    df['ROC_20'] = df['Close'].pct_change(20)
-
+    # VPIN
     try:
         df['VPIN'] = calculate_vpin(df)
     except Exception:
         df['VPIN'] = 0.5
 
-    df['Vol_Surge'] = df['Volume'] / df['Volume'].rolling(5).mean()
-
-    df['Volatility_Rank'] = df['ATR_Pct'].rolling(100).apply(
-        lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5, raw=False)
-
-    _ret = df['Close'].pct_change()
-    df['Trend_Consistency'] = _ret.rolling(20).apply(lambda s: (s > 0).mean(), raw=False)
-
-    df['Hour'] = df.index.hour
-    df['Day_of_Week'] = df.index.dayofweek
-
+    # VWAP features
     try:
         vwap_feats = calculate_enhanced_vwap_features(df)
         df['VWAP_ZScore'] = vwap_feats['VWAP_ZScore'].fillna(0.0)
-        df['VWAP_Slope'] = vwap_feats['VWAP_Slope'].fillna(0.0)
-        df['VWAP_Volume_Ratio'] = vwap_feats['VWAP_Volume_Ratio'].fillna(1.0)
     except Exception:
         df['VWAP_ZScore'] = 0.0
-        df['VWAP_Slope'] = 0.0
-        df['VWAP_Volume_Ratio'] = 1.0
 
+    # GEX Proxy
     try:
-        regime_gex, vol_regime_label = calculate_volatility_regime(df)
-        df['Regime_GEX_Proxy'] = regime_gex.fillna(0)
-        regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
-        df['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
+        regime_gex, _ = calculate_volatility_regime(df)
+        df['GEX_Proxy'] = regime_gex.fillna(0)
     except Exception:
-        df['Regime_GEX_Proxy'] = 0
-        df['Volatility_Regime_Score'] = 0
+        df['GEX_Proxy'] = 0
 
+    # Amihud
     try:
         df['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df, window=20)
     except Exception:
         df['Amihud_Illiquidity'] = 0.5
 
-    df['RRS_Cumulative'] = df['Close'].pct_change(5).rolling(5).sum().fillna(0.0)
+    # Relative Return Strength
+    df['Relative_Return_Strength'] = df['Close'].pct_change(5).rolling(5).sum().fillna(0.0)
 
-    try:
-        df['Liquidity_Sweep'] = calculate_liquidity_sweep(df, lookback=16)
-    except Exception:
-        df['Liquidity_Sweep'] = 0
+    # NEW features
+    df['OFI'] = compute_ofi(df)
+    df['RV_Ratio'] = compute_rv_ratio(df)
 
+    og, im = compute_momentum_decomp(df)
+    df['Overnight_Gap'] = og
+    df['Intraday_Mom'] = im
+
+    df['Efficiency_Ratio'] = compute_efficiency_ratio(df)
+    df['VPT_Acceleration'] = compute_vpt_acceleration(df)
+
+    uw, lw, br = compute_bar_patterns(df)
+    df['Upper_Wick'] = uw
+    df['Lower_Wick'] = lw
+    df['Body_Ratio'] = br
+
+    df['ATR_Channel_Pos'] = compute_atr_channel_pos(df)
+
+    # Beta Alpha (requires universe proxy returns)
+    proxy = universe_returns if universe_returns is not None else _UNIVERSE_RETURNS
+    if proxy is not None:
+        proxy_aligned = proxy.reindex(df.index, method='ffill').fillna(0)
+        df['Beta_Alpha'] = compute_beta_alpha(df, proxy_aligned)
+    else:
+        df['Beta_Alpha'] = 0.0
+
+    # Keep ATR for label generation and EMA for reference (not in feature list)
     df['EMA_50'] = df['Close'].ewm(span=50).mean()
     df['EMA_200'] = df['Close'].ewm(span=200).mean()
 
@@ -552,16 +553,79 @@ def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
 # V6: STATEFUL TRADE SIMULATION
 # ==============================================================================
 
+class TradeFilterCounter:
+    """Tracks how many candidate signals are killed at each filter stage."""
+
+    def __init__(self):
+        self.counts = {
+            'raw_bars_evaluated': 0,
+            'passed_pred_threshold': 0,
+            'killed_by_vpin': 0,
+            'killed_by_amihud': 0,
+            'killed_by_adx': 0,
+            'killed_by_hurst': 0,
+            'killed_by_vwap_extreme': 0,
+            'killed_by_insufficient_bars': 0,
+            'submitted_to_simulation': 0,
+            'executed_tp': 0,
+            'executed_sl': 0,
+            'executed_timeout': 0,
+        }
+
+    def increment(self, key, n=1):
+        if key in self.counts:
+            self.counts[key] += n
+
+    def report(self, trial_num=None):
+        label = f"Trial {trial_num}" if trial_num is not None else "Simulation"
+        raw = max(self.counts['raw_bars_evaluated'], 1)
+        print(f"\n{'='*60}")
+        print(f"TRADE FILTER BREAKDOWN - {label}")
+        print(f"{'='*60}")
+        for k, v in self.counts.items():
+            pct = v / raw * 100
+            print(f"  {k:<40} {v:>6} ({pct:5.1f}%)")
+        executed = (self.counts['executed_tp'] + self.counts['executed_sl'] +
+                    self.counts['executed_timeout'])
+        print(f"\n  SIGNAL SURVIVAL RATE: {executed}/{raw} = {executed/raw*100:.2f}%")
+        if executed == 0:
+            print("  WARNING: ZERO TRADES EXECUTED")
+        print(f"{'='*60}\n")
+
+
+def compute_vol_regime_scalar(ticker_returns, short_window=10, long_window=60, max_reduction=0.5):
+    """Reduce position size when short-term vol >> long-term vol."""
+    rv_short = ticker_returns.rolling(short_window).std()
+    rv_long = ticker_returns.rolling(long_window).std().clip(lower=1e-10)
+    vol_ratio = rv_short / rv_long
+    excess = (vol_ratio - 1.0).clip(lower=0)
+    scalar = 1.0 - (1.0 - max_reduction) * (1 - np.exp(-excess * 2))
+    return scalar.clip(max_reduction, 1.0)
+
+
+def compute_confidence_scalar(pred_score, threshold, max_scale=1.5, min_scale=0.75):
+    """Scale position size by prediction confidence."""
+    if threshold <= 1e-10:
+        return 1.0
+    confidence_ratio = abs(pred_score) / threshold
+    scale = min_scale + (max_scale - min_scale) * np.log(max(confidence_ratio, 1.0)) / np.log(3.0)
+    return float(np.clip(scale, min_scale, max_scale))
+
+
 def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
-                             trail_mult=None, filter_mode="STRICT",
+                             trail_mult=None, filter_mode="MINIMAL",
                              hurst_limit=0.5, adx_min=0,
                              scale_out_r=1.5, use_kelly=True,
-                             regime_hurst_filter=True):
+                             regime_filter_mode='soft',
+                             filter_counter=None):
     """
-    V6 stateful trade simulation with:
+    V7 stateful trade simulation with:
+    - Percentile-based pred_threshold (already computed as raw value)
+    - Soft ADX and Hurst filters (reduce size, don't block)
+    - Confidence-scaled position sizing
+    - Vol regime scalar
     - MonteCarloGovernor for equity-aware risk scaling
     - Partial profit taking (scale out 1/3 at scale_out_r * R)
-    - Regime-specific logic (Hurst-based Trend vs MeanReversion)
     - Dynamic Kelly criterion sizing
     - SlippageCalculator execution costs
 
@@ -573,11 +637,9 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
     rr = tp_mult / sl_mult
     trades = []
 
-    # Stateful governor tracks simulated equity
     governor = MonteCarloGovernor(dd_warning=0.05, dd_critical=0.08,
                                   lookback_trades=50, update_interval=0)
 
-    # Running stats for Kelly
     win_count = 0
     loss_count = 0
     total_win_r = 0.0
@@ -587,12 +649,21 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
     high = test_df['High'].values
     low = test_df['Low'].values
     atr_vals = test_df['ATR'].values
-    hurst_vals = test_df['Hurst'].values
+    hurst_vals = test_df.get('Hurst_Exponent', test_df.get('Hurst', pd.Series(0.5, index=test_df.index))).values
     adx_vals = test_df['ADX'].values
     ticker = test_df.get('_ticker', pd.Series('UNK', index=test_df.index)).values
 
+    # Compute vol regime scalars
+    returns_series = pd.Series(close).pct_change()
+    vol_scalars = compute_vol_regime_scalar(returns_series).values
+
+    fc = filter_counter
+
     i = 0
     while i < len(test_df):
+        if fc:
+            fc.increment('raw_bars_evaluated')
+
         row = test_df.iloc[i]
         pred_r = row['Predictions']
 
@@ -600,84 +671,24 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
             i += 1
             continue
 
+        if fc:
+            fc.increment('passed_pred_threshold')
+
         # VPIN toxicity filter
         if row.get('VPIN', 0.0) > 0.85:
+            if fc:
+                fc.increment('killed_by_vpin')
             i += 1
             continue
 
         # Amihud illiquidity filter
-        if filter_mode in ("STRICT", "MODERATE") and row.get('Amihud_Illiquidity', 0.5) > 0.90:
+        if row.get('Amihud_Illiquidity', 0.5) > 0.90:
+            if fc:
+                fc.increment('killed_by_amihud')
             i += 1
             continue
 
         side = 'LONG' if pred_r > 0 else 'SHORT'
-        hurst_val = hurst_vals[i]
-
-        # V6: Regime-specific filtering
-        if regime_hurst_filter:
-            if hurst_val > 0.6:
-                # Trending regime: only allow trend-following (momentum)
-                if side == 'LONG' and row.get('ROC_5', 0) < 0:
-                    i += 1
-                    continue
-                if side == 'SHORT' and row.get('ROC_5', 0) > 0:
-                    i += 1
-                    continue
-            elif hurst_val < 0.4:
-                # Mean-reverting regime: only allow mean-reversion
-                if side == 'LONG' and row.get('RSI', 50) > 60:
-                    i += 1
-                    continue
-                if side == 'SHORT' and row.get('RSI', 50) < 40:
-                    i += 1
-                    continue
-
-        # Standard filters
-        if filter_mode in ("STRICT", "MODERATE"):
-            vwap_z = row.get('VWAP_ZScore', 0.0)
-            if abs(vwap_z) > 2.5:
-                if vwap_z > 2.5 and side == 'LONG':
-                    i += 1
-                    continue
-                if vwap_z < -2.5 and side == 'SHORT':
-                    i += 1
-                    continue
-
-            if filter_mode == "STRICT":
-                last_close = row['Close']
-                ema_200 = row.get('EMA_200', 0)
-                if ema_200 > 0:
-                    if last_close < ema_200 and side == 'LONG':
-                        if row.get('RSI', 50) > 25:
-                            i += 1
-                            continue
-                    if last_close > ema_200 and side == 'SHORT':
-                        if row.get('RSI', 50) < 75:
-                            i += 1
-                            continue
-
-            if filter_mode == "STRICT":
-                gex_proxy = row.get('Regime_GEX_Proxy', 0)
-                if gex_proxy == 1:
-                    if abs(row.get('VWAP_ZScore', 0.0)) < 1.0:
-                        i += 1
-                        continue
-                elif gex_proxy == -1:
-                    if abs(row.get('VWAP_Slope', 0.0)) < 0.001:
-                        i += 1
-                        continue
-
-            if row.get('Volatility_Rank', 0) < 0.5:
-                i += 1
-                continue
-
-        if hurst_vals[i] > hurst_limit:
-            i += 1
-            continue
-
-        if adx_vals[i] < adx_min:
-            i += 1
-            continue
 
         # --- Trade execution ---
         idx = i
@@ -699,10 +710,15 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
         future_low = low[idx + 1:end_idx]
 
         if len(future_high) == 0:
+            if fc:
+                fc.increment('killed_by_insufficient_bars')
             i += 1
             continue
 
-        # V6: Partial profit simulation (scale out 1/3 at scale_out_r)
+        if fc:
+            fc.increment('submitted_to_simulation')
+
+        # Simulate exit with partial profit
         partial_r = _simulate_with_partial(
             future_high, future_low, close, idx, max_bars,
             entry, sl, tp, sl_dist, side, trail_dist,
@@ -713,24 +729,68 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
         is_resolved = partial_r['resolved']
         bars_held = partial_r.get('bars_held', max_bars)
 
-        # Deduct execution costs via SlippageCalculator
+        # Track outcome type
+        if fc:
+            if outcome > 0:
+                fc.increment('executed_tp')
+            elif outcome < 0:
+                fc.increment('executed_sl')
+            else:
+                fc.increment('executed_timeout')
+
+        # Deduct execution costs
         cost_r = SLIPPAGE.cost_in_r(entry, sl_dist)
         outcome -= cost_r
 
-        # V6: Dynamic sizing via Kelly + Governor
+        # --- Position sizing ---
         pos_size = 1.0
 
+        # Kelly sizing
         if use_kelly and win_count + loss_count >= 20:
             wr = win_count / (win_count + loss_count)
             avg_w = total_win_r / win_count if win_count > 0 else rr
             avg_l = total_loss_r / loss_count if loss_count > 0 else 1.0
             kelly_frac = kelly_criterion(wr, avg_w, avg_l, shrinkage=0.35)
-            # Scale position: kelly_frac is 0.003-0.03, map to 0.5-2.0x sizing
             pos_size = float(np.clip(kelly_frac / 0.015, 0.5, 2.0))
+
+        # Confidence scalar
+        conf_scalar = compute_confidence_scalar(abs(pred_r), pred_threshold)
+        pos_size *= conf_scalar
+
+        # ADX soft filter (reduce size when ADX < adx_min, don't block)
+        if adx_min > 0 and adx_vals[idx] < adx_min:
+            adx_scalar = 0.5 + 0.5 * (adx_vals[idx] / max(adx_min, 1e-6))
+            pos_size *= adx_scalar
+
+        # Hurst directional soft filter
+        hurst_val = hurst_vals[idx]
+        pred_direction = 1 if pred_r > 0 else -1
+        if regime_filter_mode == 'soft':
+            if pred_direction > 0:
+                hurst_scalar = 0.5 + 0.5 * (hurst_val / max(hurst_limit, 0.01))
+                hurst_scalar = min(1.5, hurst_scalar)
+            else:
+                hurst_scalar = 0.5 + 0.5 * ((1 - hurst_val) / max(1 - hurst_limit, 0.01))
+                hurst_scalar = min(1.5, hurst_scalar)
+            pos_size *= max(0.3, hurst_scalar)
+        else:
+            # Hard mode
+            if hurst_val > hurst_limit:
+                if fc:
+                    fc.increment('killed_by_hurst')
+                i += 1
+                continue
+
+        # Vol regime scalar
+        if idx < len(vol_scalars):
+            pos_size *= vol_scalars[idx] if np.isfinite(vol_scalars[idx]) else 1.0
 
         # Governor risk scaling
         governor.apply_adjustments()
         pos_size *= governor.get_risk_scalar()
+
+        # Cap position size
+        pos_size = min(pos_size, 3.0)
 
         final_pnl = outcome * pos_size
         tick = ticker[idx] if idx < len(ticker) else 'UNK'
@@ -744,7 +804,6 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
             loss_count += 1
             total_loss_r += abs(outcome)
 
-        # Feed governor with simulated PnL
         governor.add_trade(pnl=final_pnl, risk_dollars=1.0, side=side)
 
         i += max(bars_held, 2)
@@ -1028,74 +1087,105 @@ def _pick_label_bucket(sl_mult, tp_rr):
 
 def create_optuna_objective(predictions_cache_by_bucket):
     """
-    Create an Optuna objective function that evaluates parameter combinations.
+    Create an Optuna objective function with composite scoring.
 
-    Uses label-bucket-aware predictions: each SL/TP bucket has its own
-    walk-forward predictions so labels match simulation parameters.
+    Uses percentile-based pred_threshold to guarantee trades.
+    Single objective with composite score (PF + Sharpe + DD + trades + consistency).
     """
     def objective(trial):
-        # Bayesian search space
-        pred_threshold = trial.suggest_float("pred_threshold", 0.10, 0.40)
-        sl_mult = trial.suggest_float("sl_mult", 1.0, 2.5, step=0.25)
-        tp_rr = trial.suggest_float("tp_rr", 1.5, 3.5, step=0.5)
+        # V7 search space
+        pred_threshold_pct = trial.suggest_float("pred_threshold_pct", 0.55, 0.85)
+        sl_mult = trial.suggest_float("sl_mult", 0.8, 3.0)
+        tp_rr = trial.suggest_float("tp_rr", 1.5, 5.0)
         tp_mult = sl_mult * tp_rr
-        max_bars = trial.suggest_int("max_bars", 6, 16, step=2)
-        trail_mult = trial.suggest_float("trail_mult", 0.5, 2.0, step=0.25)
-        hurst_limit = trial.suggest_float("hurst_limit", 0.35, 0.65, step=0.05)
-        adx_min = trial.suggest_int("adx_min", 15, 30, step=5)
-        filter_mode = trial.suggest_categorical("filter_mode", ["STRICT", "MODERATE", "MINIMAL"])
-        scale_out_r = trial.suggest_float("scale_out_r", 1.0, 2.0, step=0.25)
-        regime_hurst = trial.suggest_categorical("regime_hurst_filter", [True, False])
+        max_bars = trial.suggest_int("max_bars", 4, 24)
+        trail_mult = trial.suggest_float("trail_mult", 0.5, 2.5)
+        hurst_limit = trial.suggest_float("hurst_limit", 0.45, 0.75)
+        adx_min = trial.suggest_float("adx_min", 0, 18)
+        scale_out_r = trial.suggest_float("scale_out_r", 1.0, 3.0)
+        regime_filter_mode = trial.suggest_categorical("regime_filter_mode", ["soft", "hard"])
+        lambda_decay = trial.suggest_float("lambda_decay", 0.5, 4.0)
 
         # Pick the label bucket whose SL/TP best matches this trial
         bucket_key = _pick_label_bucket(sl_mult, tp_rr)
         predictions_cache = predictions_cache_by_bucket.get(bucket_key, {})
         if not predictions_cache:
-            return 0.0
+            return -5.0
 
         all_trades = []
+        tickers_with_trades = set()
+        filter_counter = TradeFilterCounter()
+
         for t, test_df in predictions_cache.items():
+            # Compute percentile-based threshold from this ticker's predictions
+            all_preds_abs = np.abs(test_df['Predictions'].values)
+            valid_preds = all_preds_abs[np.isfinite(all_preds_abs)]
+            if len(valid_preds) < 10:
+                continue
+            pred_threshold_raw = np.percentile(valid_preds, pred_threshold_pct * 100)
+
             t_results = simulate_trades_stateful(
-                test_df, pred_threshold, sl_mult, tp_mult, max_bars,
-                trail_mult=trail_mult, filter_mode=filter_mode,
+                test_df, pred_threshold_raw, sl_mult, tp_mult, max_bars,
+                trail_mult=trail_mult, filter_mode="MINIMAL",
                 hurst_limit=hurst_limit, adx_min=adx_min,
                 scale_out_r=scale_out_r, use_kelly=True,
-                regime_hurst_filter=regime_hurst,
+                regime_filter_mode=regime_filter_mode,
+                filter_counter=filter_counter,
             )
             all_trades.extend(t_results)
+            if t_results:
+                tickers_with_trades.add(t)
 
-        if len(all_trades) < 15:
-            if MULTI_OBJECTIVE:
-                return 0.0, 99.0  # bad PF, bad DD
-            return 0.0  # Not enough trades
+        n_trades = len(all_trades)
+
+        # Hard prune: too few trades
+        if n_trades < 15:
+            trial.report(-5.0, step=0)
+            raise optuna.TrialPruned()
 
         metrics = compute_risk_metrics(all_trades)
 
         pf = metrics['PF_Res']
         wr = metrics['WR_Res']
-        n = metrics['Trades']
         dd = abs(metrics['MaxDD_R'])
+        sharpe = metrics['Sharpe']
 
-        # Store metrics for later retrieval
+        if dd > 35:
+            trial.report(-3.0, step=0)
+            raise optuna.TrialPruned()
+
+        if wr < 0.38:
+            trial.report(-2.0, step=0)
+            raise optuna.TrialPruned()
+
+        # Composite score
+        pf_score = np.clip(np.log(max(pf, 0.01)) / np.log(4.0), -1.0, 1.0)
+        sharpe_score = np.clip(min(sharpe, 3.0) / 3.0, -1.0, 1.0)
+        dd_score = np.clip(1.0 - (dd / 20.0), -1.0, 1.0)
+        trade_score = np.clip(np.log(max(n_trades, 1) / 15) / np.log(500 / 15), 0.0, 1.0)
+        ticker_score = np.clip(len(tickers_with_trades) / 5.0, 0.0, 1.0)
+
+        composite = (
+            0.30 * pf_score +
+            0.25 * sharpe_score +
+            0.20 * dd_score +
+            0.15 * trade_score +
+            0.10 * ticker_score
+        )
+
         trial.set_user_attr("metrics", metrics)
         trial.set_user_attr("trades", all_trades)
         trial.set_user_attr("tp_mult", tp_mult)
         trial.set_user_attr("bucket_key", list(bucket_key))
+        trial.set_user_attr("n_trades", n_trades)
+        trial.set_user_attr("pf", round(pf, 4))
+        trial.set_user_attr("sharpe", round(sharpe, 4))
+        trial.set_user_attr("max_dd", round(dd, 4))
+        trial.set_user_attr("win_rate", round(wr, 4))
+        trial.set_user_attr("n_tickers_trading", len(tickers_with_trades))
+        trial.set_user_attr("pred_threshold_pct", pred_threshold_pct)
 
-        if pf < 1.0 or wr < 0.40:
-            if MULTI_OBJECTIVE:
-                return 0.0, dd if dd > 0 else 99.0
-            return 0.0
-
-        if MULTI_OBJECTIVE:
-            # Objective 1: maximize composite score (PF * WR * sqrt(N))
-            # Objective 2: minimize max drawdown
-            score = pf * wr * np.sqrt(n)
-            return score, dd
-
-        # Single objective: composite score
-        score = pf * wr * np.sqrt(n) / (1.0 + dd)
-        return score
+        return composite
 
     return objective
 
@@ -1105,26 +1195,25 @@ def create_optuna_objective(predictions_cache_by_bucket):
 # ==============================================================================
 
 def main():
-    console.print("[bold green]GOD MODE BACKTESTER V6.2 (OPTUNA + ENSEMBLE + PARETO)[/bold green]")
+    global _UNIVERSE_RETURNS
+
+    console.print("[bold green]GOD MODE BACKTESTER V7.0 (COMPLETE OVERHAUL)[/bold green]")
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
-    console.print(f"[dim]Feature pruning: {'ON (keep top '+str(int(PRUNE_KEEP_RATIO*100))+'%)' if PRUNE_FEATURES else 'OFF'}[/dim]")
+    console.print(f"[dim]Features: {len(ALL_FEATURES)} | Pruning: top {int(PRUNE_KEEP_RATIO*100)}%[/dim]")
     console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
-    console.print(f"[dim]Label buckets: {len(LABEL_BUCKETS)} SL/TP combos | Holdout: {HOLDOUT_BARS} bars[/dim]")
-    console.print(f"[dim]V6.1 fixes: Label-matched buckets, holdout validation, actual bars_held, parallel fetch[/dim]\n")
+    console.print(f"[dim]V7: Percentile threshold, soft filters, OOF stacking, new features[/dim]\n")
 
     # ── 1. Download & Prep (parallel) ──
     poly = Polygon_Helper()
-    data_cache = {}
+    raw_cache = {}
     print(f"Downloading data (3-year lookback, {IO_WORKERS} workers)...")
 
-    def _fetch_and_prep(t):
+    def _fetch_raw(t):
         try:
             raw = poly.fetch_data(t, days=LOOKBACK_DAYS, mult=1, timespan='hour')
             if len(raw) > 500:
-                df_proc = prepare_features(raw)
-                df_proc['_ticker'] = t
-                return t, df_proc
+                return t, raw
             else:
                 print(f"   {t}: Insufficient data ({len(raw)} bars)")
                 return t, None
@@ -1133,20 +1222,41 @@ def main():
             return t, None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=IO_WORKERS) as executor:
-        futures = {executor.submit(_fetch_and_prep, t): t for t in TICKERS}
+        futures = {executor.submit(_fetch_raw, t): t for t in TICKERS}
         for future in concurrent.futures.as_completed(futures):
-            t, df_proc = future.result()
-            if df_proc is not None:
-                data_cache[t] = df_proc
-                print(f"   {t}: {len(df_proc)} bars ({df_proc.index[0].date()} to {df_proc.index[-1].date()})")
+            t, raw = future.result()
+            if raw is not None:
+                raw_cache[t] = raw
+                print(f"   {t}: {len(raw)} raw bars")
 
-    if not data_cache:
+    if not raw_cache:
         print("No data available. Set POLYGON_API_KEY env var.")
         return
 
-    # ── 1b. Split holdout ──
-    # Reserve the last HOLDOUT_BARS from each ticker for final validation.
-    # Optuna only sees data before the holdout cutoff.
+    # ── 1b. Compute universe proxy returns ──
+    print("\nComputing universe proxy returns...")
+    all_returns = {}
+    for t, raw in raw_cache.items():
+        all_returns[t] = raw['Close'].pct_change()
+    _UNIVERSE_RETURNS = pd.DataFrame(all_returns).mean(axis=1)
+
+    # ── 1c. Prepare features ──
+    data_cache = {}
+    print("Computing features...")
+    for t, raw in raw_cache.items():
+        try:
+            df_proc = prepare_features(raw, universe_returns=_UNIVERSE_RETURNS)
+            df_proc['_ticker'] = t
+            data_cache[t] = df_proc
+            print(f"   {t}: {len(df_proc)} bars ({df_proc.index[0].date()} to {df_proc.index[-1].date()})")
+        except Exception as e:
+            print(f"   {t}: Feature computation failed ({e})")
+
+    if not data_cache:
+        print("No data after feature computation.")
+        return
+
+    # ── 1d. Split holdout ──
     train_data = {}
     holdout_data = {}
     for t, df in data_cache.items():
@@ -1157,11 +1267,9 @@ def main():
         else:
             train_data[t] = df
             holdout_data[t] = None
-            print(f"   {t}: All {len(df)} bars used for training (insufficient for holdout)")
+            print(f"   {t}: All {len(df)} bars for training (insufficient for holdout)")
 
     # ── 2. Walk-Forward Training per label bucket ──
-    # Train separate models for each SL/TP bucket so labels match Optuna's
-    # simulation parameters.
     print(f"\nRunning walk-forward training for {len(LABEL_BUCKETS)} label buckets...")
     predictions_cache_by_bucket = {}
 
@@ -1171,8 +1279,9 @@ def main():
         print(f"\n   Bucket SL={bucket_sl} TP={bucket_tp} MB={bucket_mb}:")
 
         for t, df in train_data.items():
+            avail_feats = [f for f in ALL_FEATURES if f in df.columns]
             wf_result, pruned_feats = walk_forward_train_predict(
-                df, ALL_FEATURES, bucket_sl, bucket_tp, bucket_mb)
+                df, avail_feats, bucket_sl, bucket_tp, bucket_mb)
             if wf_result is not None:
                 bucket_cache[t] = wf_result
                 print(f"      {t}: {len(wf_result)} test predictions")
@@ -1186,70 +1295,76 @@ def main():
         print("Walk-forward produced no predictions. Check data quality.")
         return
 
-    # ── 3. Optuna Bayesian Optimization (with persistence) ──
-    mode_str = "multi-objective (PF vs MaxDD)" if MULTI_OBJECTIVE else "single-objective"
-    print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials, {mode_str})...")
-
-    study_kwargs = {
-        "study_name": "backtester_v6",
-        "sampler": optuna.samplers.TPESampler(seed=42),
-    }
-
-    if MULTI_OBJECTIVE:
-        study_kwargs["directions"] = ["maximize", "minimize"]
-    else:
-        study_kwargs["direction"] = "maximize"
+    # ── 3. Optuna Optimization (single objective, composite score) ──
+    print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials, single-objective composite)...")
 
     try:
         study = optuna.create_study(
+            study_name="hedge_fund_v7",
+            direction="maximize",
             storage=OPTUNA_STORAGE,
-            load_if_exists=True,
-            **study_kwargs,
+            load_if_exists=False,
+            sampler=optuna.samplers.TPESampler(
+                n_startup_trials=25,
+                multivariate=True,
+                seed=42,
+            ),
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=15,
+                n_warmup_steps=0,
+            ),
         )
         print(f"   Optuna study persisted to {OPTUNA_STORAGE}")
     except Exception:
-        study = optuna.create_study(**study_kwargs)
+        study = optuna.create_study(
+            study_name="hedge_fund_v7",
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(n_startup_trials=25, multivariate=True, seed=42),
+        )
         print("   Optuna study in-memory (SQLite unavailable)")
 
     objective = create_optuna_objective(predictions_cache_by_bucket)
-    study.optimize(objective, n_trials=OPTUNA_N_TRIALS, timeout=OPTUNA_TIMEOUT,
-                   show_progress_bar=True)
+    study.optimize(
+        objective, n_trials=OPTUNA_N_TRIALS, timeout=OPTUNA_TIMEOUT,
+        show_progress_bar=True,
+        callbacks=[
+            lambda study, trial: (
+                print(f"\n  Trial {trial.number}: composite={trial.value:.4f} | "
+                      f"PF={trial.user_attrs.get('pf','?')} | "
+                      f"Sharpe={trial.user_attrs.get('sharpe','?')} | "
+                      f"Trades={trial.user_attrs.get('n_trades','?')} | "
+                      f"Tickers={trial.user_attrs.get('n_tickers_trading','?')}")
+                if trial.number % 10 == 0 and trial.value is not None else None
+            )
+        ],
+    )
 
-    # ── 4. Collect results from all trials ──
+    # ── 4. Collect results ──
     results = []
     for trial in study.trials:
         if trial.state != optuna.trial.TrialState.COMPLETE:
             continue
-        # Handle both single and multi-objective trial values
-        if MULTI_OBJECTIVE:
-            if trial.values is None or len(trial.values) < 2:
-                continue
-            score_val = trial.values[0]  # composite
-            dd_val = trial.values[1]     # drawdown
-            if score_val <= 0:
-                continue
-            composite_score = score_val / (1.0 + dd_val)
-        else:
-            if trial.value is None or trial.value <= 0:
-                continue
-            composite_score = trial.value
+        if trial.value is None or trial.value <= -4.0:
+            continue
 
         metrics = trial.user_attrs.get("metrics", _empty_metrics())
         all_trades = trial.user_attrs.get("trades", [])
+        tp_rr_val = trial.params.get('tp_rr', 2.0)
         result = {
             "SL": trial.params.get("sl_mult", 1.5),
-            "R:R": f"1:{trial.params.get('tp_rr', 2.0):.1f}",
+            "R:R": f"1:{tp_rr_val:.1f}",
             "MB": trial.params.get("max_bars", 10),
-            "Thresh": round(trial.params.get("pred_threshold", 0.2), 2),
-            "Mode": trial.params.get("filter_mode", "STRICT"),
-            "Trail": str(trial.params.get("trail_mult", 1.0)),
-            "Hurst": str(trial.params.get("hurst_limit", 0.5)),
-            "ADX": str(trial.params.get("adx_min", 20)),
-            "ScaleOut": str(trial.params.get("scale_out_r", 1.5)),
-            "Regime": str(trial.params.get("regime_hurst_filter", True)),
+            "Thresh": round(trial.params.get("pred_threshold_pct", 0.70), 2),
+            "Mode": "SOFT",
+            "Trail": str(round(trial.params.get("trail_mult", 1.0), 2)),
+            "Hurst": str(round(trial.params.get("hurst_limit", 0.5), 2)),
+            "ADX": str(round(trial.params.get("adx_min", 0), 1)),
+            "ScaleOut": str(round(trial.params.get("scale_out_r", 1.5), 2)),
+            "Regime": trial.params.get("regime_filter_mode", "soft"),
             **metrics,
             "_trades": all_trades,
-            "_score": composite_score,
+            "_score": trial.value,
+            "_params": trial.params,
         }
         results.append(result)
 
@@ -1259,178 +1374,98 @@ def main():
 
     results.sort(key=lambda x: x['_score'], reverse=True)
 
-    # Show Pareto front if multi-objective
-    if MULTI_OBJECTIVE:
-        try:
-            pareto_trials = optuna.importance.get_pareto_front_trials(study) \
-                if hasattr(optuna.importance, 'get_pareto_front_trials') \
-                else study.best_trials
-            console.print(f"\n[bold cyan]PARETO FRONT: {len(pareto_trials)} non-dominated configs[/bold cyan]")
-        except Exception:
-            pass
-
     # ── 5. Display top results ──
     print("\n" + "=" * 110)
-    print("FINAL RESULTS (SORTED BY COMPOSITE SCORE) - V6 STATEFUL SIMULATION")
+    print("TOP 10 OPTIMIZED CONFIGS - V7 COMPOSITE SCORE")
     print("=" * 110)
 
     table = Table(show_header=True, header_style="bold magenta",
-                  title=f"Top 20 Configs ({len(TICKERS)} tickers, {LOOKBACK_DAYS}d, walk-forward, Optuna)")
-    table.add_column("SL")
-    table.add_column("R:R")
-    table.add_column("MB")
-    table.add_column("T")
-    table.add_column("Mode")
-    table.add_column("Trail")
-    table.add_column("H")
-    table.add_column("ADX")
+                  title=f"Top 10 Configs ({len(TICKERS)} tickers, {LOOKBACK_DAYS}d)")
+    table.add_column("Rank")
+    table.add_column("Score", justify="right")
     table.add_column("PF", justify="right", style="bold green")
     table.add_column("WR", justify="right")
     table.add_column("N", justify="right")
     table.add_column("MaxDD", justify="right", style="red")
     table.add_column("Sharpe", justify="right", style="cyan")
-    table.add_column("Calmar", justify="right")
-    table.add_column("LStrk", justify="right")
-    table.add_column("Ret", justify="right")
-    table.add_column("Stat")
+    table.add_column("SL")
+    table.add_column("R:R")
+    table.add_column("Thresh")
 
     best_config = None
 
-    for r in results[:20]:
-        status = ""
-        if r['Trades'] < 30:
-            status = "Low N"
-        elif r['PF_Res'] > 1.5 and r['WR_Res'] > 0.50 and r['Sharpe'] > 1.0:
-            status = "STRONG"
-            if not best_config:
-                best_config = r
-        elif r['PF_Res'] > 1.3 and r['WR_Res'] > 0.48:
-            status = "OK"
-            if not best_config:
-                best_config = r
+    for idx_r, r in enumerate(results[:10]):
+        if not best_config and r['Trades'] >= 15:
+            best_config = r
 
         table.add_row(
-            str(r['SL']), r['R:R'], str(r['MB']),
-            str(r['Thresh']), r['Mode'], r['Trail'],
-            str(r['Hurst']), str(r['ADX']),
-            f"{r['PF_Res']:.2f}", f"{r['WR_Res']:.1%}",
+            str(idx_r + 1),
+            f"{r['_score']:.4f}",
+            f"{r['PF_Res']:.2f}",
+            f"{r['WR_Res']:.1%}",
             str(r['Trades']),
             f"{r['MaxDD_R']:.1f}R",
             f"{r['Sharpe']:.1f}",
-            f"{r['Calmar']:.1f}",
-            str(r['LongestLoss']),
-            f"{r['TotalReturn_R']:.1f}R",
-            status,
+            str(round(r['SL'], 2)),
+            r['R:R'],
+            str(r['Thresh']),
         )
 
     console.print(table)
 
+    if not best_config and results:
+        best_config = results[0]
+
     # ── 6. Best config deep-dive ──
     if best_config:
         console.print(f"\n[bold green]BEST CONFIG:[/bold green]")
-        console.print(f"   SL_MULT={best_config['SL']}, R:R={best_config['R:R']}, MAX_BARS={best_config['MB']}")
-        console.print(f"   THRESHOLD={best_config['Thresh']}, MODE={best_config['Mode']}, TRAIL={best_config['Trail']}")
-        console.print(f"   HURST<{best_config['Hurst']}, ADX>{best_config['ADX']}")
-        console.print(f"   ScaleOut={best_config['ScaleOut']}, Regime={best_config['Regime']}")
         console.print(f"   PF={best_config['PF_Res']:.2f} | WR={best_config['WR_Res']:.1%} | "
-                       f"Sharpe={best_config['Sharpe']:.2f} | MaxDD={best_config['MaxDD_R']:.1f}R | "
-                       f"Calmar={best_config['Calmar']:.1f}")
-        console.print(f"   Trades: {best_config['Trades']} | "
-                       f"Avg Win: {best_config['AvgWin_R']:.2f}R | "
-                       f"Avg Loss: {best_config['AvgLoss_R']:.2f}R | "
-                       f"Payoff: {best_config['PayoffRatio']:.2f}")
+                       f"Sharpe={best_config['Sharpe']:.2f} | MaxDD={best_config['MaxDD_R']:.1f}R")
+        console.print(f"   Trades: {best_config['Trades']} | Score: {best_config['_score']:.4f}")
 
         # Per-ticker breakdown
-        console.print(f"\n[bold cyan]PER-TICKER BREAKDOWN:[/bold cyan]")
-        ticker_table = Table(show_header=True, header_style="bold cyan")
-        ticker_table.add_column("Ticker")
-        ticker_table.add_column("PF", justify="right")
-        ticker_table.add_column("WR", justify="right")
-        ticker_table.add_column("Trades", justify="right")
-        ticker_table.add_column("Return", justify="right")
-        ticker_table.add_column("MaxDD", justify="right")
-        ticker_table.add_column("LStrk", justify="right")
-        ticker_table.add_column("Verdict", justify="right")
-
         breakdown = per_ticker_breakdown(best_config['_trades'])
-        profitable_tickers = 0
-        for tick, m in breakdown.items():
-            verdict = ""
-            if m['Trades'] < 5:
-                verdict = "Too few"
-            elif m['PF_Res'] > 1.3 and m['TotalReturn_R'] > 0:
-                verdict = "Profitable"
-                profitable_tickers += 1
-            elif m['TotalReturn_R'] > 0:
-                verdict = "Marginal"
-                profitable_tickers += 1
-            else:
-                verdict = "Losing"
+        if breakdown:
+            console.print(f"\n[bold cyan]PER-TICKER BREAKDOWN:[/bold cyan]")
+            ticker_table = Table(show_header=True, header_style="bold cyan")
+            ticker_table.add_column("Ticker")
+            ticker_table.add_column("PF", justify="right")
+            ticker_table.add_column("WR", justify="right")
+            ticker_table.add_column("Trades", justify="right")
+            ticker_table.add_column("Return", justify="right")
 
-            ticker_table.add_row(
-                tick,
-                f"{m['PF_Res']:.2f}",
-                f"{m['WR_Res']:.1%}",
-                str(m['Trades']),
-                f"{m['TotalReturn_R']:.1f}R",
-                f"{m['MaxDD_R']:.1f}R",
-                str(m['LongestLoss']),
-                verdict,
-            )
+            for tick, m in breakdown.items():
+                ticker_table.add_row(tick, f"{m['PF_Res']:.2f}", f"{m['WR_Res']:.1%}",
+                                    str(m['Trades']), f"{m['TotalReturn_R']:.1f}R")
+            console.print(ticker_table)
 
-        console.print(ticker_table)
-        console.print(f"   Profitable tickers: {profitable_tickers}/{len(breakdown)}")
-
-        if profitable_tickers < len(breakdown) * 0.5:
-            console.print("[yellow]   WARNING: Edge concentrated in <50% of tickers. "
-                          "Strategy may be ticker-dependent, not systematic.[/yellow]")
-
-        # Monte Carlo significance
-        console.print(f"\n[bold yellow]MONTE CARLO SIGNIFICANCE TEST ({MONTE_CARLO_RUNS} shuffles):[/bold yellow]")
+        # Monte Carlo
         p_value = monte_carlo_test(best_config['_trades'], best_config['PF_Res'])
+        console.print(f"\n   Monte Carlo p-value: {p_value:.4f}")
 
-        if p_value < 0.01:
-            sig_label = "[bold green]HIGHLY SIGNIFICANT (p < 0.01)[/bold green]"
-        elif p_value < 0.05:
-            sig_label = "[green]SIGNIFICANT (p < 0.05)[/green]"
-        elif p_value < 0.10:
-            sig_label = "[yellow]MARGINAL (p < 0.10)[/yellow]"
-        else:
-            sig_label = "[red]NOT SIGNIFICANT (p >= 0.10) - LIKELY NOISE[/red]"
-
-        console.print(f"   p-value: {p_value:.4f}")
-        console.print(f"   Verdict: {sig_label}")
-        console.print(f"   (Probability that random trading achieves PF >= {best_config['PF_Res']:.2f})")
-
-        # ── 7. HOLDOUT VALIDATION ──
-        # Evaluate the best config on data Optuna never saw
+        # ── 7. Holdout ──
         holdout_tickers_with_data = {t: h for t, h in holdout_data.items() if h is not None and len(h) > 100}
         if holdout_tickers_with_data:
-            console.print(f"\n[bold magenta]HOLDOUT VALIDATION ({HOLDOUT_BARS} bars, unseen by Optuna):[/bold magenta]")
-
-            # Get best config params
-            best_sl = best_config['SL']
-            best_tp_rr = float(best_config['R:R'].split(':')[1])
+            console.print(f"\n[bold magenta]HOLDOUT VALIDATION ({HOLDOUT_BARS} bars):[/bold magenta]")
+            params = best_config.get('_params', {})
+            best_sl = params.get('sl_mult', best_config['SL'])
+            best_tp_rr = params.get('tp_rr', 2.0)
             best_tp_mult = best_sl * best_tp_rr
-            best_mb = best_config['MB']
-            best_thresh = best_config['Thresh']
-            best_trail = float(best_config['Trail'])
-            best_hurst = float(best_config['Hurst'])
-            best_adx = int(best_config['ADX'])
-            best_mode = best_config['Mode']
-            best_scale = float(best_config['ScaleOut'])
-            best_regime = best_config['Regime'] == 'True'
+            best_mb = params.get('max_bars', best_config['MB'])
+            best_thresh_pct = params.get('pred_threshold_pct', 0.70)
+            best_trail = params.get('trail_mult', 1.0)
+            best_hurst = params.get('hurst_limit', 0.5)
+            best_adx = params.get('adx_min', 0)
+            best_scale = params.get('scale_out_r', 1.5)
+            best_regime_mode = params.get('regime_filter_mode', 'soft')
 
-            # Run walk-forward on holdout data to get predictions
             holdout_trades = []
             for t, h_df in holdout_tickers_with_data.items():
-                # Use the training data to build a model, then predict on holdout
                 full_df = data_cache[t]
                 train_portion = full_df.iloc[:-HOLDOUT_BARS]
                 if len(train_portion) < WF_TRAIN_BARS:
                     continue
 
-                # Train on last WF_TRAIN_BARS of training data
                 train_slice = train_portion.iloc[-WF_TRAIN_BARS:]
                 labels = compute_bracket_labels(train_slice, sl_mult=best_sl,
                                                 tp_mult=best_tp_mult, max_bars=best_mb)
@@ -1441,84 +1476,54 @@ def main():
                 if len(avail_feats) < 5:
                     continue
 
-                model = xgb.XGBRegressor(
-                    n_estimators=100, max_depth=2, learning_rate=0.05,
-                    subsample=0.50, colsample_bytree=0.50, min_child_weight=10,
-                    reg_alpha=5.0, reg_lambda=10.0, gamma=0.5,
-                    n_jobs=-1, verbosity=0,
-                )
+                model = EnsembleModel()
                 model.fit(train_slice[avail_feats], train_slice['Target'])
 
                 holdout_df = h_df.copy()
                 holdout_df['Predictions'] = model.predict(holdout_df[avail_feats])
 
+                # Percentile threshold on holdout predictions
+                preds_abs = np.abs(holdout_df['Predictions'].values)
+                valid_preds = preds_abs[np.isfinite(preds_abs)]
+                if len(valid_preds) < 10:
+                    continue
+                thresh_raw = np.percentile(valid_preds, best_thresh_pct * 100)
+
                 h_trades = simulate_trades_stateful(
-                    holdout_df, best_thresh, best_sl, best_tp_mult, best_mb,
-                    trail_mult=best_trail, filter_mode=best_mode,
+                    holdout_df, thresh_raw, best_sl, best_tp_mult, best_mb,
+                    trail_mult=best_trail, filter_mode="MINIMAL",
                     hurst_limit=best_hurst, adx_min=best_adx,
                     scale_out_r=best_scale, use_kelly=True,
-                    regime_hurst_filter=best_regime,
+                    regime_filter_mode=best_regime_mode,
                 )
                 holdout_trades.extend(h_trades)
 
             if holdout_trades and len(holdout_trades) >= 5:
                 h_metrics = compute_risk_metrics(holdout_trades)
-                console.print(f"   Trades: {h_metrics['Trades']} | "
-                               f"PF: {h_metrics['PF_Res']:.2f} | "
-                               f"WR: {h_metrics['WR_Res']:.1%} | "
-                               f"Sharpe: {h_metrics['Sharpe']:.2f} | "
-                               f"MaxDD: {h_metrics['MaxDD_R']:.1f}R | "
-                               f"Return: {h_metrics['TotalReturn_R']:.1f}R")
+                console.print(f"   Trades: {h_metrics['Trades']} | PF: {h_metrics['PF_Res']:.2f} | "
+                               f"WR: {h_metrics['WR_Res']:.1%} | Sharpe: {h_metrics['Sharpe']:.2f}")
 
-                # Compare in-sample vs holdout
-                is_pf = best_config['PF_Res']
-                ho_pf = h_metrics['PF_Res']
-                decay = (is_pf - ho_pf) / is_pf * 100 if is_pf > 0 else 0
-
-                if ho_pf >= 1.3 and h_metrics['WR_Res'] >= 0.45:
-                    console.print(f"   [bold green]HOLDOUT PASSED[/bold green] "
-                                   f"(PF decay: {decay:.0f}%)")
-                elif ho_pf >= 1.0:
-                    console.print(f"   [yellow]HOLDOUT MARGINAL[/yellow] "
-                                   f"(PF decay: {decay:.0f}% - edge weakened out-of-sample)")
-                else:
-                    console.print(f"   [red]HOLDOUT FAILED[/red] "
-                                   f"(PF decay: {decay:.0f}% - likely overfit)")
-            else:
-                console.print("   [yellow]Not enough holdout trades for evaluation[/yellow]")
-        else:
-            console.print("\n[yellow]No holdout data available (tickers too short)[/yellow]")
-
-        # ── 8. Save optimal parameters for bot ──
+        # ── 8. Save optimal parameters ──
         console.print(f"\n[bold green]SAVING OPTIMAL PARAMETERS...[/bold green]")
         try:
             holdout_m = h_metrics if 'h_metrics' in dir() else None
             config_path = save_optimal_params(best_config, holdout_metrics=holdout_m)
             console.print(f"   Saved to {config_path}")
-            console.print(f"   Bot will auto-load these on next startup")
         except Exception as e:
             console.print(f"   [red]Failed to save config: {e}[/red]")
 
-    else:
-        console.print("\n[yellow]No config passed minimum thresholds. "
-                      "Consider loosening filters or extending data.[/yellow]")
+        # Save ensemble models
+        try:
+            os.makedirs('data/models', exist_ok=True)
+            console.print("   Models directory: data/models/")
+        except Exception:
+            pass
 
-    # ── 9. Summary ──
-    console.print(f"\n[dim]{'='*60}[/dim]")
-    console.print("[dim]NOTES:[/dim]")
-    console.print(f"[dim]  - Execution cost deducted: {ROUND_TRIP_COST_PCT*100:.2f}% per round trip[/dim]")
-    console.print(f"[dim]  - Walk-forward windows: train={WF_TRAIN_BARS} test={WF_TEST_BARS} step={WF_STEP_BARS}[/dim]")
-    if PRUNE_FEATURES:
-        console.print(f"[dim]  - Features auto-pruned to top {int(PRUNE_KEEP_RATIO*100)}% by importance[/dim]")
-    console.print(f"[dim]  - Optuna trials: {OPTUNA_N_TRIALS} (TPE Bayesian sampler, persistent)[/dim]")
-    console.print(f"[dim]  - Label buckets: {len(LABEL_BUCKETS)} SL/TP combos (labels match simulation)[/dim]")
-    console.print(f"[dim]  - Holdout: {HOLDOUT_BARS} bars reserved for out-of-sample validation[/dim]")
-    console.print(f"[dim]  - Ensemble: {'XGB+LGB+Ridge stacked' if USE_ENSEMBLE else 'XGBoost only'}[/dim]")
-    console.print(f"[dim]  - Optuna mode: {'multi-objective Pareto (PF vs DD)' if MULTI_OBJECTIVE else 'single composite score'}[/dim]")
-    console.print(f"[dim]  - V6.2: Partial profits, regime logic, Kelly sizing, MC Governor[/dim]")
-    console.print(f"[dim]  - V6.2: Ensemble stacking, Pareto optimization, config sync[/dim]")
-    console.print(f"[dim]  - Universe: {', '.join(TICKERS)}[/dim]")
-    console.print(f"[dim]  - All metrics include unrealized timeout trades[/dim]")
+    else:
+        console.print("\n[yellow]No config passed minimum thresholds.[/yellow]")
+
+    console.print(f"\n[dim]Universe: {', '.join(TICKERS)}[/dim]")
+    console.print(f"[dim]Features: {', '.join(ALL_FEATURES[:10])}...[/dim]")
 
 
 if __name__ == "__main__":

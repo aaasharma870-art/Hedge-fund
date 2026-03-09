@@ -8,24 +8,26 @@ distinguishing trending vs mean-reverting market regimes.
 import numpy as np
 
 
-def get_kalman_filter(series, q_base=0.01, r_base=0.1, vol_span=20):
+def get_kalman_filter(series, q_base=0.01, r_base=0.1, vol_span=20, return_velocity=False):
     """
     Volatility-adaptive Kalman filter for price trend estimation.
 
-    Dynamically adjusts process noise (Q) and measurement noise (R)
-    based on a trimmed-mean baseline of exponentially-smoothed absolute returns.
+    Uses a constant-velocity state model: [price_level, price_velocity].
 
     Args:
         series: 1-D numpy array of prices.
-        q_base: Base process noise. Higher values make the filter more responsive.
-        r_base: Base measurement noise. Higher values make the filter smoother.
+        q_base: Base process noise.
+        r_base: Base measurement noise.
         vol_span: EMA span for volatility estimation.
+        return_velocity: If True, returns (estimates, velocities) tuple.
 
     Returns:
-        numpy array of filtered (estimated) prices, same length as input.
+        numpy array of filtered prices (or tuple of (prices, velocities) if return_velocity=True).
     """
     n = len(series)
     if n == 0:
+        if return_velocity:
+            return np.array([]), np.array([])
         return np.array([])
 
     abs_returns = np.abs(np.diff(series, prepend=series[0]))
@@ -42,21 +44,40 @@ def get_kalman_filter(series, q_base=0.01, r_base=0.1, vol_span=20):
     if vol_baseline <= 0:
         vol_baseline = 1e-8
 
-    x = series[0]
-    p = 1.0
+    # State: [price_level, price_velocity]
+    x = np.array([series[0], 0.0])
+    P = np.eye(2)
+    F = np.array([[1.0, 1.0], [0.0, 1.0]])  # constant velocity transition
+    H = np.array([[1.0, 0.0]])  # observe price level only
+
     estimates = np.empty(n)
+    velocities = np.empty(n)
 
     for i in range(n):
         ratio = max(0.1, min(10.0, vol_ema[i] / vol_baseline))
         q = max(0.001, min(0.1, q_base * ratio))
         r = max(0.01, min(1.0, r_base / ratio))
-        z = series[i]
-        p = p + q
-        k = p / (p + r)
-        x = x + k * (z - x)
-        p = (1 - k) * p
-        estimates[i] = x
 
+        Q = np.array([[q, q * 0.5], [q * 0.5, q]])
+        R_mat = np.array([[r]])
+
+        # Predict
+        x = F @ x
+        P = F @ P @ F.T + Q
+
+        # Update
+        z = series[i]
+        y_innov = z - H @ x
+        S = H @ P @ H.T + R_mat
+        K = P @ H.T / S[0, 0]
+        x = x + K.flatten() * y_innov[0]
+        P = (np.eye(2) - K @ H) @ P
+
+        estimates[i] = x[0]
+        velocities[i] = x[1]
+
+    if return_velocity:
+        return estimates, velocities
     return estimates
 
 

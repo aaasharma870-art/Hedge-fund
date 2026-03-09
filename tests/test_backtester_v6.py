@@ -231,20 +231,18 @@ class TestSimulateTradesStateful:
     def test_governor_reduces_size_in_drawdown(self):
         """After many losses, governor should reduce position sizes."""
         df = _make_test_df(n=500, seed=99)
-        # Make predictions heavily biased (large values) to ensure trades
         df['Predictions'] = 0.5
         trades = simulate_trades_stateful(
             df, pred_threshold=0.1, sl_mult=1.5, tp_mult=3.0, max_bars=10,
             filter_mode="MINIMAL", use_kelly=False,
         )
         if len(trades) > 30:
-            # After enough trades, governor may have kicked in
             sizes = [t[2] for t in trades]
-            # At minimum, sizes should be <= 1.0 (governor only reduces)
-            assert all(s <= 1.01 for s in sizes)
+            # V7: sizes can exceed 1.0 due to confidence scalar, but should be bounded
+            assert all(s <= 3.1 for s in sizes)
 
-    def test_kelly_disabled_keeps_unit_size(self):
-        """With Kelly disabled and no drawdown, pos_size should stay at 1.0."""
+    def test_kelly_disabled_keeps_reasonable_size(self):
+        """With Kelly disabled, pos_size should be reasonable (soft filters apply)."""
         df = _make_test_df(n=100)
         df['Predictions'] = 0.5
         trades = simulate_trades_stateful(
@@ -252,8 +250,9 @@ class TestSimulateTradesStateful:
             filter_mode="MINIMAL", use_kelly=False,
         )
         if trades:
-            # First few trades before governor kicks in should be 1.0
-            assert trades[0][2] == pytest.approx(1.0)
+            # V7: confidence, Hurst, vol scalars apply even without Kelly
+            # Size should be positive and bounded
+            assert 0.1 < trades[0][2] < 3.1
 
 
 # ==============================================================================

@@ -251,6 +251,10 @@ def apply_to_settings(settings, optimal_params):
         "FILTER_MODE": "FILTER_MODE",
         "SCALE_OUT_R": "SCALE_OUT_R",
         "REGIME_HURST_FILTER": "REGIME_HURST_FILTER",
+        # V7 additions
+        "ADX_MIN": "ADX_MIN",
+        "HURST_LIMIT": "HURST_LIMIT",
+        "PRED_THRESHOLD_PCT": "PRED_THRESHOLD_PCT",
     }
 
     for opt_key, settings_key in key_map.items():
