@@ -167,7 +167,18 @@ from hedge_fund.governance import MonteCarloGovernor
 from hedge_fund.optimization import PortfolioOptimizer
 from hedge_fund.risk import OvernightGapModel, SlippageCalculator
 from hedge_fund.analysis import run_attribution_analysis
-from hedge_fund.features import CrossSectionalRanker
+from hedge_fund.features import (
+    CrossSectionalRanker,
+    EXPECTED_FEATURES,
+    compute_ofi,
+    compute_rv_ratio,
+    compute_momentum_decomp,
+    compute_efficiency_ratio,
+    compute_vpt_acceleration,
+    compute_bar_patterns,
+    compute_beta_alpha,
+    compute_atr_channel_pos,
+)
 from hedge_fund.config import load_app_config, load_optimal_params, apply_to_settings
 from hedge_fund.dashboard import Dashboard as SharedDashboard
 from hedge_fund.scanner import CandidateScanner
@@ -315,7 +326,8 @@ SETTINGS = {
     "ZOMBIE_MINUTES": 60,
     "PYRAMID_R": 1.5,
     "HEDGE_TICKER": "PSQ",
-    "MIN_HURST": 0.38,
+    "ADX_MIN": 15,          # V7: Soft filter threshold (reduce size below this)
+    "HURST_LIMIT": 0.5,     # V7: Hurst directional soft filter center
     "MIN_HITRATE": 0.35,
     "USE_MARKET_ORDERS": True,
     "SLIPPAGE_HAIRCUT": 0.10,
@@ -353,22 +365,17 @@ SETTINGS = {
     "TP_MULT": 3.0,
 
     # Phase 23: Hybrid God Mode (Dual-Tier)
-    # Tier 1: "The Specialist" (Sniper Entry) - Maximize PF
+    # V7: ADX/Hurst are now soft filters applied to risk_mult, not hard gates
     "TIER_1": {
         "NAME": "SPECIALIST",
         "MIN_PROB": 0.30,
-        "MAX_HURST": 0.55,
-        "MIN_ADX": 25,
         "RISK_MULT": 2.0,       # Double Size
         "RR": 2.0,              # 1:2 Risk/Reward
         "TRAIL": 1.0
     },
-    # Tier 2: "The Grinder" (Standard Entry) - Maximize Volume
     "TIER_2": {
         "NAME": "GRINDER",
         "MIN_PROB": 0.20,
-        "MAX_HURST": 0.45,
-        "MIN_ADX": 20,
         "RISK_MULT": 1.0,       # Standard Size
         "RR": 1.5,              # 1:1.5 Risk/Reward
         "TRAIL": 1.0
@@ -2292,11 +2299,84 @@ from hedge_fund.features import (
     calculate_amihud_illiquidity,
     calculate_real_relative_strength,
     calculate_liquidity_sweep,
+    calculate_volatility_regime,
 )
 
 
-# calculate_volatility_regime also imported from hedge_fund.features
-from hedge_fund.features import calculate_volatility_regime
+def _compute_v7_features(df):
+    """
+    Compute V7 features on a DataFrame. Matches backtester's prepare_features().
+    Returns the DataFrame with all EXPECTED_FEATURES columns added.
+    """
+    # Core indicators (kept for internal use / filters)
+    df['ADX'] = df.ta.adx(14)['ADX_14']
+    df['ATR'] = df.ta.atr(14)
+    df['ATR_Pct'] = df['ATR'] / df['Close']
+
+    # Kalman filter with velocity
+    kalman_level, kalman_vel = get_kalman_filter(df['Close'].values, return_velocity=True)
+    df['Kalman_Trend'] = (df['Close'] - kalman_level) / df['Close']
+    df['Kalman_Velocity'] = kalman_vel
+
+    # Hurst exponent (100-bar window, computed every 10 bars)
+    df['Hurst_Exponent'] = np.nan
+    close_vals = df['Close'].values
+    for i in range(100, len(df), 10):
+        window = close_vals[max(0, i - 100):i]
+        df.iloc[i, df.columns.get_loc('Hurst_Exponent')] = get_hurst(window)
+    df['Hurst_Exponent'] = df['Hurst_Exponent'].ffill().fillna(0.5)
+
+    # VPIN
+    try:
+        df['VPIN'] = calculate_vpin(df)
+    except Exception:
+        df['VPIN'] = 0.5
+
+    # VWAP features
+    try:
+        vwap_feats = calculate_enhanced_vwap_features(df)
+        df['VWAP_ZScore'] = vwap_feats['VWAP_ZScore'].fillna(0.0)
+    except Exception:
+        df['VWAP_ZScore'] = 0.0
+
+    # GEX Proxy
+    try:
+        regime_gex, _ = calculate_volatility_regime(df)
+        df['GEX_Proxy'] = regime_gex.fillna(0)
+    except Exception:
+        df['GEX_Proxy'] = 0
+
+    # Amihud
+    try:
+        df['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df, window=20)
+    except Exception:
+        df['Amihud_Illiquidity'] = 0.5
+
+    # Relative Return Strength
+    df['Relative_Return_Strength'] = df['Close'].pct_change(5).rolling(5).sum().fillna(0.0)
+
+    # NEW V7 features
+    df['OFI'] = compute_ofi(df)
+    df['RV_Ratio'] = compute_rv_ratio(df)
+
+    og, im = compute_momentum_decomp(df)
+    df['Overnight_Gap'] = og
+    df['Intraday_Mom'] = im
+
+    df['Efficiency_Ratio'] = compute_efficiency_ratio(df)
+    df['VPT_Acceleration'] = compute_vpt_acceleration(df)
+
+    uw, lw, br = compute_bar_patterns(df)
+    df['Upper_Wick'] = uw
+    df['Lower_Wick'] = lw
+    df['Body_Ratio'] = br
+
+    df['ATR_Channel_Pos'] = compute_atr_channel_pos(df)
+
+    # Beta Alpha (default 0 if no universe proxy available)
+    df['Beta_Alpha'] = 0.0
+
+    return df
 
 
 def enhance_triple_barrier_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=12, atr_col='ATR'):
@@ -2401,37 +2481,8 @@ class WalkForwardAI:
         self.shap_importances = {}  # {feature: importance} from last training
         self.shap_history = []      # List of (timestamp, {feature: importance}) for drift detection
 
-        # ENHANCED: Expanded feature set from 6 to 30+ features (INSTITUTIONAL-GRADE)
-        self.cols = [
-            # Original features
-            'RSI', 'ADX', 'ATR_Pct', 'Vol_Rel', 'Kalman_Dist', 'Hurst',
-            # Price action features
-            'BB_Width', 'BB_Position', 'VWAP_Dist', 'HL_Range',
-            # Momentum features
-            'ROC_5', 'ROC_20',
-            # Volume features
-            'Vol_Surge', 'Money_Flow',
-            # Regime features
-            'Volatility_Rank', 'Trend_Consistency',
-            # ENHANCED: Sentiment features (SA API)
-            'sa_news_count_3d', 'sa_sentiment_score', 'sentiment_valid',
-            # ENHANCED: Time features (intraday patterns)
-            'Hour', 'Day_of_Week',
-            # Fundamental features
-            'earnings_surprise', 'revenue_growth_yoy', 'pe_ratio',
-            # Dynamic news weighting
-            'news_impact_weight',
-            # Market context features (cross-asset signals)
-            'SPY_ROC_5', 'SPY_ROC_20', 'VIX_Level', 'VIX_ROC',
-            # Cross-sectional factor ranks
-            'momentum_rank', 'volume_rank', 'value_rank', 'composite_rank',
-            # INSTITUTIONAL MICROSTRUCTURE FEATURES
-            'VPIN', 'VWAP_ZScore', 'VWAP_Slope', 'VWAP_Volume_Ratio',
-            'Regime_GEX_Proxy', 'Amihud_Illiquidity',
-            'Volatility_Regime_Score',
-            # CRITICAL ALPHA FEATURES (Institutional Edge)
-            'RRS_Cumulative', 'Liquidity_Sweep', 'Beta_To_SPY'
-        ]
+        # V7: Feature set synchronized with backtester's EXPECTED_FEATURES
+        self.cols = list(EXPECTED_FEATURES)
         self.active_features = list(self.cols)  # v15: Track active features after IC check
 
         # ENHANCED: Optuna State - WEEKLY tuning to prevent overfitting
@@ -2593,196 +2644,8 @@ class WalkForwardAI:
                     if df.empty or len(df) < 200:
                         return None, None
 
-                    # ENHANCED FEATURES: Original + 10 new features
-                    # Original features
-                    df['RSI'] = df.ta.rsi(14)
-                    df['ADX'] = df.ta.adx(14)['ADX_14']
-                    df['ATR'] = df.ta.atr(14)
-                    df['ATR_Pct'] = df['ATR'] / df['Close']
-                    v = df['Volume'].rolling(20)
-                    df['Vol_Rel'] = df['Volume'] / v.mean()
-                    df['Kalman'] = get_kalman_filter(df['Close'].values)
-                    df['Kalman_Dist'] = (df['Close'] - df['Kalman']) / df['Close']
-                    # Hurst: compute every 10 bars and forward-fill (perf optimization)
-                    df['Hurst'] = np.nan
-                    _close_vals = df['Close'].values
-                    for _hi in range(50, len(df), 10):
-                        _window = _close_vals[_hi - 50:_hi]
-                        df.iloc[_hi, df.columns.get_loc('Hurst')] = get_hurst(_window)
-                    df['Hurst'] = df['Hurst'].ffill().fillna(0.5)
-
-                    # NEW: Bollinger Bands features
-                    bb = df.ta.bbands(20, 2)
-                    if bb is not None and len(bb.columns) >= 3:
-                        df['BB_Upper'] = bb.iloc[:, 0]
-                        df['BB_Mid'] = bb.iloc[:, 1]
-                        df['BB_Lower'] = bb.iloc[:, 2]
-                        df['BB_Width'] = (df['BB_Upper'] - df['BB_Lower']) / df['Close']
-                        df['BB_Position'] = (df['Close'] - df['BB_Lower']) / (df['BB_Upper'] - df['BB_Lower'] + 1e-10)
-                    else:
-                        df['BB_Width'] = 0.02
-                        df['BB_Position'] = 0.5
-
-                    # NEW: VWAP feature
-                    try:
-                        df['VWAP'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
-                        df['VWAP_Dist'] = (df['Close'] - df['VWAP']) / df['Close']
-                    except Exception as e:
-                        logging.debug(f"VWAP feature calc failed: {e}")
-                        df['VWAP_Dist'] = 0.0
-
-                    # NEW: Microstructure features
-                    df['HL_Range'] = (df['High'] - df['Low']) / df['Close']
-                    df['Money_Flow'] = (df['Close'] * df['Volume']).rolling(10).sum()
-                    df['Money_Flow'] = df['Money_Flow'] / df['Money_Flow'].rolling(50).mean()  # Normalize
-
-                    # NEW: Momentum features
-                    df['ROC_5'] = df['Close'].pct_change(5)
-                    df['ROC_20'] = df['Close'].pct_change(20)
-
-                    # NEW: Volume features
-                    df['Vol_Surge'] = df['Volume'] / df['Volume'].rolling(5).mean()
-
-                    # NEW: Regime features
-                    df['Volatility_Rank'] = df['ATR_Pct'].rolling(100).apply(
-                        lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5, raw=False
-                    )
-                    _ret = df['Close'].pct_change()
-                    df['Trend_Consistency'] = _ret.rolling(20).apply(
-                        lambda s: (s > 0).mean(), raw=False
-                    )
-
-                    # ENHANCED: Time features (intraday patterns)
-                    df['Hour'] = df.index.hour
-                    df['Day_of_Week'] = df.index.dayofweek  # 0=Monday, 4=Friday
-
-                    # ENHANCED: Sentiment features (will be 0 during training, populated during live scanning)
-                    df['sa_news_count_3d'] = 0  # Placeholder for training
-                    df['sa_sentiment_score'] = 0  # Populated live from SA API
-                    df['sentiment_valid'] = 0  # Flag: 0=placeholder, 1=real SA data
-
-                    # Fundamental features (populated live from FMP, default 0 for training)
-                    df['earnings_surprise'] = 0.0
-                    df['revenue_growth_yoy'] = 0.0
-                    df['pe_ratio'] = 20.0
-
-                    # Dynamic news weighting (populated live, default 0 for training)
-                    df['news_impact_weight'] = 0.0
-
-                    # Market context: SPY momentum + VIX regime
-                    if spy_ctx is not None:
-                        df = df.join(spy_ctx, how='left')
-                        df['SPY_ROC_5'] = df['SPY_ROC_5'].ffill().fillna(0.0)
-                        df['SPY_ROC_20'] = df['SPY_ROC_20'].ffill().fillna(0.0)
-                    else:
-                        df['SPY_ROC_5'] = 0.0
-                        df['SPY_ROC_20'] = 0.0
-
-                    if vix_level_map:
-                        df['VIX_Level'] = [vix_level_map.get(d, 20.0) for d in df.index.date]
-                        df['VIX_ROC'] = [vix_roc_map.get(d, 0.0) for d in df.index.date]
-                        df['VIX_Level'] = df['VIX_Level'].fillna(20.0)
-                        df['VIX_ROC'] = df['VIX_ROC'].fillna(0.0)
-                    else:
-                        df['VIX_Level'] = 20.0
-                        df['VIX_ROC'] = 0.0
-
-                    # Cross-sectional ranks PROXY (Self-Relative Percentiles for Training)
-                    # "Is this stock exhibiting top-tier behavior relative to its recent history?"
-                    df['momentum_rank'] = df['ROC_20'].rolling(100).rank(pct=True).fillna(0.5)
-
-                    # Volume Rank: Relative Volume Strength
-                    df['volume_rank'] = (df['Volume'] / df['Volume'].rolling(20).mean()).rolling(100).rank(pct=True).fillna(0.5)
-
-                    # Value Rank: Low RSI = 'Value' (oversold) in this context, or PE if available
-                    # We use RSI Rank as a proxy for "Value/Mean-Reversion Potential"
-                    df['value_rank'] = (100 - df['RSI']).rolling(100).rank(pct=True).fillna(0.5)
-
-                    # Composite = Average of Momentum and Volume
-                    df['composite_rank'] = ((df['momentum_rank'] + df['volume_rank']) / 2).fillna(0.5)
-
-                    # ==============================================================================
-                    # INSTITUTIONAL MICROSTRUCTURE FEATURES (HIGH-CONFIDENCE TRADING)
-                    # ==============================================================================
-
-                    # 1. VPIN (Order Flow Toxicity) - Filter out toxic market conditions
-                    try:
-                        df['VPIN'] = calculate_vpin(df, window=50)
-                        logging.debug(f"   ✅ VPIN calculated (mean={df['VPIN'].mean():.3f})")
-                    except Exception as e:
-                        logging.debug(f"   VPIN calc failed: {e}")
-                        df['VPIN'] = 0.0
-
-                    # 2. Enhanced VWAP Features (Institutional Mean Reversion Signals)
-                    try:
-                        vwap_features = calculate_enhanced_vwap_features(df)
-                        df['VWAP_ZScore'] = vwap_features['VWAP_ZScore'].fillna(0.0)
-                        df['VWAP_Slope'] = vwap_features['VWAP_Slope'].fillna(0.0)
-                        df['VWAP_Volume_Ratio'] = vwap_features['VWAP_Volume_Ratio'].fillna(1.0)
-                        logging.debug(f"   ✅ Enhanced VWAP features calculated")
-                    except Exception as e:
-                        logging.debug(f"   VWAP features failed: {e}")
-                        df['VWAP_ZScore'] = 0.0
-                        df['VWAP_Slope'] = 0.0
-                        df['VWAP_Volume_Ratio'] = 1.0
-
-                    # 3. GEX Proxy (Volatility Regime Detection)
-                    try:
-                        regime_gex, vol_regime_label = calculate_volatility_regime(df)
-                        df['Regime_GEX_Proxy'] = regime_gex.fillna(0)
-                        # Convert regime label to score: LOW=-1, MEDIUM=0, HIGH=1
-                        regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
-                        df['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
-                        logging.debug(f"   ✅ GEX Proxy calculated")
-                    except Exception as e:
-                        logging.debug(f"   GEX Proxy failed: {e}")
-                        df['Regime_GEX_Proxy'] = 0
-                        df['Volatility_Regime_Score'] = 0
-
-                    # 4. Amihud Illiquidity (Slippage Risk)
-                    try:
-                        df['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df, window=20)
-                        logging.debug(f"   ✅ Amihud Illiquidity calculated (mean={df['Amihud_Illiquidity'].mean():.3f})")
-                    except Exception as e:
-                        logging.debug(f"   Amihud calc failed: {e}")
-                        df['Amihud_Illiquidity'] = 0.5
-
-                    # 5. 🔥 CRITICAL: Real Relative Strength (RRS) vs SPY
-                    try:
-                        # Fetch SPY data for beta calculation
-                        spy_df_for_rrs = None
-                        if spy_ctx is not None and 'SPY_Close' in spy_ctx.columns:
-                            spy_df_for_rrs = pd.DataFrame({'Close': spy_ctx['SPY_Close']})
-
-                        rrs = calculate_real_relative_strength(df, spy_df_for_rrs)
-                        df['RRS_Cumulative'] = rrs.fillna(0.0)
-
-                        # Also store Beta for analysis
-                        if spy_df_for_rrs is not None:
-                            stock_returns = df['Close'].pct_change()
-                            spy_returns = spy_df_for_rrs['Close'].pct_change().reindex(df.index, method='ffill')
-                            covariance = stock_returns.rolling(50).cov(spy_returns)
-                            spy_variance = spy_returns.rolling(50).var()
-                            df['Beta_To_SPY'] = (covariance / (spy_variance + 1e-9)).fillna(1.0).clip(-3, 3)
-                        else:
-                            df['Beta_To_SPY'] = 1.0
-
-                        logging.debug(f"   ✅ RRS calculated (mean={df['RRS_Cumulative'].mean():.4f})")
-                    except Exception as e:
-                        logging.debug(f"   RRS calc failed: {e}")
-                        df['RRS_Cumulative'] = 0.0
-                        df['Beta_To_SPY'] = 1.0
-
-                    # 6. 🎯 HIGH WIN RATE: Liquidity Sweep Detection
-                    try:
-                        df['Liquidity_Sweep'] = calculate_liquidity_sweep(df, lookback=16)
-                        sweep_count = (df['Liquidity_Sweep'] != 0).sum()
-                        logging.debug(f"   ✅ Liquidity Sweeps detected: {sweep_count}")
-                    except Exception as e:
-                        logging.debug(f"   Liquidity Sweep calc failed: {e}")
-                        df['Liquidity_Sweep'] = 0
-
-                    # ==============================================================================
+                    # V7: Compute all features using unified pipeline
+                    df = _compute_v7_features(df)
 
                     # FIX: Attach daily ATR for consistent train/live stop geometry
                     # Uses Polygon daily bars via vectorized join (fast)
@@ -3435,99 +3298,8 @@ class BracketBacktest:
                 if df is None or len(df) < 200:
                     continue
 
-                # Compute features (same pipeline as training)
-                df['RSI'] = df.ta.rsi(14)
-                df['ADX'] = df.ta.adx(14)['ADX_14']
-                df['ATR'] = df.ta.atr(14)
-                df['ATR_Pct'] = df['ATR'] / df['Close']
-                v = df['Volume'].rolling(20)
-                df['Vol_Rel'] = df['Volume'] / v.mean()
-                df['Kalman'] = get_kalman_filter(df['Close'].values)
-                df['Kalman_Dist'] = (df['Close'] - df['Kalman']) / df['Close']
-                df['Hurst'] = 0.5
-                _cv = df['Close'].values
-                for _hi in range(50, len(df), 10):
-                    df.iloc[_hi, df.columns.get_loc('Hurst')] = get_hurst(_cv[_hi-50:_hi])
-                df['Hurst'] = df['Hurst'].ffill().fillna(0.5)
-
-                bb = df.ta.bbands(20, 2)
-                if bb is not None and len(bb.columns) >= 3:
-                    df['BB_Width'] = (bb.iloc[:, 0] - bb.iloc[:, 2]) / df['Close']
-                    df['BB_Position'] = (df['Close'] - bb.iloc[:, 2]) / (bb.iloc[:, 0] - bb.iloc[:, 2] + 1e-10)
-                else:
-                    df['BB_Width'] = 0.02; df['BB_Position'] = 0.5
-
-                try:
-                    df['VWAP'] = (df['Close'] * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
-                    df['VWAP_Dist'] = (df['Close'] - df['VWAP']) / df['Close']
-                except Exception:
-                    df['VWAP_Dist'] = 0.0
-
-                df['HL_Range'] = (df['High'] - df['Low']) / df['Close']
-                df['Money_Flow'] = (df['Close'] * df['Volume']).rolling(10).sum()
-                df['Money_Flow'] = df['Money_Flow'] / df['Money_Flow'].rolling(50).mean()
-                df['ROC_5'] = df['Close'].pct_change(5)
-                df['ROC_20'] = df['Close'].pct_change(20)
-                df['Vol_Surge'] = df['Volume'] / df['Volume'].rolling(5).mean()
-                df['Volatility_Rank'] = df['ATR_Pct'].rolling(100).apply(
-                    lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5, raw=False)
-                _ret = df['Close'].pct_change()
-                df['Trend_Consistency'] = _ret.rolling(20).apply(lambda s: (s > 0).mean(), raw=False)
-                df['Hour'] = df.index.hour
-                df['Day_of_Week'] = df.index.dayofweek
-
-                # ==============================================================================
-                # INSTITUTIONAL MICROSTRUCTURE FEATURES (BACKTEST)
-                # ==============================================================================
-                try:
-                    df['VPIN'] = calculate_vpin(df, window=50)
-                except Exception as e:
-                    logging.debug(f"VPIN backtest calc failed: {e}")
-                    df['VPIN'] = 0.0
-
-                try:
-                    vwap_features = calculate_enhanced_vwap_features(df)
-                    df['VWAP_ZScore'] = vwap_features['VWAP_ZScore'].fillna(0.0)
-                    df['VWAP_Slope'] = vwap_features['VWAP_Slope'].fillna(0.0)
-                    df['VWAP_Volume_Ratio'] = vwap_features['VWAP_Volume_Ratio'].fillna(1.0)
-                except Exception as e:
-                    logging.debug(f"VWAP features backtest calc failed: {e}")
-                    df['VWAP_ZScore'] = 0.0
-                    df['VWAP_Slope'] = 0.0
-                    df['VWAP_Volume_Ratio'] = 1.0
-
-                try:
-                    regime_gex, vol_regime_label = calculate_volatility_regime(df)
-                    df['Regime_GEX_Proxy'] = regime_gex.fillna(0)
-                    regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
-                    df['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
-                except Exception as e:
-                    logging.debug(f"GEX proxy backtest calc failed: {e}")
-                    df['Regime_GEX_Proxy'] = 0
-                    df['Volatility_Regime_Score'] = 0
-
-                try:
-                    df['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df, window=20)
-                except Exception as e:
-                    logging.debug(f"Amihud backtest calc failed: {e}")
-                    df['Amihud_Illiquidity'] = 0.5
-
-                # RRS and Liquidity Sweep (Critical Alpha Features)
-                try:
-                    # RRS (no SPY data in backtest, use momentum proxy)
-                    df['RRS_Cumulative'] = df['Close'].pct_change(5).rolling(5).sum().fillna(0.0)
-                    df['Beta_To_SPY'] = 1.0  # Placeholder for backtest
-                except Exception as e:
-                    logging.debug(f"RRS backtest calc failed: {e}")
-                    df['RRS_Cumulative'] = 0.0
-                    df['Beta_To_SPY'] = 1.0
-
-                try:
-                    df['Liquidity_Sweep'] = calculate_liquidity_sweep(df, lookback=16)
-                except Exception as e:
-                    logging.debug(f"Liquidity sweep backtest calc failed: {e}")
-                    df['Liquidity_Sweep'] = 0
-                # ==============================================================================
+                # V7: Compute all features using unified pipeline
+                df = _compute_v7_features(df)
 
                 # Fill placeholders for features not available in backtest
                 for col in self.ai.active_features:
@@ -4213,166 +3985,12 @@ def run_god_mode():
                     if not portfolio_risk.should_allow_entry(t, combined_exposure, alpaca.equity):
                         return None
 
-                    # Feature Eng
-                    df_15m['RSI'] = df_15m.ta.rsi(14)
-                    df_15m['ADX'] = df_15m.ta.adx(14)['ADX_14']
-                    df_15m['ATR'] = df_15m.ta.atr(14)
-                    df_15m['ATR_Pct'] = df_15m['ATR'] / df_15m['Close']
-                    # EMA 200 (Trend Filter)
-                    df_15m['EMA_200'] = df_15m.ta.ema(200)
-
-                    v = df_15m['Volume'].rolling(20)
-                    df_15m['Vol_Rel'] = df_15m['Volume'] / v.mean()
-                    df_15m['Kalman'] = get_kalman_filter(df_15m['Close'].values)
-                    df_15m['Kalman_Dist'] = (df_15m['Close'] - df_15m['Kalman']) / df_15m['Close']
-                    hurst = get_hurst(df_15m['Close'].values)
-                    df_15m['Hurst'] = df_15m['Close'].rolling(50).apply(lambda x: get_hurst(x.values) if len(x) >= 20 else 0.5, raw=False).fillna(hurst)
-
-                    # --- FEATURES MUST MATCH TRAINING (was missing, causing silent predict failures) ---
-                    # Bollinger Bands
-                    bb = df_15m.ta.bbands(20, 2)
-                    if bb is not None and len(bb.columns) >= 3:
-                        df_15m['BB_Upper'] = bb.iloc[:, 0]
-                        df_15m['BB_Mid'] = bb.iloc[:, 1]
-                        df_15m['BB_Lower'] = bb.iloc[:, 2]
-                        df_15m['BB_Width'] = (df_15m['BB_Upper'] - df_15m['BB_Lower']) / df_15m['Close']
-                        df_15m['BB_Position'] = (df_15m['Close'] - df_15m['BB_Lower']) / (df_15m['BB_Upper'] - df_15m['BB_Lower'] + 1e-10)
-                    else:
-                        df_15m['BB_Width'] = 0.02
-                        df_15m['BB_Position'] = 0.5
-
-                    # VWAP
-                    try:
-                        df_15m['VWAP'] = (df_15m['Close'] * df_15m['Volume']).rolling(20).sum() / df_15m['Volume'].rolling(20).sum()
-                        df_15m['VWAP_Dist'] = (df_15m['Close'] - df_15m['VWAP']) / df_15m['Close']
-                    except Exception as e:
-                        logging.debug(f"VWAP calc failed for scanner: {e}")
-                        df_15m['VWAP_Dist'] = 0.0
-
-                    # Microstructure
-                    df_15m['HL_Range'] = (df_15m['High'] - df_15m['Low']) / df_15m['Close']
-                    df_15m['Money_Flow'] = (df_15m['Close'] * df_15m['Volume']).rolling(10).sum()
-                    mf_mean = df_15m['Money_Flow'].rolling(50).mean()
-                    df_15m['Money_Flow'] = df_15m['Money_Flow'] / mf_mean
-
-                    # Momentum
-                    df_15m['ROC_5'] = df_15m['Close'].pct_change(5)
-                    df_15m['ROC_20'] = df_15m['Close'].pct_change(20)
-
-                    # Volume surge
-                    df_15m['Vol_Surge'] = df_15m['Volume'] / df_15m['Volume'].rolling(5).mean()
-
-                    # Regime features
-                    df_15m['Volatility_Rank'] = df_15m['ATR_Pct'].rolling(100, min_periods=20).apply(
-                        lambda x: (x.iloc[-1] > x).sum() / len(x) if len(x) > 0 else 0.5, raw=False
-                    )
-                    _ret_live = df_15m['Close'].pct_change()
-                    df_15m['Trend_Consistency'] = _ret_live.rolling(20, min_periods=5).apply(
-                        lambda s: (s > 0).mean(), raw=False
-                    )
-
-                    # Time features
-                    df_15m['Hour'] = df_15m.index.hour
-                    df_15m['Day_of_Week'] = df_15m.index.dayofweek
-
-                    # Market context features (computed once per scan cycle above)
-                    df_15m['SPY_ROC_5'] = live_spy_roc_5
-                    df_15m['SPY_ROC_20'] = live_spy_roc_20
-                    df_15m['VIX_Level'] = live_vix_level
-                    df_15m['VIX_ROC'] = live_vix_roc
-
-                    # Cross-sectional factor ranks (computed once per scan cycle)
-                    _ranks = cs_ranker.get_ranks(t)
-                    df_15m['momentum_rank'] = _ranks['momentum_rank']
-                    df_15m['volume_rank'] = _ranks['volume_rank']
-                    df_15m['value_rank'] = _ranks['value_rank']
-                    df_15m['composite_rank'] = _ranks['composite_rank']
-
-                    # ==============================================================
-                    # FIX Issue 3: Institutional microstructure features were MISSING
-                    # in live scanning but computed during training. This caused the
-                    # model to see real VPIN/Amihud/etc during training but defaults
-                    # (0.0) during live prediction → distribution mismatch.
-                    # ==============================================================
-
-                    # 1. VPIN (Order Flow Toxicity)
-                    try:
-                        df_15m['VPIN'] = calculate_vpin(df_15m, window=50)
-                    except Exception:
-                        df_15m['VPIN'] = 0.0
-
-                    # 2. Enhanced VWAP Features
-                    try:
-                        vwap_features = calculate_enhanced_vwap_features(df_15m)
-                        df_15m['VWAP_ZScore'] = vwap_features['VWAP_ZScore'].fillna(0.0)
-                        df_15m['VWAP_Slope'] = vwap_features['VWAP_Slope'].fillna(0.0)
-                        df_15m['VWAP_Volume_Ratio'] = vwap_features['VWAP_Volume_Ratio'].fillna(1.0)
-                    except Exception:
-                        df_15m['VWAP_ZScore'] = 0.0
-                        df_15m['VWAP_Slope'] = 0.0
-                        df_15m['VWAP_Volume_Ratio'] = 1.0
-
-                    # 3. GEX Proxy (Volatility Regime Detection)
-                    try:
-                        regime_gex, vol_regime_label = calculate_volatility_regime(df_15m)
-                        df_15m['Regime_GEX_Proxy'] = regime_gex.fillna(0)
-                        regime_score_map = {'LOW': -1, 'MEDIUM': 0, 'HIGH': 1}
-                        df_15m['Volatility_Regime_Score'] = vol_regime_label.map(regime_score_map).fillna(0)
-                    except Exception:
-                        df_15m['Regime_GEX_Proxy'] = 0
-                        df_15m['Volatility_Regime_Score'] = 0
-
-                    # 4. Amihud Illiquidity
-                    try:
-                        df_15m['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df_15m, window=20)
-                    except Exception:
-                        df_15m['Amihud_Illiquidity'] = 0.5
-
-                    # 5. Real Relative Strength + Beta
-                    try:
-                        _spy_for_rrs = None
-                        if _spy_scan is not None and len(_spy_scan) > 0:
-                            _spy_for_rrs = pd.DataFrame({'Close': _spy_scan['Close']})
-                        rrs = calculate_real_relative_strength(df_15m, _spy_for_rrs)
-                        df_15m['RRS_Cumulative'] = rrs.fillna(0.0)
-                        if _spy_for_rrs is not None:
-                            stock_returns = df_15m['Close'].pct_change()
-                            spy_returns = _spy_for_rrs['Close'].pct_change().reindex(df_15m.index, method='ffill')
-                            covariance = stock_returns.rolling(50).cov(spy_returns)
-                            spy_variance = spy_returns.rolling(50).var()
-                            df_15m['Beta_To_SPY'] = (covariance / (spy_variance + 1e-9)).fillna(1.0).clip(-3, 3)
-                        else:
-                            df_15m['Beta_To_SPY'] = 1.0
-                    except Exception:
-                        df_15m['RRS_Cumulative'] = 0.0
-                        df_15m['Beta_To_SPY'] = 1.0
-
-                    # 6. Liquidity Sweep Detection
-                    try:
-                        df_15m['Liquidity_Sweep'] = calculate_liquidity_sweep(df_15m, lookback=16)
-                    except Exception:
-                        df_15m['Liquidity_Sweep'] = 0
-                    # --- END FEATURE PARITY FIX ---
+                    # V7: Compute all features using unified pipeline
+                    df_15m = _compute_v7_features(df_15m)
+                    # EMA 200 for trend filter (not in EXPECTED_FEATURES but used by live filters)
+                    df_15m['EMA_200'] = df_15m['Close'].ewm(span=200).mean()
 
                     row = df_15m.iloc[-2].to_dict()
-
-                    # Injections
-                    if sa_helper.key:
-                        row.update(sa_helper.get_news_features(t))
-                        row.update(sa_helper.get_ratings(t))
-                        row['sentiment_valid'] = 1.0
-                    else:
-                        row['sa_news_count_3d'] = 0
-                        row['sa_sentiment_score'] = 0
-                        row['sentiment_valid'] = 0.0
-
-                    # Fundamental features from FMP
-                    fund_feats = fmp.get_fundamental_features(t)
-                    row.update(fund_feats)
-
-                    # Dynamic news weighting
-                    _ns = all_news_scores.get(t, 0)
-                    row['news_impact_weight'] = float(_ns) if _ns else 0.0
 
                     # Validate live features against training distribution
                     try:
@@ -4395,130 +4013,72 @@ def run_god_mode():
                     if not daily_atr or np.isnan(daily_atr) or daily_atr <= 0: daily_atr = row.get('ATR', prices.get(t, row['Close']) * 0.02)
 
                     # ==============================================================================
-                    # INSTITUTIONAL-GRADE CONFIDENCE FILTERING (>50% WR, >1.5 PF TARGET)
+                    # V7 FILTERING: Synced with backtester
+                    # Only VPIN and Amihud are hard blocks. ADX/Hurst are soft scalars.
                     # ==============================================================================
 
-                    # 1. Base R-value threshold (adaptive based on market regime)
-                    base_r_threshold = 0.10  # Default
-
-                    # Increase threshold in high-volatility regimes (harder to predict)
-                    vix_level = row.get('VIX_Level', 20.0)
-                    if vix_level > 25:
-                        base_r_threshold = 0.15
-                    elif vix_level > 30:
-                        base_r_threshold = 0.20
-
-                    # Skip if R-value too close to zero (equivalent to HOLD)
+                    # 1. Base R-value threshold
+                    base_r_threshold = SETTINGS.get('MIN_CONFIDENCE', 0.02)
                     if abs(predicted_r) < base_r_threshold:
                         return None
 
-                    # 2. Skip if prediction interval too wide (unreliable)
+                    # 2. Uncertainty filter (keep for live, not in backtester)
                     if uncertainty > 2.0:
                         return None
 
-                    # 3. VPIN Filter: Block toxic order flow (informed trading present)
+                    # 3. VPIN hard filter (synced with backtester: > 0.85)
                     vpin = row.get('VPIN', 0.0)
-                    if vpin > 0.85:  # 85th percentile = very toxic
-                        logging.debug(f"   🚫 {t} blocked by VPIN={vpin:.2f} (toxic order flow)")
+                    if vpin > 0.85:
+                        logging.debug(f"   {t} blocked by VPIN={vpin:.2f}")
                         return None
 
-                    # 4. Amihud Illiquidity Filter: Block low-liquidity conditions (high slippage risk)
+                    # 4. Amihud hard filter (synced with backtester: > 0.90)
                     amihud = row.get('Amihud_Illiquidity', 0.5)
-                    if amihud > 0.90:  # 90th percentile = very illiquid
-                        logging.debug(f"   🚫 {t} blocked by Amihud={amihud:.2f} (low liquidity)")
-                        return None
-
-                    # 5. Enhanced Confidence Filter: Use quantile spread as confidence proxy
-                    # Wide quantile spread (q90 - q10) = high uncertainty = skip
-                    if uncertainty > 1.5:  # Tighter threshold for high-accuracy trading
-                        logging.debug(f"   🚫 {t} blocked by high uncertainty={uncertainty:.2f}")
-                        return None
-
-                    # 6. VWAP Z-Score Filter: Extreme deviations often mean-revert (fade the extremes)
-                    vwap_z = row.get('VWAP_ZScore', 0.0)
-                    predicted_side = "LONG" if predicted_r > 0 else "SHORT"
-
-                    # If VWAP Z-score is extreme, ensure we're trading WITH the reversion, not against it
-                    if abs(vwap_z) > 2.5:
-                        # Extreme high: expect mean reversion DOWN (favor SHORTS)
-                        if vwap_z > 2.5 and predicted_side == "LONG":
-                            logging.debug(f"   🚫 {t} blocked: VWAP_Z={vwap_z:.2f} (overextended, fade the move)")
-                            return None
-                        # Extreme low: expect mean reversion UP (favor LONGS)
-                        if vwap_z < -2.5 and predicted_side == "SHORT":
-                            logging.debug(f"   🚫 {t} blocked: VWAP_Z={vwap_z:.2f} (oversold, fade the move)")
-                            return None
-
-                    # 7. Regime-Based Filtering: Use GEX Proxy to match strategy to regime
-                    gex_proxy = row.get('Regime_GEX_Proxy', 0)
-
-                    # Positive GEX (mean reversion regime): Only take mean-reversion signals
-                    if gex_proxy == 1:
-                        # Mean reversion: favor trades when price is stretched from VWAP
-                        if abs(vwap_z) < 1.0:  # Not stretched enough
-                            logging.debug(f"   🚫 {t} blocked in +GEX regime: VWAP_Z={vwap_z:.2f} (need stretch for MR)")
-                            return None
-
-                    # Negative GEX (trending regime): Only take trend-following signals
-                    elif gex_proxy == -1:
-                        # Trend following: favor trades with strong VWAP slope
-                        vwap_slope = row.get('VWAP_Slope', 0.0)
-                        if abs(vwap_slope) < 0.001:  # Flat VWAP = no trend
-                            logging.debug(f"   🚫 {t} blocked in -GEX regime: VWAP_Slope={vwap_slope:.4f} (need trend)")
-                            return None
-
-                    # 8. Minimum Win Probability Filter (for >50% win rate target)
-                    if p_win < 0.52:  # Slightly above 50% to account for costs
-                        logging.debug(f"   🚫 {t} blocked by low p_win={p_win:.2%}")
+                    if amihud > 0.90:
+                        logging.debug(f"   {t} blocked by Amihud={amihud:.2f}")
                         return None
 
                     # ==============================================================================
 
                     # Determine side based on R-value sign
+                    predicted_side = "LONG" if predicted_r > 0 else "SHORT"
                     side = predicted_side
-
-                    # 🚀 TREND FILTER BOOSTER: "The Golden Gate"
-                    # Filter out counter-trend signals to maximize win-rate
-                    last_close = row['Close']
-                    ema_200 = row.get('EMA_200', 0)
-                    if ema_200 > 0:
-                        # If Price < EMA200, only SHORTs allowed
-                        if last_close < ema_200 and side == "LONG":
-                            # Check exception: Deep oversold bounce? (RSI < 25)
-                            if row.get('RSI', 50) > 25:
-                                return None
-
-                        # If Price > EMA200, only LONGs allowed
-                        if last_close > ema_200 and side == "SHORT":
-                            # Check exception: Deep overbought dump? (RSI > 75)
-                            if row.get('RSI', 50) < 75:
-                                return None
 
                     entry_price = prices.get(t, row['Close'])
 
-                    # --- HYBRID GOD MODE LOGIC (Dual-Tier) ---
-                    hurst_val = row.get('Hurst', 0.5)
+                    # --- V7 SOFT FILTERS (reduce size, don't block) ---
+                    hurst_val = row.get('Hurst_Exponent', row.get('Hurst', 0.5))
                     adx_val = row.get('ADX', 20)
+                    soft_scalar = 1.0
 
+                    # ADX soft filter: reduce size when ADX is low (weak trend)
+                    adx_min = SETTINGS.get('ADX_MIN', 15)
+                    if adx_min > 0 and adx_val < adx_min:
+                        adx_scalar = 0.5 + 0.5 * (adx_val / max(adx_min, 1e-6))
+                        soft_scalar *= adx_scalar
+
+                    # Hurst directional soft filter (synced with backtester)
+                    hurst_limit = SETTINGS.get('HURST_LIMIT', 0.5)
+                    pred_direction = 1 if predicted_r > 0 else -1
+                    if pred_direction > 0:
+                        hurst_scalar = 0.5 + 0.5 * (hurst_val / max(hurst_limit, 0.01))
+                        hurst_scalar = min(1.5, hurst_scalar)
+                    else:
+                        hurst_scalar = 0.5 + 0.5 * ((1 - hurst_val) / max(1 - hurst_limit, 0.01))
+                        hurst_scalar = min(1.5, hurst_scalar)
+                    soft_scalar *= max(0.3, hurst_scalar)
+
+                    # Confidence scalar (synced with backtester)
+                    conf_scalar = min(2.0, 0.5 + 0.5 * (abs(predicted_r) / max(base_r_threshold, 1e-6)))
+                    soft_scalar *= conf_scalar
+
+                    # Tier classification (simplified: always allow, use soft_scalar for sizing)
                     t1_cfg = SETTINGS.get("TIER_1", {})
                     t2_cfg = SETTINGS.get("TIER_2", {})
 
-                    # Tier 1: Specialist (High Conf, Low Chop, High Trend)
-                    is_tier_1 = (
-                        (p_win >= t1_cfg.get("MIN_PROB", 0.30)) and
-                        (hurst_val < t1_cfg.get("MAX_HURST", 0.55)) and
-                        (adx_val > t1_cfg.get("MIN_ADX", 25))
-                    )
-
-                    # Tier 2: Grinder (Med Conf, Med Chop)
-                    is_tier_2 = (
-                        (p_win >= t2_cfg.get("MIN_PROB", 0.20)) and
-                        (hurst_val < t2_cfg.get("MAX_HURST", 0.45)) and
-                        (adx_val > t2_cfg.get("MIN_ADX", 20))
-                    )
-
-                    active_tier = None
-                    tier_type = "Filtered"
+                    # Tier 1 if high confidence and strong trend
+                    is_tier_1 = (p_win >= t1_cfg.get("MIN_PROB", 0.30))
+                    is_tier_2 = (p_win >= t2_cfg.get("MIN_PROB", 0.20))
 
                     if is_tier_1:
                         active_tier = t1_cfg
@@ -4526,14 +4086,12 @@ def run_god_mode():
                     elif is_tier_2:
                         active_tier = t2_cfg
                         tier_type = "Tier 2 (Grinder)"
-
-                    # FINAL GATE
-                    if not active_tier:
-                        # Fail
+                    else:
                         return None
 
                     # --- Apply Tier Parameters ---
-                    risk_mult = active_tier.get("RISK_MULT", 1.0)
+                    risk_mult = active_tier.get("RISK_MULT", 1.0) * soft_scalar
+                    risk_mult = min(risk_mult, 3.0)  # Cap at 3x (synced with backtester)
                     rr_target = active_tier.get("RR", 1.5)
 
                     # Burn-in / News Penalties

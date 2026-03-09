@@ -161,3 +161,46 @@ class MonteCarloGovernor:
     def get_risk_scalar(self):
         """Return current risk scalar (0.5 - 1.0)."""
         return self.risk_scalar
+
+
+class DailyRiskManager:
+    """Daily P&L tracking with loss halt and profit lock-in."""
+
+    def __init__(self, daily_loss_limit=0.02, daily_profit_lock_pct=0.03):
+        self.daily_loss_limit = daily_loss_limit
+        self.daily_profit_lock_pct = daily_profit_lock_pct
+        self._daily_pnl = 0.0
+        self._daily_start_equity = 0.0
+        self._current_date = None
+
+    def reset_if_new_day(self, current_date, equity):
+        """Reset daily P&L tracker at start of new trading day."""
+        if current_date != self._current_date:
+            self._current_date = current_date
+            self._daily_pnl = 0.0
+            self._daily_start_equity = equity
+
+    def record_pnl(self, pnl):
+        """Record a trade's P&L."""
+        self._daily_pnl += pnl
+
+    def get_daily_size_scalar(self):
+        """Returns size scalar based on current day's P&L."""
+        if self._daily_start_equity <= 0:
+            return 1.0
+
+        daily_pnl_pct = self._daily_pnl / self._daily_start_equity
+
+        if daily_pnl_pct <= -self.daily_loss_limit:
+            return 0.0  # full stop
+
+        if daily_pnl_pct >= self.daily_profit_lock_pct:
+            return 0.5  # reduce to protect gains
+
+        return 1.0
+
+    @property
+    def is_halted(self):
+        if self._daily_start_equity <= 0:
+            return False
+        return (self._daily_pnl / self._daily_start_equity) <= -self.daily_loss_limit
