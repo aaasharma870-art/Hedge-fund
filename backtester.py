@@ -151,11 +151,11 @@ TICKERS = [
 MONTE_CARLO_RUNS = 1000
 
 # --- Feature pruning ---
-PRUNE_FEATURES = False   # V10: disabled — using curated CORE_FEATURES
-PRUNE_KEEP_RATIO = 0.5
+PRUNE_FEATURES = True    # V11: light pruning — drop bottom 30% of 18 features
+PRUNE_KEEP_RATIO = 0.70
 
 # --- Optuna settings ---
-OPTUNA_N_TRIALS = 60     # Reduced from 300 to prevent overfitting with discrete params
+OPTUNA_N_TRIALS = 80     # V11: 7 params with 80 trials — good Bayesian coverage
 OPTUNA_TIMEOUT = None    # No time limit (set to seconds to cap)
 OPTUNA_STORAGE = "sqlite:///optuna_backtester.db"  # Persistent study storage
 
@@ -268,18 +268,31 @@ class Polygon_Helper:
 
 ALL_FEATURES = list(EXPECTED_FEATURES) + INSTITUTIONAL_SIGNAL_NAMES
 
-# V10: Curated core features with strong economic rationale
+# V11: 18 curated features — enough signal without overfitting at depth-3
 CORE_FEATURES = [
-    'VPIN',              # Informed trading pressure (Easley & O'Hara)
-    'Kalman_Trend',      # Smoothed trend direction
-    'Hurst_Exponent',    # Regime classification
-    'COFI',              # Cumulative order flow imbalance
-    'OFI',               # Single-bar order flow
-    'RV_Ratio',          # Realized vs implied vol ratio
-    'VWAP_ZScore',       # Mean reversion signal
-    'ATR_Channel_Pos',   # Bollinger-style position
-    'Amihud_Illiquidity', # Liquidity measure
-    'Intraday_Mom',      # Intraday momentum
+    # Microstructure (order flow & informed trading)
+    'VPIN',                   # Probability of informed trading
+    'OFI',                    # Order flow imbalance
+    'Amihud_Illiquidity',     # Liquidity measure
+    'COFI',                   # Cumulative order flow imbalance
+    # Trend & momentum
+    'Kalman_Trend',           # Smoothed trend
+    'Kalman_Velocity',        # Trend acceleration
+    'Intraday_Mom',           # Intraday return momentum
+    'Hurst_Exponent',         # Trending vs mean-reverting
+    # Volatility & regime
+    'RV_Ratio',               # Realized vol ratio (short/long)
+    'GEX_Proxy',              # Gamma exposure proxy
+    'ATR_Channel_Pos',        # Position within ATR channel
+    'VWAP_ZScore',            # Deviation from VWAP
+    # Cross-sectional (meaningful with 15 tickers)
+    'Relative_Return_Strength',  # Relative momentum
+    'Beta_Alpha',             # Idiosyncratic return
+    # Regime classification signals
+    'Variance_Ratio',         # Lo-MacKinlay variance ratio
+    'RV_Regime',              # Volatility regime indicator
+    'Absorption_Ratio',       # Buying/selling exhaustion
+    'Trade_Intensity',        # Volume intensity
 ]
 
 
@@ -645,95 +658,47 @@ def compute_confidence_scalar(pred_score, threshold, max_scale=1.5, min_scale=0.
 def determine_entry(row, pred, threshold, ticker, regime_mgr, portfolio_mgr,
                     filter_counter, params):
     """
-    Multi-confirmation entry decision for one bar.
+    V11: Simplified entry for backtesting — prediction threshold only.
+
+    Complex filters (COFI, regime-MR, session, portfolio capacity) belong
+    in the live bot, not the backtester. The backtest should test what the
+    MODEL predicts, not what a stack of filters allows through.
 
     Returns (should_enter: bool, direction: str, size_scalar: float)
     """
     fc = filter_counter
 
-    # Update regime from current bar features
+    # Update regime state (needed for sizing, even if we don't gate on it)
     regime = regime_mgr.update(
         float(row.get('Regime_Trending', 0)),
         float(row.get('Regime_MeanRev', 1)),
         float(row.get('Regime_Volatile', 0)),
     )
 
-    # Gate 1: prediction threshold
+    # ONLY gate: prediction must exceed threshold
     if abs(pred) < threshold:
         if fc:
             fc.increment('below_threshold')
         return False, None, 0.0
 
+    if fc:
+        fc.increment('passed_pred_threshold')
+
     raw_dir = 'long' if pred > 0 else 'short'
 
-    # Gate 2: regime short filter
-    if raw_dir == 'short' and not regime_mgr.allow_short():
-        if fc:
-            fc.increment('regime_no_short')
-        return False, None, 0.0
-
-    # Gate 3: COFI alignment
-    cofi = float(row.get('COFI', 0.0))
-    cofi_conflict_threshold = float(params.get('cofi_conflict_threshold', 0.8))
-    if raw_dir == 'long' and cofi < -cofi_conflict_threshold:
-        if fc:
-            fc.increment('cofi_conflict')
-        return False, None, 0.0
-    if raw_dir == 'short' and cofi > cofi_conflict_threshold:
-        if fc:
-            fc.increment('cofi_conflict')
-        return False, None, 0.0
-
-    # Gate 4: regime-signal consistency
-    mr_score = float(row.get('MR_Score', 0.0))
-
-    if regime == REGIME_MEAN_REVERTING:
-        mr_min = float(params.get('mr_score_min', 0.5))
-        if raw_dir == 'long' and mr_score > mr_min:
-            if fc:
-                fc.increment('regime_mr_conflict')
-            return False, None, 0.0
-        if raw_dir == 'short' and mr_score < -mr_min:
-            if fc:
-                fc.increment('regime_mr_conflict')
-            return False, None, 0.0
-
-    # Gate 5: session filter
-    session_progress = float(row.get('Session_Progress', 0.5))
-    if session_progress > 0.92:
-        if fc:
-            fc.increment('session_end_filter')
-        return False, None, 0.0
-
-    # Gate 6: portfolio capacity
-    kelly_approx = 0.02
-    capacity = portfolio_mgr.allowable_size(ticker, raw_dir, kelly_approx)
-    if capacity < 0.001:
-        if fc:
-            fc.increment('portfolio_capacity')
-        return False, None, 0.0
-
-    # Compute conviction score for size scalar
-    weights = regime_mgr.get_signal_weights()
+    # Size scaling based on regime (soft, not gating)
     base_size = regime_mgr.get_size_scalar()
 
-    pred_norm = min(abs(pred) / max(threshold, 1e-10), 2.0)
-    cofi_norm = min(abs(cofi) / 4.0, 1.0)
-    cs_norm = min(abs(float(row.get('CS_Mom_Rank', 0.0))) / 4.0, 1.0)
-    mr_norm = min(abs(mr_score) / 4.0, 1.0)
+    # Confidence scaling: stronger predictions get larger sizes
+    confidence_ratio = abs(pred) / max(threshold, 1e-10)
+    conf_scale = min(1.5, 0.75 + 0.25 * min(confidence_ratio, 3.0))
 
-    conviction = (
-        weights['model'] * pred_norm +
-        weights['cofi'] * cofi_norm +
-        weights['cs_rank'] * cs_norm +
-        weights['mr'] * mr_norm
-    )
+    size_scalar = base_size * conf_scale
 
-    # Kyle Lambda: reduce size in thin markets
-    kyle = float(row.get('Kyle_Lambda', 0.0))
-    liquidity_scalar = max(0.5, 1.0 + min(0.3, kyle * 0.15))
-
-    size_scalar = base_size * min(1.5, 0.5 + conviction) * liquidity_scalar
+    # Shorts get reduced size (long bias for equities)
+    if raw_dir == 'short':
+        direction_bias = float(params.get('direction_bias', 0.7))
+        size_scalar *= direction_bias
 
     if fc:
         fc.increment('entry_confirmed')
@@ -775,9 +740,9 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
 
     regime_mgr = RegimeManager()
     portfolio_mgr = PortfolioManager(
-        max_gross=params.get('max_gross', 1.2),
-        max_net=params.get('max_net', 0.4),
-        max_single=0.25,
+        max_gross=params.get('max_gross', 2.0),
+        max_net=params.get('max_net', 1.0),
+        max_single=0.50,
     )
 
     win_count = 0
@@ -1218,24 +1183,24 @@ def create_optuna_objective(predictions_cache_by_bucket):
     Single objective with composite score (PF + Sharpe + DD + trades + consistency).
     """
     def objective(trial):
-        # V10: 5 discrete parameters to prevent overfitting
+        # V11: 7 params — categorical for structural, narrow continuous for tuning
         sl_mult = trial.suggest_categorical("sl_mult", [1.0, 1.5, 2.0, 2.5])
-        tp_rr = trial.suggest_categorical("tp_rr", [2.0, 3.0, 4.0, 5.0])
+        tp_rr = trial.suggest_float("tp_rr", 1.5, 4.0)
         tp_mult = sl_mult * tp_rr
-        max_bars = trial.suggest_categorical("max_bars", [8, 10, 12, 14])
-        pred_threshold_pct = trial.suggest_categorical("pred_threshold_pct", [0.60, 0.65, 0.70, 0.75, 0.80])
-        trail_mult = trial.suggest_categorical("trail_mult", [0.8, 1.0, 1.5, 2.0])
+        max_bars = trial.suggest_categorical("max_bars", [6, 8, 10, 12, 14, 16])
+        pred_threshold_pct = trial.suggest_float("pred_threshold_pct", 0.50, 0.80)
+        trail_mult = trial.suggest_float("trail_mult", 0.5, 2.0)
+        scale_out_r = trial.suggest_float("scale_out_r", 1.0, 2.5)
+        direction_bias = trial.suggest_float("direction_bias", 0.4, 1.0)
 
-        # Hard-coded defaults — no longer optimized
+        # Hard-coded defaults
         hurst_limit = 0.60
         adx_min = 0
-        scale_out_r = 1.5
         regime_filter_mode = 'soft'
-        direction_bias = 0.7
         cofi_conflict_threshold = 1.0
         mr_score_min = 1.0
-        max_gross = 1.0
-        max_net = 0.3
+        max_gross = 1.5
+        max_net = 0.5
 
         # Pack into params dict
         trial_params = {
@@ -1243,6 +1208,7 @@ def create_optuna_objective(predictions_cache_by_bucket):
             'mr_score_min': mr_score_min,
             'max_gross': max_gross,
             'max_net': max_net,
+            'direction_bias': direction_bias,
         }
 
         # Pick the label bucket whose SL/TP best matches this trial
@@ -1281,8 +1247,23 @@ def create_optuna_objective(predictions_cache_by_bucket):
 
         n_trades = len(all_trades)
 
-        # ── Hard gates (reject immediately) ──
-        if n_trades < 50:
+        # DIAGNOSTIC: Log trade generation stats for first 5 trials
+        if trial.number < 5:
+            print(f"\n      [DIAG Trial {trial.number}] n_trades={n_trades}, "
+                  f"tickers_with_trades={len(tickers_with_trades)}/{len(predictions_cache)}")
+            if n_trades > 0:
+                outcomes = [t[0] for t in all_trades]
+                print(f"      [DIAG] Mean PnL={np.mean(outcomes):.4f}, "
+                      f"StdDev={np.std(outcomes):.4f}, "
+                      f"PF={sum(x for x in outcomes if x > 0) / max(abs(sum(x for x in outcomes if x < 0)), 1e-10):.3f}")
+            if filter_counter:
+                fc_c = filter_counter.counts
+                print(f"      [DIAG] Bars evaluated: {fc_c.get('raw_bars_evaluated', 0)}, "
+                      f"Below threshold: {fc_c.get('below_threshold', 0)}, "
+                      f"Entry confirmed: {fc_c.get('entry_confirmed', 0)}")
+
+        # Graduated trade count penalty (no hard cutoff except bare minimum)
+        if n_trades < 15:
             return -5.0
 
         metrics = compute_risk_metrics(all_trades)
@@ -1292,51 +1273,65 @@ def create_optuna_objective(predictions_cache_by_bucket):
         dd = abs(metrics['MaxDD_R'])
         sharpe = metrics['Sharpe']
 
-        if pf < 1.02:
-            return -5.0
-
-        if sharpe < 0.0:
-            return -3.0
-
-        if wr < 0.35:
-            return -3.0
-
-        # Per-ticker gate: at least 4/6 tickers must have PF >= 0.90
-        ticker_pfs = {}
-        for t, t_results in per_ticker_trades.items():
-            if len(t_results) >= 15:
-                t_metrics = compute_risk_metrics(t_results)
-                ticker_pfs[t] = t_metrics.get('PF_Raw', 0)
-
-        profitable_tickers = sum(1 for v in ticker_pfs.values() if v >= 0.90)
-        if len(ticker_pfs) >= 4 and profitable_tickers < max(4, int(len(ticker_pfs) * 0.6)):
-            return -2.0
-
         # ── L/S scoring using CORRECT direction-based trades ──
         long_trades = [t for t in all_trades if len(t) >= 5 and t[4] == 'LONG']
         short_trades = [t for t in all_trades if len(t) >= 5 and t[4] == 'SHORT']
 
-        long_metrics = compute_risk_metrics(long_trades) if len(long_trades) >= 10 else {}
-        short_metrics = compute_risk_metrics(short_trades) if len(short_trades) >= 10 else {}
+        long_metrics = compute_risk_metrics(long_trades) if len(long_trades) >= 8 else {}
+        short_metrics = compute_risk_metrics(short_trades) if len(short_trades) >= 8 else {}
 
         long_pf = long_metrics.get('PF_Raw', 0.5) if long_metrics else 0.5
         short_pf = short_metrics.get('PF_Raw', 0.5) if short_metrics else 0.5
-        ls_health = min(long_pf, short_pf) / max(long_pf, short_pf) if max(long_pf, short_pf) > 0 else 0
 
         n_long = len(long_trades)
         n_short = len(short_trades)
         balance = min(n_long, n_short) / max(max(n_long, n_short), 1)
 
-        # ── Score: Sharpe-first, penalized by concentration ──
-        ticker_consistency = profitable_tickers / max(len(ticker_pfs), 1)
-        trade_sufficiency = min(1.0, np.log(max(n_trades, 30) / 30) / np.log(500 / 30))
+        # Per-ticker consistency
+        ticker_pfs = {}
+        for t, t_results in per_ticker_trades.items():
+            if len(t_results) >= 10:
+                t_metrics = compute_risk_metrics(t_results)
+                ticker_pfs[t] = t_metrics.get('PF_Raw', 0)
 
+        profitable_tickers = sum(1 for v in ticker_pfs.values() if v >= 0.95)
+        ticker_consistency = profitable_tickers / max(len(ticker_pfs), 1)
+
+        # ── Graduated scoring (all components continuous, no cliffs) ──
+
+        # PF: log-scale, centered at PF=1.0
+        pf_score = np.clip(np.log(max(pf, 0.01)) / np.log(2.0), -1.5, 1.0)
+
+        # Sharpe: linear, capped
+        sharpe_score = np.clip(sharpe / 3.0, -1.0, 1.0)
+
+        # Drawdown: penalize deep drawdowns
+        dd_per_trade = dd / max(n_trades, 1)
+        dd_score = np.clip(1.0 - dd_per_trade / 2.0, -1.0, 1.0)
+
+        # Trade count: log-scale bonus for statistical robustness
+        trade_score = np.clip(np.log(max(n_trades, 1) / 15) / np.log(500 / 15), 0.0, 1.0)
+
+        # Win rate: bonus for consistency
+        wr_score = np.clip((wr - 0.35) / 0.30, -0.5, 1.0)
+
+        # L/S health: are both sides profitable?
+        ls_health = 0.0
+        if long_pf > 0 and short_pf > 0:
+            ls_health = np.clip(
+                (np.log(max(long_pf, 0.5)) + np.log(max(short_pf, 0.5))) / (2 * np.log(2.0)),
+                -0.5, 1.0
+            )
+
+        # FINAL composite: PF and Sharpe dominate
         score = (
-            0.40 * min(sharpe / 3.0, 1.0) +
-            0.25 * min(np.log(max(pf, 1.0)) / np.log(2.0), 1.0) +
+            0.30 * pf_score +
+            0.25 * sharpe_score +
             0.15 * ticker_consistency +
-            0.10 * trade_sufficiency +
-            0.10 * ls_health
+            0.10 * trade_score +
+            0.10 * wr_score +
+            0.05 * dd_score +
+            0.05 * ls_health
         )
 
         trial.set_user_attr("metrics", metrics)
@@ -1369,12 +1364,12 @@ def create_optuna_objective(predictions_cache_by_bucket):
 def main():
     global _UNIVERSE_RETURNS
 
-    console.print("[bold green]GOD MODE BACKTESTER V10.0 (ANTI-OVERFIT)[/bold green]")
+    console.print("[bold green]GOD MODE BACKTESTER V11.0 (BALANCED EDGE)[/bold green]")
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
-    console.print(f"[dim]Features: {len(CORE_FEATURES)} core | Pruning: disabled (curated)[/dim]")
-    console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} (5 categorical params) | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
-    console.print(f"[dim]V10: Gate-based objective, 60/40 opt/val split, aggressive regularization[/dim]\n")
+    console.print(f"[dim]Features: {len(CORE_FEATURES)} core | Pruning: top {int(PRUNE_KEEP_RATIO*100)}%[/dim]")
+    console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} (7 params) | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
+    console.print(f"[dim]V11: Graduated scoring, 75/25 opt/val split, moderate regularization[/dim]\n")
 
     # ── 1. Download & Prep (parallel) ──
     raw_cache = {}
@@ -1505,46 +1500,51 @@ def main():
         optuna_cache_by_bucket[bucket_key] = {}
         validation_cache_by_bucket[bucket_key] = {}
         for ticker, df_pred in ticker_dfs.items():
-            split_point = int(len(df_pred) * 0.6)
+            split_point = int(len(df_pred) * 0.75)
             optuna_cache_by_bucket[bucket_key][ticker] = df_pred.iloc[:split_point].copy()
             validation_cache_by_bucket[bucket_key][ticker] = df_pred.iloc[split_point:].copy()
-    print(f"   Split predictions: 60% optimization / 40% validation")
+    print(f"   Split predictions: 75% optimization / 25% validation")
 
     # ── 3. Optuna Optimization (single objective, composite score) ──
     print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials, single-objective composite)...")
 
     try:
         study = optuna.create_study(
-            study_name="hedge_fund_v10",
+            study_name="hedge_fund_v11",
             direction="maximize",
             storage=OPTUNA_STORAGE,
             load_if_exists=False,
             sampler=optuna.samplers.TPESampler(
-                n_startup_trials=10,
+                n_startup_trials=15,
                 multivariate=True,
                 seed=42,
             ),
             pruner=optuna.pruners.MedianPruner(
-                n_startup_trials=8,
+                n_startup_trials=10,
                 n_warmup_steps=0,
             ),
         )
         print(f"   Optuna study persisted to {OPTUNA_STORAGE}")
     except Exception:
         study = optuna.create_study(
-            study_name="hedge_fund_v10",
+            study_name="hedge_fund_v11",
             direction="maximize",
-            sampler=optuna.samplers.TPESampler(n_startup_trials=10, multivariate=True, seed=42),
+            sampler=optuna.samplers.TPESampler(n_startup_trials=15, multivariate=True, seed=42),
         )
         print("   Optuna study in-memory (SQLite unavailable)")
 
-    # Warm-start with known-good parameter combos (must match categorical values)
+    # Warm-start with known-good parameter combos
     seed_configs = [
-        {'sl_mult': 2.5, 'tp_rr': 2.0, 'max_bars': 14, 'pred_threshold_pct': 0.75, 'trail_mult': 1.0},
-        {'sl_mult': 2.0, 'tp_rr': 3.0, 'max_bars': 12, 'pred_threshold_pct': 0.70, 'trail_mult': 1.5},
-        {'sl_mult': 1.5, 'tp_rr': 2.0, 'max_bars': 10, 'pred_threshold_pct': 0.65, 'trail_mult': 1.0},
-        {'sl_mult': 1.0, 'tp_rr': 2.0, 'max_bars': 8, 'pred_threshold_pct': 0.60, 'trail_mult': 0.8},
-        {'sl_mult': 2.0, 'tp_rr': 2.0, 'max_bars': 12, 'pred_threshold_pct': 0.70, 'trail_mult': 1.0},
+        {'sl_mult': 2.5, 'tp_rr': 2.0, 'max_bars': 14, 'pred_threshold_pct': 0.70,
+         'trail_mult': 1.0, 'scale_out_r': 1.5, 'direction_bias': 0.7},
+        {'sl_mult': 2.0, 'tp_rr': 2.5, 'max_bars': 12, 'pred_threshold_pct': 0.65,
+         'trail_mult': 1.2, 'scale_out_r': 1.5, 'direction_bias': 0.7},
+        {'sl_mult': 1.5, 'tp_rr': 2.0, 'max_bars': 10, 'pred_threshold_pct': 0.60,
+         'trail_mult': 1.0, 'scale_out_r': 1.5, 'direction_bias': 0.8},
+        {'sl_mult': 1.0, 'tp_rr': 2.0, 'max_bars': 8, 'pred_threshold_pct': 0.55,
+         'trail_mult': 0.8, 'scale_out_r': 1.2, 'direction_bias': 0.7},
+        {'sl_mult': 2.0, 'tp_rr': 3.0, 'max_bars': 12, 'pred_threshold_pct': 0.70,
+         'trail_mult': 1.5, 'scale_out_r': 2.0, 'direction_bias': 0.6},
     ]
     for sp in seed_configs:
         study.enqueue_trial(sp)
@@ -1608,7 +1608,7 @@ def main():
 
     # ── 5. Display top results ──
     print("\n" + "=" * 110)
-    print("TOP 10 OPTIMIZED CONFIGS - V7 COMPOSITE SCORE")
+    print("TOP 10 OPTIMIZED CONFIGS - V11 GRADUATED SCORE")
     print("=" * 110)
 
     table = Table(show_header=True, header_style="bold magenta",
