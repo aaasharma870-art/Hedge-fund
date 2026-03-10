@@ -90,6 +90,9 @@ from hedge_fund.features import (
     compute_atr_channel_pos,
     EXPECTED_FEATURES,
 )
+from hedge_fund.signals import SIGNAL_NAMES as INSTITUTIONAL_SIGNAL_NAMES
+from hedge_fund.regime import RegimeManager, REGIME_TRENDING, REGIME_MEAN_REVERTING, REGIME_VOLATILE
+from hedge_fund.portfolio import PortfolioManager
 from hedge_fund.data import RateLimiter
 from hedge_fund.governance import MonteCarloGovernor
 from hedge_fund.risk import kelly_criterion, SlippageCalculator
@@ -112,34 +115,30 @@ KEYS = {
 IO_WORKERS = 16
 
 # --- Data window ---
-LOOKBACK_DAYS = 1095  # 3 years
+# Use Polygon for 2-year lookback if API key available, else yfinance 57-day limit
+_HAS_POLYGON_KEY = bool(os.environ.get("POLYGON_API_KEY", ""))
+if _HAS_POLYGON_KEY:
+    LOOKBACK_DAYS = 504   # 2 years
+    WF_TRAIN_BARS = 6000
+    WF_TEST_BARS = 2000
+    WF_STEP_BARS = 2000
+    HOLDOUT_BARS_CFG = 2000
+else:
+    LOOKBACK_DAYS = 57    # yfinance 60-day limit for 15m bars
+    WF_TRAIN_BARS = 1500
+    WF_TEST_BARS = 500
+    WF_STEP_BARS = 500
+    HOLDOUT_BARS_CFG = 500
 
 # --- Walk-forward settings ---
-WF_TRAIN_BARS = 1500   # ~9 months of hourly bars for training
-WF_TEST_BARS = 500     # ~3 months of hourly bars for testing
-WF_STEP_BARS = 500     # step forward by 3 months each window
+# (set above based on data source)
 
 # --- Execution cost model (via SlippageCalculator) ---
 SLIPPAGE = SlippageCalculator(spread_pct=0.03, impact_pct=0.02)
 ROUND_TRIP_COST_PCT = SLIPPAGE.round_trip_pct()
 
-# --- Diversified universe ---
-TICKERS = [
-    # Tech / Growth
-    'NVDA', 'PLTR', 'TSLA', 'AMD', 'MSFT', 'META',
-    # Small-cap momentum
-    'RKLB', 'ASTS',
-    # Financials
-    'JPM', 'GS',
-    # Healthcare
-    'UNH', 'LLY',
-    # Energy
-    'XOM', 'CVX',
-    # Industrials
-    'CAT', 'GE',
-    # Consumer
-    'AMZN', 'COST',
-]
+# --- Focused L/S universe (verified profitable tickers) ---
+TICKERS = ['RKLB', 'AMD', 'GS', 'COST', 'GE', 'ASTS']
 
 # --- Monte Carlo settings ---
 MONTE_CARLO_RUNS = 1000
@@ -149,7 +148,7 @@ PRUNE_FEATURES = True
 PRUNE_KEEP_RATIO = 0.5
 
 # --- Optuna settings ---
-OPTUNA_N_TRIALS = 150    # Bayesian optimization trials
+OPTUNA_N_TRIALS = 300    # Bayesian optimization trials (6 tickers = fast per trial)
 OPTUNA_TIMEOUT = None    # No time limit (set to seconds to cap)
 OPTUNA_STORAGE = "sqlite:///optuna_backtester.db"  # Persistent study storage
 
@@ -164,7 +163,7 @@ LABEL_BUCKETS = [
 ]
 
 # --- Holdout settings ---
-HOLDOUT_BARS = 500  # Reserve last ~3 months as final validation
+HOLDOUT_BARS = HOLDOUT_BARS_CFG
 
 # --- Ensemble settings ---
 USE_ENSEMBLE = True  # Use XGBoost + LightGBM + Ridge stacked ensemble
@@ -260,14 +259,14 @@ class Polygon_Helper:
 # FEATURE ENGINEERING
 # ==============================================================================
 
-ALL_FEATURES = list(EXPECTED_FEATURES)
+ALL_FEATURES = list(EXPECTED_FEATURES) + INSTITUTIONAL_SIGNAL_NAMES
 
 
 # Global market proxy returns - set during data loading
 _UNIVERSE_RETURNS = None
 
 
-def prepare_features(df, universe_returns=None):
+def prepare_features(df, universe_returns=None, ticker=None, all_closes=None, all_volumes=None):
     """Compute all features on a DataFrame of OHLCV bars."""
     df = df.copy()
 
@@ -347,6 +346,20 @@ def prepare_features(df, universe_returns=None):
     # Keep ATR for label generation and EMA for reference (not in feature list)
     df['EMA_50'] = df['Close'].ewm(span=50).mean()
     df['EMA_200'] = df['Close'].ewm(span=200).mean()
+
+    # Institutional signals — additive layer, does not modify existing features
+    try:
+        from hedge_fund.signals import compute_all_signals
+        df = compute_all_signals(
+            df=df,
+            ticker=ticker if ticker else 'UNKNOWN',
+            all_closes=all_closes,
+            all_volumes=all_volumes,
+            universe_returns=universe_returns,
+        )
+    except Exception as e:
+        import warnings as _warnings
+        _warnings.warn(f"Institutional signals failed for {ticker}: {e}. Using base features.")
 
     df.dropna(inplace=True)
     return df
@@ -559,6 +572,7 @@ class TradeFilterCounter:
     def __init__(self):
         self.counts = {
             'raw_bars_evaluated': 0,
+            'below_threshold': 0,
             'passed_pred_threshold': 0,
             'killed_by_vpin': 0,
             'killed_by_amihud': 0,
@@ -566,6 +580,12 @@ class TradeFilterCounter:
             'killed_by_hurst': 0,
             'killed_by_vwap_extreme': 0,
             'killed_by_insufficient_bars': 0,
+            'regime_no_short': 0,
+            'cofi_conflict': 0,
+            'regime_mr_conflict': 0,
+            'session_end_filter': 0,
+            'portfolio_capacity': 0,
+            'entry_confirmed': 0,
             'submitted_to_simulation': 0,
             'executed_tp': 0,
             'executed_sl': 0,
@@ -612,13 +632,112 @@ def compute_confidence_scalar(pred_score, threshold, max_scale=1.5, min_scale=0.
     return float(np.clip(scale, min_scale, max_scale))
 
 
+def determine_entry(row, pred, threshold, ticker, regime_mgr, portfolio_mgr,
+                    filter_counter, params):
+    """
+    Multi-confirmation entry decision for one bar.
+
+    Returns (should_enter: bool, direction: str, size_scalar: float)
+    """
+    fc = filter_counter
+
+    # Update regime from current bar features
+    regime = regime_mgr.update(
+        float(row.get('Regime_Trending', 0)),
+        float(row.get('Regime_MeanRev', 1)),
+        float(row.get('Regime_Volatile', 0)),
+    )
+
+    # Gate 1: prediction threshold
+    if abs(pred) < threshold:
+        if fc:
+            fc.increment('below_threshold')
+        return False, None, 0.0
+
+    raw_dir = 'long' if pred > 0 else 'short'
+
+    # Gate 2: regime short filter
+    if raw_dir == 'short' and not regime_mgr.allow_short():
+        if fc:
+            fc.increment('regime_no_short')
+        return False, None, 0.0
+
+    # Gate 3: COFI alignment
+    cofi = float(row.get('COFI', 0.0))
+    cofi_conflict_threshold = float(params.get('cofi_conflict_threshold', 0.8))
+    if raw_dir == 'long' and cofi < -cofi_conflict_threshold:
+        if fc:
+            fc.increment('cofi_conflict')
+        return False, None, 0.0
+    if raw_dir == 'short' and cofi > cofi_conflict_threshold:
+        if fc:
+            fc.increment('cofi_conflict')
+        return False, None, 0.0
+
+    # Gate 4: regime-signal consistency
+    mr_score = float(row.get('MR_Score', 0.0))
+
+    if regime == REGIME_MEAN_REVERTING:
+        mr_min = float(params.get('mr_score_min', 0.5))
+        if raw_dir == 'long' and mr_score > mr_min:
+            if fc:
+                fc.increment('regime_mr_conflict')
+            return False, None, 0.0
+        if raw_dir == 'short' and mr_score < -mr_min:
+            if fc:
+                fc.increment('regime_mr_conflict')
+            return False, None, 0.0
+
+    # Gate 5: session filter
+    session_progress = float(row.get('Session_Progress', 0.5))
+    if session_progress > 0.92:
+        if fc:
+            fc.increment('session_end_filter')
+        return False, None, 0.0
+
+    # Gate 6: portfolio capacity
+    kelly_approx = 0.02
+    capacity = portfolio_mgr.allowable_size(ticker, raw_dir, kelly_approx)
+    if capacity < 0.001:
+        if fc:
+            fc.increment('portfolio_capacity')
+        return False, None, 0.0
+
+    # Compute conviction score for size scalar
+    weights = regime_mgr.get_signal_weights()
+    base_size = regime_mgr.get_size_scalar()
+
+    pred_norm = min(abs(pred) / max(threshold, 1e-10), 2.0)
+    cofi_norm = min(abs(cofi) / 4.0, 1.0)
+    cs_norm = min(abs(float(row.get('CS_Mom_Rank', 0.0))) / 4.0, 1.0)
+    mr_norm = min(abs(mr_score) / 4.0, 1.0)
+
+    conviction = (
+        weights['model'] * pred_norm +
+        weights['cofi'] * cofi_norm +
+        weights['cs_rank'] * cs_norm +
+        weights['mr'] * mr_norm
+    )
+
+    # Kyle Lambda: reduce size in thin markets
+    kyle = float(row.get('Kyle_Lambda', 0.0))
+    liquidity_scalar = max(0.5, 1.0 + min(0.3, kyle * 0.15))
+
+    size_scalar = base_size * min(1.5, 0.5 + conviction) * liquidity_scalar
+
+    if fc:
+        fc.increment('entry_confirmed')
+    return True, raw_dir, size_scalar
+
+
 def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars,
                              trail_mult=None, filter_mode="MINIMAL",
                              hurst_limit=0.5, adx_min=0,
                              scale_out_r=1.5, use_kelly=True,
                              regime_filter_mode='soft',
                              filter_counter=None,
-                             direction_bias=1.0):
+                             direction_bias=1.0,
+                             params=None):
     """
     V7 stateful trade simulation with:
     - Percentile-based pred_threshold (already computed as raw value)
@@ -635,11 +754,21 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
     if test_df is None or len(test_df) == 0:
         return []
 
+    if params is None:
+        params = {}
+
     rr = tp_mult / sl_mult
     trades = []
 
     governor = MonteCarloGovernor(dd_warning=0.05, dd_critical=0.08,
                                   lookback_trades=50, update_interval=0)
+
+    regime_mgr = RegimeManager()
+    portfolio_mgr = PortfolioManager(
+        max_gross=params.get('max_gross', 1.2),
+        max_net=params.get('max_net', 0.4),
+        max_single=0.25,
+    )
 
     win_count = 0
     loss_count = 0
@@ -650,9 +779,7 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
     high = test_df['High'].values
     low = test_df['Low'].values
     atr_vals = test_df['ATR'].values
-    hurst_vals = test_df.get('Hurst_Exponent', test_df.get('Hurst', pd.Series(0.5, index=test_df.index))).values
-    adx_vals = test_df['ADX'].values
-    ticker = test_df.get('_ticker', pd.Series('UNK', index=test_df.index)).values
+    ticker_col = test_df.get('_ticker', pd.Series('UNK', index=test_df.index)).values
 
     # Compute vol regime scalars
     returns_series = pd.Series(close).pct_change()
@@ -667,29 +794,31 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
 
         row = test_df.iloc[i]
         pred_r = row['Predictions']
+        tick = ticker_col[i] if i < len(ticker_col) else 'UNK'
 
-        if abs(pred_r) < pred_threshold:
+        # Use determine_entry for multi-confirmation gating
+        should_enter, direction, size_scalar = determine_entry(
+            row=row,
+            pred=pred_r,
+            threshold=pred_threshold,
+            ticker=tick,
+            regime_mgr=regime_mgr,
+            portfolio_mgr=portfolio_mgr,
+            filter_counter=fc,
+            params=params,
+        )
+        if not should_enter:
             i += 1
             continue
 
-        if fc:
-            fc.increment('passed_pred_threshold')
+        side = direction.upper()
 
-        # VPIN toxicity filter
-        if row.get('VPIN', 0.0) > 0.85:
-            if fc:
-                fc.increment('killed_by_vpin')
-            i += 1
-            continue
-
-        # Amihud illiquidity filter
-        if row.get('Amihud_Illiquidity', 0.5) > 0.90:
-            if fc:
-                fc.increment('killed_by_amihud')
-            i += 1
-            continue
-
-        side = 'LONG' if pred_r > 0 else 'SHORT'
+        # Get regime-adjusted SL/TP
+        regime_sl, regime_tp_rr, mb_scalar = portfolio_mgr.regime_params(
+            tick, sl_mult, rr, direction, regime_mgr.current_regime
+        )
+        effective_tp_mult = regime_sl * regime_tp_rr
+        effective_max_bars = int(max_bars * mb_scalar)
 
         # --- Trade execution ---
         idx = i
@@ -699,14 +828,14 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
             i += 1
             continue
 
-        sl_dist = sl_mult * a
-        tp_dist = tp_mult * a
+        sl_dist = regime_sl * a
+        tp_dist = effective_tp_mult * a
         sl = entry - sl_dist if side == 'LONG' else entry + sl_dist
         tp = entry + tp_dist if side == 'LONG' else entry - tp_dist
 
         trail_dist = (trail_mult * a) if trail_mult else None
 
-        end_idx = min(idx + max_bars + 1, len(test_df))
+        end_idx = min(idx + effective_max_bars + 1, len(test_df))
         future_high = high[idx + 1:end_idx]
         future_low = low[idx + 1:end_idx]
 
@@ -719,16 +848,18 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
         if fc:
             fc.increment('submitted_to_simulation')
 
+        effective_rr = effective_tp_mult / regime_sl if regime_sl > 0 else rr
+
         # Simulate exit with partial profit
         partial_r = _simulate_with_partial(
-            future_high, future_low, close, idx, max_bars,
+            future_high, future_low, close, idx, effective_max_bars,
             entry, sl, tp, sl_dist, side, trail_dist,
-            scale_out_r=scale_out_r, rr=rr
+            scale_out_r=scale_out_r, rr=effective_rr
         )
 
         outcome = partial_r['total_r']
         is_resolved = partial_r['resolved']
-        bars_held = partial_r.get('bars_held', max_bars)
+        bars_held = partial_r.get('bars_held', effective_max_bars)
 
         # Track outcome type
         if fc:
@@ -744,7 +875,7 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
         outcome -= cost_r
 
         # --- Position sizing ---
-        pos_size = 1.0
+        pos_size = size_scalar
 
         # Kelly sizing
         if use_kelly and win_count + loss_count >= 20:
@@ -752,39 +883,11 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
             avg_w = total_win_r / win_count if win_count > 0 else rr
             avg_l = total_loss_r / loss_count if loss_count > 0 else 1.0
             kelly_frac = kelly_criterion(wr, avg_w, avg_l, shrinkage=0.35)
-            pos_size = float(np.clip(kelly_frac / 0.015, 0.5, 2.0))
+            pos_size *= float(np.clip(kelly_frac / 0.015, 0.5, 2.0))
 
         # Direction bias: reduce short position sizes
         if side == 'SHORT' and direction_bias < 1.0:
             pos_size *= direction_bias
-
-        # Confidence scalar
-        conf_scalar = compute_confidence_scalar(abs(pred_r), pred_threshold)
-        pos_size *= conf_scalar
-
-        # ADX soft filter (reduce size when ADX < adx_min, don't block)
-        if adx_min > 0 and adx_vals[idx] < adx_min:
-            adx_scalar = 0.5 + 0.5 * (adx_vals[idx] / max(adx_min, 1e-6))
-            pos_size *= adx_scalar
-
-        # Hurst directional soft filter
-        hurst_val = hurst_vals[idx]
-        pred_direction = 1 if pred_r > 0 else -1
-        if regime_filter_mode == 'soft':
-            if pred_direction > 0:
-                hurst_scalar = 0.5 + 0.5 * (hurst_val / max(hurst_limit, 0.01))
-                hurst_scalar = min(1.5, hurst_scalar)
-            else:
-                hurst_scalar = 0.5 + 0.5 * ((1 - hurst_val) / max(1 - hurst_limit, 0.01))
-                hurst_scalar = min(1.5, hurst_scalar)
-            pos_size *= max(0.3, hurst_scalar)
-        else:
-            # Hard mode
-            if hurst_val > hurst_limit:
-                if fc:
-                    fc.increment('killed_by_hurst')
-                i += 1
-                continue
 
         # Vol regime scalar
         if idx < len(vol_scalars):
@@ -798,8 +901,10 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
         pos_size = min(pos_size, 3.0)
 
         final_pnl = outcome * pos_size
-        tick = ticker[idx] if idx < len(ticker) else 'UNK'
         trades.append((final_pnl, is_resolved, pos_size, tick))
+
+        # Register in portfolio and remove after trade
+        portfolio_mgr.add(tick, direction, pos_size * 0.02)
 
         # Update running stats
         if outcome > 0:
@@ -810,6 +915,9 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
             total_loss_r += abs(outcome)
 
         governor.add_trade(pnl=final_pnl, risk_dollars=1.0, side=side)
+
+        # Remove from portfolio after trade completes
+        portfolio_mgr.remove(tick)
 
         i += max(bars_held, 2)
 
@@ -1100,7 +1208,7 @@ def create_optuna_objective(predictions_cache_by_bucket):
     Single objective with composite score (PF + Sharpe + DD + trades + consistency).
     """
     def objective(trial):
-        # V7 search space
+        # V9 search space
         pred_threshold_pct = trial.suggest_float("pred_threshold_pct", 0.55, 0.85)
         sl_mult = trial.suggest_float("sl_mult", 0.8, 3.0)
         tp_rr = trial.suggest_float("tp_rr", 1.5, 5.0)
@@ -1114,6 +1222,20 @@ def create_optuna_objective(predictions_cache_by_bucket):
         lambda_decay = trial.suggest_float("lambda_decay", 0.5, 4.0)
         direction_bias = trial.suggest_float("direction_bias", 0.3, 1.0)
 
+        # New regime and L/S parameters
+        cofi_conflict_threshold = trial.suggest_float('cofi_conflict', 0.3, 2.0)
+        mr_score_min = trial.suggest_float('mr_score_min', 0.3, 2.5)
+        max_gross = trial.suggest_float('max_gross', 0.7, 1.4)
+        max_net = trial.suggest_float('max_net', 0.15, 0.50)
+
+        # Pack into params dict
+        trial_params = {
+            'cofi_conflict_threshold': cofi_conflict_threshold,
+            'mr_score_min': mr_score_min,
+            'max_gross': max_gross,
+            'max_net': max_net,
+        }
+
         # Pick the label bucket whose SL/TP best matches this trial
         bucket_key = _pick_label_bucket(sl_mult, tp_rr)
         predictions_cache = predictions_cache_by_bucket.get(bucket_key, {})
@@ -1124,15 +1246,6 @@ def create_optuna_objective(predictions_cache_by_bucket):
         per_ticker_trades = {}
         tickers_with_trades = set()
         filter_counter = TradeFilterCounter()
-
-        # Compute per-ticker prediction confidence for weighting
-        all_pred_stds = []
-        for t, test_df in predictions_cache.items():
-            preds = test_df['Predictions'].dropna()
-            if len(preds) > 10:
-                all_pred_stds.append((t, float(np.std(preds))))
-        universe_avg_confidence = np.mean([s for _, s in all_pred_stds]) if all_pred_stds else 1.0
-        ticker_confidence_weights = {t: s / max(universe_avg_confidence, 1e-10) for t, s in all_pred_stds}
 
         for t, test_df in predictions_cache.items():
             # Compute percentile-based threshold from this ticker's predictions
@@ -1150,6 +1263,7 @@ def create_optuna_objective(predictions_cache_by_bucket):
                 regime_filter_mode=regime_filter_mode,
                 filter_counter=filter_counter,
                 direction_bias=direction_bias,
+                params=trial_params,
             )
             all_trades.extend(t_results)
             if t_results:
@@ -1158,7 +1272,7 @@ def create_optuna_objective(predictions_cache_by_bucket):
 
         n_trades = len(all_trades)
 
-        # Hard prune: too few trades (30 = ~1.7 per ticker minimum)
+        # Hard prune: too few trades
         if n_trades < 30:
             trial.report(-5.0, step=0)
             raise optuna.TrialPruned()
@@ -1180,7 +1294,6 @@ def create_optuna_objective(predictions_cache_by_bucket):
         sharpe_score = np.clip(min(sharpe, 3.0) / 3.0, -1.0, 1.0)
         dd_score = np.clip(1.0 - (avg_dd_per_trade / 3.0), -1.0, 1.0)
         trade_score = np.clip(np.log(max(n_trades, 1) / 30) / np.log(500 / 30), 0.0, 1.0)
-        ticker_score = np.clip(len(tickers_with_trades) / 5.0, 0.0, 1.0)
 
         # Per-ticker consistency: fraction of tickers with PF > 1.0
         ticker_pfs = {}
@@ -1188,16 +1301,33 @@ def create_optuna_objective(predictions_cache_by_bucket):
             if len(t_results) >= 5:
                 t_metrics = compute_risk_metrics(t_results)
                 ticker_pfs[t] = t_metrics.get('PF_Raw', 0)
-        n_profitable_tickers = sum(1 for pf_val in ticker_pfs.values() if pf_val > 1.0)
-        consistency_score = n_profitable_tickers / max(len(ticker_pfs), 1)
+
+        # L/S scoring: split trades by direction
+        long_trades = [t for t in all_trades if t[0] > 0 and t[1]]
+        short_trades = [t for t in all_trades if t[0] < 0 and t[1]]
+
+        long_metrics = compute_risk_metrics(long_trades) if len(long_trades) >= 8 else {}
+        short_metrics = compute_risk_metrics(short_trades) if len(short_trades) >= 8 else {}
+
+        long_pf = long_metrics.get('PF_Raw', 0.5) if long_metrics else 0.5
+        short_pf = short_metrics.get('PF_Raw', 0.5) if short_metrics else 0.5
+
+        n_long = len(long_trades)
+        n_short = len(short_trades)
+        balance = min(n_long, n_short) / max(max(n_long, n_short), 1)
+
+        ls_score = np.clip(
+            (np.log(max(long_pf, 0.01)) + np.log(max(short_pf, 0.01))) / (2 * np.log(4)),
+            -1, 1
+        )
 
         composite = (
             0.28 * pf_score +
-            0.22 * sharpe_score +
-            0.18 * dd_score +
-            0.15 * trade_score +
-            0.12 * consistency_score +
-            0.05 * ticker_score
+            0.22 * ls_score +
+            0.18 * sharpe_score +
+            0.15 * dd_score +
+            0.10 * trade_score +
+            0.07 * balance
         )
 
         trial.set_user_attr("metrics", metrics)
@@ -1211,8 +1341,12 @@ def create_optuna_objective(predictions_cache_by_bucket):
         trial.set_user_attr("win_rate", round(wr, 4))
         trial.set_user_attr("n_tickers_trading", len(tickers_with_trades))
         trial.set_user_attr("pred_threshold_pct", pred_threshold_pct)
-        trial.set_user_attr("n_profitable_tickers", n_profitable_tickers)
         trial.set_user_attr("ticker_pfs", {k: round(v, 3) for k, v in ticker_pfs.items()})
+        trial.set_user_attr('long_pf', round(long_pf, 3))
+        trial.set_user_attr('short_pf', round(short_pf, 3))
+        trial.set_user_attr('long_n', n_long)
+        trial.set_user_attr('short_n', n_short)
+        trial.set_user_attr('ls_balance', round(balance, 3))
 
         return composite
 
@@ -1226,40 +1360,56 @@ def create_optuna_objective(predictions_cache_by_bucket):
 def main():
     global _UNIVERSE_RETURNS
 
-    console.print("[bold green]GOD MODE BACKTESTER V7.0 (COMPLETE OVERHAUL)[/bold green]")
+    console.print("[bold green]GOD MODE BACKTESTER V9.0 (INSTITUTIONAL L/S)[/bold green]")
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
     console.print(f"[dim]Features: {len(ALL_FEATURES)} | Pruning: top {int(PRUNE_KEEP_RATIO*100)}%[/dim]")
     console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
-    console.print(f"[dim]V7: Percentile threshold, soft filters, OOF stacking, new features[/dim]\n")
+    console.print(f"[dim]V9: Institutional signals, regime-gated L/S, cross-sectional factors[/dim]\n")
 
     # ── 1. Download & Prep (parallel) ──
-    poly = Polygon_Helper()
     raw_cache = {}
-    print(f"Downloading data (3-year lookback, {IO_WORKERS} workers)...")
 
-    def _fetch_raw(t):
-        try:
-            raw = poly.fetch_data(t, days=LOOKBACK_DAYS, mult=1, timespan='hour')
-            if len(raw) > 500:
-                return t, raw
-            else:
-                print(f"   {t}: Insufficient data ({len(raw)} bars)")
+    if _HAS_POLYGON_KEY:
+        poly = Polygon_Helper()
+        print(f"Downloading data from Polygon ({LOOKBACK_DAYS}d lookback, {IO_WORKERS} workers)...")
+
+        def _fetch_raw(t):
+            try:
+                raw = poly.fetch_data(t, days=LOOKBACK_DAYS, mult=15, timespan='minute')
+                if len(raw) > 500:
+                    return t, raw
+                else:
+                    print(f"   {t}: Insufficient data ({len(raw)} bars)")
+                    return t, None
+            except Exception as e:
+                print(f"   {t}: Failed ({e})")
                 return t, None
-        except Exception as e:
-            print(f"   {t}: Failed ({e})")
-            return t, None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=IO_WORKERS) as executor:
-        futures = {executor.submit(_fetch_raw, t): t for t in TICKERS}
-        for future in concurrent.futures.as_completed(futures):
-            t, raw = future.result()
-            if raw is not None:
-                raw_cache[t] = raw
-                print(f"   {t}: {len(raw)} raw bars")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=IO_WORKERS) as executor:
+            futures = {executor.submit(_fetch_raw, t): t for t in TICKERS}
+            for future in concurrent.futures.as_completed(futures):
+                t, raw = future.result()
+                if raw is not None:
+                    raw_cache[t] = raw
+                    print(f"   {t}: {len(raw)} raw bars")
+    else:
+        import yfinance as yf
+        print(f"Downloading data from yfinance ({LOOKBACK_DAYS}d lookback, 15m bars)...")
+        for t in TICKERS:
+            try:
+                raw = yf.download(t, period=f'{LOOKBACK_DAYS}d', interval='15m', auto_adjust=True, progress=False)
+                if raw is not None and len(raw) > 200:
+                    raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
+                    raw_cache[t] = raw
+                    print(f"   {t}: {len(raw)} raw bars")
+                else:
+                    print(f"   {t}: Insufficient data ({len(raw) if raw is not None else 0} bars)")
+            except Exception as e:
+                print(f"   {t}: Failed ({e})")
 
     if not raw_cache:
-        print("No data available. Set POLYGON_API_KEY env var.")
+        print("No data available. Set POLYGON_API_KEY env var or ensure yfinance works.")
         return
 
     # ── 1b. Compute universe proxy returns ──
@@ -1269,12 +1419,27 @@ def main():
         all_returns[t] = raw['Close'].pct_change()
     _UNIVERSE_RETURNS = pd.DataFrame(all_returns).mean(axis=1)
 
-    # ── 1c. Prepare features ──
+    # ── 1c. Build cross-sectional structures for institutional signals ──
+    try:
+        _closes = {t: raw_cache[t]['Close'] for t in raw_cache if 'Close' in raw_cache[t].columns}
+        _volumes = {t: raw_cache[t]['Volume'] for t in raw_cache if 'Volume' in raw_cache[t].columns}
+        if len(_closes) >= 2:
+            all_closes_cs = pd.DataFrame(_closes)
+            all_volumes_cs = pd.DataFrame(_volumes)
+        else:
+            all_closes_cs = all_volumes_cs = None
+    except Exception:
+        all_closes_cs = all_volumes_cs = None
+
+    # ── 1d. Prepare features ──
     data_cache = {}
     print("Computing features...")
     for t, raw in raw_cache.items():
         try:
-            df_proc = prepare_features(raw, universe_returns=_UNIVERSE_RETURNS)
+            df_proc = prepare_features(
+                raw, universe_returns=_UNIVERSE_RETURNS,
+                ticker=t, all_closes=all_closes_cs, all_volumes=all_volumes_cs,
+            )
             df_proc['_ticker'] = t
             data_cache[t] = df_proc
             print(f"   {t}: {len(df_proc)} bars ({df_proc.index[0].date()} to {df_proc.index[-1].date()})")
@@ -1285,7 +1450,7 @@ def main():
         print("No data after feature computation.")
         return
 
-    # ── 1d. Split holdout ──
+    # ── 1e. Split holdout ──
     train_data = {}
     holdout_data = {}
     for t, df in data_cache.items():
@@ -1329,7 +1494,7 @@ def main():
 
     try:
         study = optuna.create_study(
-            study_name="hedge_fund_v7",
+            study_name="hedge_fund_v9",
             direction="maximize",
             storage=OPTUNA_STORAGE,
             load_if_exists=False,
@@ -1346,11 +1511,33 @@ def main():
         print(f"   Optuna study persisted to {OPTUNA_STORAGE}")
     except Exception:
         study = optuna.create_study(
-            study_name="hedge_fund_v7",
+            study_name="hedge_fund_v9",
             direction="maximize",
             sampler=optuna.samplers.TPESampler(n_startup_trials=25, multivariate=True, seed=42),
         )
         print("   Optuna study in-memory (SQLite unavailable)")
+
+    # Warm-start with known-good parameter region from last backtest
+    seed_params = {
+        'pred_threshold_pct': 0.78,
+        'sl_mult': 2.5,
+        'tp_rr': 4.5,
+        'max_bars': 14,
+        'trail_mult': 1.2,
+        'adx_min': 5.0,
+        'hurst_limit': 0.60,
+        'lambda_decay': 1.5,
+        'cofi_conflict': 0.8,
+        'mr_score_min': 1.0,
+        'max_gross': 1.0,
+        'max_net': 0.35,
+        'scale_out_r': 2.0,
+        'regime_filter_mode': 'soft',
+        'direction_bias': 0.7,
+    }
+    for _ in range(5):
+        study.enqueue_trial(seed_params)
+    print(f"   Enqueued 5 warm-start seed trials")
 
     objective = create_optuna_objective(predictions_cache_by_bucket)
     study.optimize(
@@ -1364,8 +1551,9 @@ def main():
                     f"PF={trial.user_attrs.get('pf', 'pruned')} | "
                     f"Sharpe={trial.user_attrs.get('sharpe', 'pruned')} | "
                     f"Trades={trial.user_attrs.get('n_trades', 'pruned')} | "
-                    f"Tickers={trial.user_attrs.get('n_tickers_trading', 'pruned')} | "
-                    f"WR={trial.user_attrs.get('win_rate', 'pruned')}"
+                    f"LongPF={trial.user_attrs.get('long_pf', '?')} "
+                    f"ShortPF={trial.user_attrs.get('short_pf', '?')} "
+                    f"L/S_Bal={trial.user_attrs.get('ls_balance', '?')}"
                 )
                 if trial.number % 5 == 0 and trial.value is not None else None
             )

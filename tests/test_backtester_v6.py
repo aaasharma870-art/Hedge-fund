@@ -218,10 +218,14 @@ class TestSimulateTradesStateful:
         )
         assert len(trades_strict) <= len(trades_minimal)
 
-    def test_vpin_filter_blocks_toxic_orders(self):
+    def test_regime_volatile_blocks_shorts(self):
+        """In volatile regime (Regime_Volatile=1), shorts should be blocked."""
         df = _make_test_df()
-        # Set all VPIN to high toxicity
-        df['VPIN'] = 0.9
+        # Set volatile regime and all predictions negative (short signals)
+        df['Regime_Volatile'] = 1.0
+        df['Regime_Trending'] = 0.0
+        df['Regime_MeanRev'] = 0.0
+        df['Predictions'] = -0.5  # all short signals
         trades = simulate_trades_stateful(
             df, pred_threshold=0.1, sl_mult=1.5, tp_mult=3.0, max_bars=10,
             filter_mode="MINIMAL",

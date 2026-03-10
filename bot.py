@@ -179,6 +179,8 @@ from hedge_fund.features import (
     compute_beta_alpha,
     compute_atr_channel_pos,
 )
+from hedge_fund.regime import RegimeManager as _RegimeManager
+from hedge_fund.portfolio import PortfolioManager as _PortfolioManager
 from hedge_fund.config import load_app_config, load_optimal_params, apply_to_settings
 from hedge_fund.dashboard import Dashboard as SharedDashboard
 from hedge_fund.scanner import CandidateScanner
@@ -3697,6 +3699,15 @@ def run_god_mode():
     daily_risk = DailyRiskManager(max_daily_loss_pct=0.02)
     cs_ranker = CrossSectionalRanker()
     dashboard = Dashboard()
+
+    # V9: Regime and portfolio managers for institutional L/S
+    regime_manager = _RegimeManager()
+    portfolio_manager = _PortfolioManager(
+        max_gross=SETTINGS.get('max_gross', 1.2),
+        max_net=SETTINGS.get('max_net', 0.4),
+        max_single=0.25,
+    )
+    universe_buffer = {t: deque(maxlen=200) for t in CORE}
 
     # v15.10: Safe Import for ZoneInfo
     try:
