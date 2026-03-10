@@ -7,21 +7,19 @@ Controls gross exposure, net exposure, and ticker-regime parameter adjustment.
 
 
 TICKER_REGIME_CLASS = {
-    'RKLB': 'momentum',
-    'ASTS': 'momentum',
-    'AMD': 'momentum',
-    'GS': 'value',
-    'GE': 'value',
-    'COST': 'value',
+    'RKLB': 'momentum', 'ASTS': 'momentum', 'AMD': 'momentum',
+    'NVDA': 'momentum', 'PLTR': 'momentum', 'COIN': 'momentum',
+    'GS': 'value', 'GE': 'value', 'COST': 'value',
+    'JPM': 'value', 'UNH': 'value', 'CAT': 'value',
+    'XOM': 'value', 'JNJ': 'value', 'PG': 'value',
 }
 
 TICKER_BETA = {
-    'RKLB': 1.8,
-    'ASTS': 2.1,
-    'AMD': 1.6,
-    'GS': 1.3,
-    'GE': 1.1,
-    'COST': 0.7,
+    'RKLB': 1.8, 'ASTS': 2.1, 'AMD': 1.6,
+    'NVDA': 1.7, 'PLTR': 1.9, 'COIN': 2.3,
+    'GS': 1.3, 'GE': 1.1, 'COST': 0.7,
+    'JPM': 1.2, 'UNH': 0.8, 'CAT': 1.1,
+    'XOM': 0.9, 'JNJ': 0.6, 'PG': 0.5,
 }
 
 

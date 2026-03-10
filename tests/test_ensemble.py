@@ -37,8 +37,8 @@ class TestEnsembleModel:
         model.fit(X, y)
         r2 = model.score(X, y)
         assert isinstance(r2, float)
-        # Should fit training data reasonably well
-        assert r2 > 0.5
+        # V10: aggressive regularization (max_depth=1 stumps) lowers in-sample R²
+        assert r2 > 0.1
 
     def test_feature_importances(self):
         X, y = _make_data(n_features=5)

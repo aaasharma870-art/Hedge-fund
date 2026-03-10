@@ -15,12 +15,12 @@ class TestComputeRiskMetrics:
     """Tests for the advanced risk metrics calculator."""
 
     def _make_trades(self, outcomes, resolved=None, tickers=None):
-        """Helper to create trade tuples: (outcome, is_resolved, size, ticker)."""
+        """Helper to create trade tuples: (outcome, is_resolved, size, ticker, side)."""
         if resolved is None:
             resolved = [True] * len(outcomes)
         if tickers is None:
             tickers = ['TEST'] * len(outcomes)
-        return [(o, r, 1.0, t) for o, r, t in zip(outcomes, resolved, tickers)]
+        return [(o, r, 1.0, t, 'LONG') for o, r, t in zip(outcomes, resolved, tickers)]
 
     def test_basic_profit_factor(self):
         trades = self._make_trades([2.0, 2.0, -1.0, -1.0])
@@ -84,9 +84,9 @@ class TestComputeRiskMetrics:
     def test_resolved_vs_raw_metrics(self):
         # Mix of resolved and unresolved trades
         trades = [
-            (2.0, True, 1.0, 'A'),   # resolved win
-            (-1.0, True, 1.0, 'A'),  # resolved loss
-            (0.5, False, 1.0, 'A'),  # timeout (not resolved)
+            (2.0, True, 1.0, 'A', 'LONG'),   # resolved win
+            (-1.0, True, 1.0, 'A', 'SHORT'),  # resolved loss
+            (0.5, False, 1.0, 'A', 'LONG'),   # timeout (not resolved)
         ]
         m = compute_risk_metrics(trades)
         assert m['Trades'] == 3
@@ -103,9 +103,9 @@ class TestPerTickerBreakdown:
 
     def test_separates_by_ticker(self):
         trades = [
-            (2.0, True, 1.0, 'NVDA'),
-            (-1.0, True, 1.0, 'NVDA'),
-            (1.5, True, 1.0, 'TSLA'),
+            (2.0, True, 1.0, 'NVDA', 'LONG'),
+            (-1.0, True, 1.0, 'NVDA', 'SHORT'),
+            (1.5, True, 1.0, 'TSLA', 'LONG'),
         ]
         breakdown = per_ticker_breakdown(trades)
         assert 'NVDA' in breakdown
@@ -115,8 +115,8 @@ class TestPerTickerBreakdown:
 
     def test_single_ticker(self):
         trades = [
-            (1.0, True, 1.0, 'AMD'),
-            (1.0, True, 1.0, 'AMD'),
+            (1.0, True, 1.0, 'AMD', 'LONG'),
+            (1.0, True, 1.0, 'AMD', 'LONG'),
         ]
         breakdown = per_ticker_breakdown(trades)
         assert len(breakdown) == 1
@@ -128,10 +128,10 @@ class TestPerTickerBreakdown:
 
     def test_metrics_per_ticker_independent(self):
         trades = [
-            (3.0, True, 1.0, 'WINNER'),
-            (3.0, True, 1.0, 'WINNER'),
-            (-1.0, True, 1.0, 'LOSER'),
-            (-1.0, True, 1.0, 'LOSER'),
+            (3.0, True, 1.0, 'WINNER', 'LONG'),
+            (3.0, True, 1.0, 'WINNER', 'LONG'),
+            (-1.0, True, 1.0, 'LOSER', 'SHORT'),
+            (-1.0, True, 1.0, 'LOSER', 'SHORT'),
         ]
         breakdown = per_ticker_breakdown(trades)
         assert breakdown['WINNER']['WR_Raw'] == pytest.approx(1.0)
@@ -145,23 +145,23 @@ class TestMonteCarloTest:
         # System with very high PF should have low p-value
         # Uses magnitudes that are symmetric so sign-randomization creates
         # meaningful variation in PF. 50 wins@2R, 20 losses@2R -> PF=5.0
-        trades = [(2.0, True, 1.0, 'A')] * 50 + [(-2.0, True, 1.0, 'A')] * 20
-        observed_pf = sum(x for x, _, _, _ in trades if x > 0) / abs(sum(x for x, _, _, _ in trades if x < 0))
+        trades = [(2.0, True, 1.0, 'A', 'LONG')] * 50 + [(-2.0, True, 1.0, 'A', 'SHORT')] * 20
+        observed_pf = sum(t[0] for t in trades if t[0] > 0) / abs(sum(t[0] for t in trades if t[0] < 0))
         p = monte_carlo_test(trades, observed_pf=observed_pf, n_simulations=500)
         assert p < 0.10
 
     def test_random_signal_high_pvalue(self):
         # System with PF near 1.0 should have high p-value
-        trades = [(1.0, True, 1.0, 'A')] * 30 + [(-1.0, True, 1.0, 'A')] * 30
+        trades = [(1.0, True, 1.0, 'A', 'LONG')] * 30 + [(-1.0, True, 1.0, 'A', 'SHORT')] * 30
         p = monte_carlo_test(trades, observed_pf=1.0, n_simulations=200)
         assert p > 0.20
 
     def test_too_few_trades_returns_1(self):
-        trades = [(1.0, True, 1.0, 'A')] * 5
+        trades = [(1.0, True, 1.0, 'A', 'LONG')] * 5
         p = monte_carlo_test(trades, observed_pf=2.0)
         assert p == 1.0
 
     def test_returns_float_between_0_and_1(self):
-        trades = [(1.5, True, 1.0, 'A')] * 30 + [(-1.0, True, 1.0, 'A')] * 20
+        trades = [(1.5, True, 1.0, 'A', 'LONG')] * 30 + [(-1.0, True, 1.0, 'A', 'SHORT')] * 20
         p = monte_carlo_test(trades, observed_pf=1.5, n_simulations=100)
         assert 0.0 <= p <= 1.0

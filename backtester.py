@@ -137,18 +137,25 @@ else:
 SLIPPAGE = SlippageCalculator(spread_pct=0.03, impact_pct=0.02)
 ROUND_TRIP_COST_PCT = SLIPPAGE.round_trip_pct()
 
-# --- Focused L/S universe (verified profitable tickers) ---
-TICKERS = ['RKLB', 'AMD', 'GS', 'COST', 'GE', 'ASTS']
+# --- Diversified L/S universe (15 liquid, diverse names) ---
+TICKERS = [
+    # Momentum / High-beta
+    'RKLB', 'ASTS', 'AMD', 'NVDA', 'PLTR', 'COIN',
+    # Value / Low-beta
+    'GS', 'GE', 'COST', 'JPM', 'UNH', 'CAT',
+    # Defensive
+    'XOM', 'JNJ', 'PG',
+]
 
 # --- Monte Carlo settings ---
 MONTE_CARLO_RUNS = 1000
 
 # --- Feature pruning ---
-PRUNE_FEATURES = True
+PRUNE_FEATURES = False   # V10: disabled — using curated CORE_FEATURES
 PRUNE_KEEP_RATIO = 0.5
 
 # --- Optuna settings ---
-OPTUNA_N_TRIALS = 300    # Bayesian optimization trials (6 tickers = fast per trial)
+OPTUNA_N_TRIALS = 60     # Reduced from 300 to prevent overfitting with discrete params
 OPTUNA_TIMEOUT = None    # No time limit (set to seconds to cap)
 OPTUNA_STORAGE = "sqlite:///optuna_backtester.db"  # Persistent study storage
 
@@ -260,6 +267,20 @@ class Polygon_Helper:
 # ==============================================================================
 
 ALL_FEATURES = list(EXPECTED_FEATURES) + INSTITUTIONAL_SIGNAL_NAMES
+
+# V10: Curated core features with strong economic rationale
+CORE_FEATURES = [
+    'VPIN',              # Informed trading pressure (Easley & O'Hara)
+    'Kalman_Trend',      # Smoothed trend direction
+    'Hurst_Exponent',    # Regime classification
+    'COFI',              # Cumulative order flow imbalance
+    'OFI',               # Single-bar order flow
+    'RV_Ratio',          # Realized vs implied vol ratio
+    'VWAP_ZScore',       # Mean reversion signal
+    'ATR_Channel_Pos',   # Bollinger-style position
+    'Amihud_Illiquidity', # Liquidity measure
+    'Intraday_Mom',      # Intraday momentum
+]
 
 
 # Global market proxy returns - set during data loading
@@ -487,12 +508,6 @@ def walk_forward_train_predict(df, features, sl_mult, tp_mult, max_bars,
         preds = model.predict(test_df[active_features])
         test_df['Predictions'] = preds
 
-        # Overfitting dampener
-        train_r2 = model.score(train_df[active_features], train_df['Target'])
-        test_r2 = model.score(test_df[active_features], test_df['Target'])
-        if train_r2 - test_r2 > 0.15:
-            test_df['Predictions'] = test_df['Predictions'] * 0.90
-
         all_test_dfs.append(test_df)
         start += step_bars
 
@@ -548,11 +563,6 @@ def _walk_forward_pruned(df, features, sl_mult, tp_mult, max_bars,
         model.fit(train_df[features], train_df['Target'])
         preds = model.predict(test_df[features])
         test_df['Predictions'] = preds
-
-        train_r2 = model.score(train_df[features], train_df['Target'])
-        test_r2 = model.score(test_df[features], test_df['Target'])
-        if train_r2 - test_r2 > 0.15:
-            test_df['Predictions'] = test_df['Predictions'] * 0.90
 
         all_test_dfs.append(test_df)
         start += step_bars
@@ -813,12 +823,10 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
 
         side = direction.upper()
 
-        # Get regime-adjusted SL/TP
-        regime_sl, regime_tp_rr, mb_scalar = portfolio_mgr.regime_params(
-            tick, sl_mult, rr, direction, regime_mgr.current_regime
-        )
-        effective_tp_mult = regime_sl * regime_tp_rr
-        effective_max_bars = int(max_bars * mb_scalar)
+        # V10: Use raw SL/TP to match label buckets (no regime adjustment mismatch)
+        regime_sl = sl_mult
+        effective_tp_mult = tp_mult
+        effective_max_bars = max_bars
 
         # --- Trade execution ---
         idx = i
@@ -901,7 +909,7 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
         pos_size = min(pos_size, 3.0)
 
         final_pnl = outcome * pos_size
-        trades.append((final_pnl, is_resolved, pos_size, tick))
+        trades.append((final_pnl, is_resolved, pos_size, tick, side))
 
         # Register in portfolio and remove after trade
         portfolio_mgr.add(tick, direction, pos_size * 0.02)
@@ -1096,8 +1104,10 @@ def compute_risk_metrics(trades):
         mean_r = np.mean(normalized_returns)
         std_r = np.std(normalized_returns, ddof=1)
         sharpe_per_trade = mean_r / std_r if std_r > 1e-10 else 0
-        # Annualize: assume ~4 trades per day on average across universe
-        sharpe_annual = sharpe_per_trade * np.sqrt(252 * 4)
+        # Annualize dynamically from actual trade count
+        trading_days = 252
+        trades_per_day = max(1, n_total / max(trading_days, 1))
+        sharpe_annual = sharpe_per_trade * np.sqrt(252 * trades_per_day)
     else:
         sharpe_annual = 0
 
@@ -1208,25 +1218,24 @@ def create_optuna_objective(predictions_cache_by_bucket):
     Single objective with composite score (PF + Sharpe + DD + trades + consistency).
     """
     def objective(trial):
-        # V9 search space
-        pred_threshold_pct = trial.suggest_float("pred_threshold_pct", 0.55, 0.85)
-        sl_mult = trial.suggest_float("sl_mult", 0.8, 3.0)
-        tp_rr = trial.suggest_float("tp_rr", 1.5, 5.0)
+        # V10: 5 discrete parameters to prevent overfitting
+        sl_mult = trial.suggest_categorical("sl_mult", [1.0, 1.5, 2.0, 2.5])
+        tp_rr = trial.suggest_categorical("tp_rr", [2.0, 3.0, 4.0, 5.0])
         tp_mult = sl_mult * tp_rr
-        max_bars = trial.suggest_int("max_bars", 4, 24)
-        trail_mult = trial.suggest_float("trail_mult", 0.5, 2.5)
-        hurst_limit = trial.suggest_float("hurst_limit", 0.45, 0.75)
-        adx_min = trial.suggest_float("adx_min", 0, 18)
-        scale_out_r = trial.suggest_float("scale_out_r", 1.0, 3.0)
-        regime_filter_mode = trial.suggest_categorical("regime_filter_mode", ["soft", "hard"])
-        lambda_decay = trial.suggest_float("lambda_decay", 0.5, 4.0)
-        direction_bias = trial.suggest_float("direction_bias", 0.3, 1.0)
+        max_bars = trial.suggest_categorical("max_bars", [8, 10, 12, 14])
+        pred_threshold_pct = trial.suggest_categorical("pred_threshold_pct", [0.60, 0.65, 0.70, 0.75, 0.80])
+        trail_mult = trial.suggest_categorical("trail_mult", [0.8, 1.0, 1.5, 2.0])
 
-        # New regime and L/S parameters
-        cofi_conflict_threshold = trial.suggest_float('cofi_conflict', 0.3, 2.0)
-        mr_score_min = trial.suggest_float('mr_score_min', 0.3, 2.5)
-        max_gross = trial.suggest_float('max_gross', 0.7, 1.4)
-        max_net = trial.suggest_float('max_net', 0.15, 0.50)
+        # Hard-coded defaults — no longer optimized
+        hurst_limit = 0.60
+        adx_min = 0
+        scale_out_r = 1.5
+        regime_filter_mode = 'soft'
+        direction_bias = 0.7
+        cofi_conflict_threshold = 1.0
+        mr_score_min = 1.0
+        max_gross = 1.0
+        max_net = 0.3
 
         # Pack into params dict
         trial_params = {
@@ -1272,10 +1281,9 @@ def create_optuna_objective(predictions_cache_by_bucket):
 
         n_trades = len(all_trades)
 
-        # Hard prune: too few trades
-        if n_trades < 30:
-            trial.report(-5.0, step=0)
-            raise optuna.TrialPruned()
+        # ── Hard gates (reject immediately) ──
+        if n_trades < 50:
+            return -5.0
 
         metrics = compute_risk_metrics(all_trades)
 
@@ -1283,51 +1291,52 @@ def create_optuna_objective(predictions_cache_by_bucket):
         wr = metrics['WR_Raw']
         dd = abs(metrics['MaxDD_R'])
         sharpe = metrics['Sharpe']
-        avg_dd_per_trade = dd / max(n_trades, 1)
 
-        if wr < 0.28:
-            trial.report(-2.0, step=0)
-            raise optuna.TrialPruned()
+        if pf < 1.02:
+            return -5.0
 
-        # Composite score
-        pf_score = np.clip(np.log(max(pf, 0.01)) / np.log(4.0), -1.0, 1.0)
-        sharpe_score = np.clip(min(sharpe, 3.0) / 3.0, -1.0, 1.0)
-        dd_score = np.clip(1.0 - (avg_dd_per_trade / 3.0), -1.0, 1.0)
-        trade_score = np.clip(np.log(max(n_trades, 1) / 30) / np.log(500 / 30), 0.0, 1.0)
+        if sharpe < 0.0:
+            return -3.0
 
-        # Per-ticker consistency: fraction of tickers with PF > 1.0
+        if wr < 0.35:
+            return -3.0
+
+        # Per-ticker gate: at least 4/6 tickers must have PF >= 0.90
         ticker_pfs = {}
         for t, t_results in per_ticker_trades.items():
-            if len(t_results) >= 5:
+            if len(t_results) >= 15:
                 t_metrics = compute_risk_metrics(t_results)
                 ticker_pfs[t] = t_metrics.get('PF_Raw', 0)
 
-        # L/S scoring: split trades by direction
-        long_trades = [t for t in all_trades if t[0] > 0 and t[1]]
-        short_trades = [t for t in all_trades if t[0] < 0 and t[1]]
+        profitable_tickers = sum(1 for v in ticker_pfs.values() if v >= 0.90)
+        if len(ticker_pfs) >= 4 and profitable_tickers < max(4, int(len(ticker_pfs) * 0.6)):
+            return -2.0
 
-        long_metrics = compute_risk_metrics(long_trades) if len(long_trades) >= 8 else {}
-        short_metrics = compute_risk_metrics(short_trades) if len(short_trades) >= 8 else {}
+        # ── L/S scoring using CORRECT direction-based trades ──
+        long_trades = [t for t in all_trades if len(t) >= 5 and t[4] == 'LONG']
+        short_trades = [t for t in all_trades if len(t) >= 5 and t[4] == 'SHORT']
+
+        long_metrics = compute_risk_metrics(long_trades) if len(long_trades) >= 10 else {}
+        short_metrics = compute_risk_metrics(short_trades) if len(short_trades) >= 10 else {}
 
         long_pf = long_metrics.get('PF_Raw', 0.5) if long_metrics else 0.5
         short_pf = short_metrics.get('PF_Raw', 0.5) if short_metrics else 0.5
+        ls_health = min(long_pf, short_pf) / max(long_pf, short_pf) if max(long_pf, short_pf) > 0 else 0
 
         n_long = len(long_trades)
         n_short = len(short_trades)
         balance = min(n_long, n_short) / max(max(n_long, n_short), 1)
 
-        ls_score = np.clip(
-            (np.log(max(long_pf, 0.01)) + np.log(max(short_pf, 0.01))) / (2 * np.log(4)),
-            -1, 1
-        )
+        # ── Score: Sharpe-first, penalized by concentration ──
+        ticker_consistency = profitable_tickers / max(len(ticker_pfs), 1)
+        trade_sufficiency = min(1.0, np.log(max(n_trades, 30) / 30) / np.log(500 / 30))
 
-        composite = (
-            0.28 * pf_score +
-            0.22 * ls_score +
-            0.18 * sharpe_score +
-            0.15 * dd_score +
-            0.10 * trade_score +
-            0.07 * balance
+        score = (
+            0.40 * min(sharpe / 3.0, 1.0) +
+            0.25 * min(np.log(max(pf, 1.0)) / np.log(2.0), 1.0) +
+            0.15 * ticker_consistency +
+            0.10 * trade_sufficiency +
+            0.10 * ls_health
         )
 
         trial.set_user_attr("metrics", metrics)
@@ -1348,7 +1357,7 @@ def create_optuna_objective(predictions_cache_by_bucket):
         trial.set_user_attr('short_n', n_short)
         trial.set_user_attr('ls_balance', round(balance, 3))
 
-        return composite
+        return score
 
     return objective
 
@@ -1360,12 +1369,12 @@ def create_optuna_objective(predictions_cache_by_bucket):
 def main():
     global _UNIVERSE_RETURNS
 
-    console.print("[bold green]GOD MODE BACKTESTER V9.0 (INSTITUTIONAL L/S)[/bold green]")
+    console.print("[bold green]GOD MODE BACKTESTER V10.0 (ANTI-OVERFIT)[/bold green]")
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Walk-Forward: {WF_TRAIN_BARS}/{WF_TEST_BARS}/{WF_STEP_BARS} bars[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Execution cost: {ROUND_TRIP_COST_PCT*100:.2f}% round-trip[/dim]")
-    console.print(f"[dim]Features: {len(ALL_FEATURES)} | Pruning: top {int(PRUNE_KEEP_RATIO*100)}%[/dim]")
-    console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
-    console.print(f"[dim]V9: Institutional signals, regime-gated L/S, cross-sectional factors[/dim]\n")
+    console.print(f"[dim]Features: {len(CORE_FEATURES)} core | Pruning: disabled (curated)[/dim]")
+    console.print(f"[dim]Optuna trials: {OPTUNA_N_TRIALS} (5 categorical params) | Monte Carlo: {MONTE_CARLO_RUNS} shuffles[/dim]")
+    console.print(f"[dim]V10: Gate-based objective, 60/40 opt/val split, aggressive regularization[/dim]\n")
 
     # ── 1. Download & Prep (parallel) ──
     raw_cache = {}
@@ -1473,7 +1482,7 @@ def main():
         print(f"\n   Bucket SL={bucket_sl} TP={bucket_tp} MB={bucket_mb}:")
 
         for t, df in train_data.items():
-            avail_feats = [f for f in ALL_FEATURES if f in df.columns]
+            avail_feats = [f for f in CORE_FEATURES if f in df.columns]
             wf_result, pruned_feats = walk_forward_train_predict(
                 df, avail_feats, bucket_sl, bucket_tp, bucket_mb)
             if wf_result is not None:
@@ -1489,57 +1498,59 @@ def main():
         print("Walk-forward produced no predictions. Check data quality.")
         return
 
+    # ── 2b. Split predictions into optimization (60%) + validation (40%) ──
+    optuna_cache_by_bucket = {}
+    validation_cache_by_bucket = {}
+    for bucket_key, ticker_dfs in predictions_cache_by_bucket.items():
+        optuna_cache_by_bucket[bucket_key] = {}
+        validation_cache_by_bucket[bucket_key] = {}
+        for ticker, df_pred in ticker_dfs.items():
+            split_point = int(len(df_pred) * 0.6)
+            optuna_cache_by_bucket[bucket_key][ticker] = df_pred.iloc[:split_point].copy()
+            validation_cache_by_bucket[bucket_key][ticker] = df_pred.iloc[split_point:].copy()
+    print(f"   Split predictions: 60% optimization / 40% validation")
+
     # ── 3. Optuna Optimization (single objective, composite score) ──
     print(f"\nStarting Optuna optimization ({OPTUNA_N_TRIALS} trials, single-objective composite)...")
 
     try:
         study = optuna.create_study(
-            study_name="hedge_fund_v9",
+            study_name="hedge_fund_v10",
             direction="maximize",
             storage=OPTUNA_STORAGE,
             load_if_exists=False,
             sampler=optuna.samplers.TPESampler(
-                n_startup_trials=25,
+                n_startup_trials=10,
                 multivariate=True,
                 seed=42,
             ),
             pruner=optuna.pruners.MedianPruner(
-                n_startup_trials=15,
+                n_startup_trials=8,
                 n_warmup_steps=0,
             ),
         )
         print(f"   Optuna study persisted to {OPTUNA_STORAGE}")
     except Exception:
         study = optuna.create_study(
-            study_name="hedge_fund_v9",
+            study_name="hedge_fund_v10",
             direction="maximize",
-            sampler=optuna.samplers.TPESampler(n_startup_trials=25, multivariate=True, seed=42),
+            sampler=optuna.samplers.TPESampler(n_startup_trials=10, multivariate=True, seed=42),
         )
         print("   Optuna study in-memory (SQLite unavailable)")
 
-    # Warm-start with known-good parameter region from last backtest
-    seed_params = {
-        'pred_threshold_pct': 0.78,
-        'sl_mult': 2.5,
-        'tp_rr': 4.5,
-        'max_bars': 14,
-        'trail_mult': 1.2,
-        'adx_min': 5.0,
-        'hurst_limit': 0.60,
-        'lambda_decay': 1.5,
-        'cofi_conflict': 0.8,
-        'mr_score_min': 1.0,
-        'max_gross': 1.0,
-        'max_net': 0.35,
-        'scale_out_r': 2.0,
-        'regime_filter_mode': 'soft',
-        'direction_bias': 0.7,
-    }
-    for _ in range(5):
-        study.enqueue_trial(seed_params)
-    print(f"   Enqueued 5 warm-start seed trials")
+    # Warm-start with known-good parameter combos (must match categorical values)
+    seed_configs = [
+        {'sl_mult': 2.5, 'tp_rr': 2.0, 'max_bars': 14, 'pred_threshold_pct': 0.75, 'trail_mult': 1.0},
+        {'sl_mult': 2.0, 'tp_rr': 3.0, 'max_bars': 12, 'pred_threshold_pct': 0.70, 'trail_mult': 1.5},
+        {'sl_mult': 1.5, 'tp_rr': 2.0, 'max_bars': 10, 'pred_threshold_pct': 0.65, 'trail_mult': 1.0},
+        {'sl_mult': 1.0, 'tp_rr': 2.0, 'max_bars': 8, 'pred_threshold_pct': 0.60, 'trail_mult': 0.8},
+        {'sl_mult': 2.0, 'tp_rr': 2.0, 'max_bars': 12, 'pred_threshold_pct': 0.70, 'trail_mult': 1.0},
+    ]
+    for sp in seed_configs:
+        study.enqueue_trial(sp)
+    print(f"   Enqueued {len(seed_configs)} warm-start seed trials")
 
-    objective = create_optuna_objective(predictions_cache_by_bucket)
+    objective = create_optuna_objective(optuna_cache_by_bucket)
     study.optimize(
         objective, n_trials=OPTUNA_N_TRIALS, timeout=OPTUNA_TIMEOUT,
         show_progress_bar=True,
@@ -1664,6 +1675,55 @@ def main():
         p_value = monte_carlo_test(best_config['_trades'], best_config['PF_Res'])
         console.print(f"\n   Monte Carlo p-value: {p_value:.4f}")
 
+        # ── 6b. Validation set check (40% held back from Optuna) ──
+        best_params = best_config.get('_params', {})
+        best_bucket_key = tuple(best_config.get('_params', {}).get('bucket_key', list(LABEL_BUCKETS[0]))) if 'bucket_key' not in best_config else None
+        # Find the matching bucket from the trial
+        trial_bucket = best_config.get('_bucket_key', None)
+        if trial_bucket is None:
+            best_sl_v = best_params.get('sl_mult', best_config['SL'])
+            best_tp_rr_v = best_params.get('tp_rr', 2.0)
+            trial_bucket = _pick_label_bucket(best_sl_v, best_tp_rr_v)
+
+        val_cache = validation_cache_by_bucket.get(trial_bucket, {})
+        if val_cache:
+            console.print(f"\n[bold yellow]VALIDATION SET CHECK (40% held-back):[/bold yellow]")
+            val_trades = []
+            v_sl = best_params.get('sl_mult', best_config['SL'])
+            v_tp_rr = best_params.get('tp_rr', 2.0)
+            v_tp_mult = v_sl * v_tp_rr
+            v_mb = best_params.get('max_bars', best_config['MB'])
+            v_thresh_pct = best_params.get('pred_threshold_pct', 0.70)
+            v_trail = best_params.get('trail_mult', 1.0)
+
+            for t_v, val_df in val_cache.items():
+                preds_abs = np.abs(val_df['Predictions'].values)
+                valid_preds = preds_abs[np.isfinite(preds_abs)]
+                if len(valid_preds) < 10:
+                    continue
+                thresh_raw = np.percentile(valid_preds, v_thresh_pct * 100)
+                v_results = simulate_trades_stateful(
+                    val_df, thresh_raw, v_sl, v_tp_mult, v_mb,
+                    trail_mult=v_trail, filter_mode="MINIMAL",
+                    hurst_limit=0.60, adx_min=0,
+                    scale_out_r=1.5, use_kelly=True,
+                    regime_filter_mode='soft',
+                    direction_bias=0.7,
+                )
+                val_trades.extend(v_results)
+
+            if val_trades:
+                val_metrics = compute_risk_metrics(val_trades)
+                console.print(f"   Validation PF: {val_metrics['PF_Res']:.2f} | "
+                              f"Sharpe: {val_metrics['Sharpe']:.2f} | "
+                              f"Trades: {val_metrics['Trades']}")
+                if val_metrics['PF_Res'] < 1.0:
+                    console.print("[red]   VALIDATION FAILED — config is overfit, DO NOT USE[/red]")
+                else:
+                    console.print("[green]   VALIDATION PASSED[/green]")
+            else:
+                console.print("   [yellow]No validation trades produced[/yellow]")
+
         # ── 7. Holdout ──
         holdout_tickers_with_data = {t: h for t, h in holdout_data.items() if h is not None and len(h) > 100}
         if holdout_tickers_with_data:
@@ -1693,7 +1753,7 @@ def main():
                 train_slice = train_slice.copy()
                 train_slice['Target'] = labels
 
-                avail_feats = [f for f in ALL_FEATURES if f in train_slice.columns and f in h_df.columns]
+                avail_feats = [f for f in CORE_FEATURES if f in train_slice.columns and f in h_df.columns]
                 if len(avail_feats) < 5:
                     continue
 
