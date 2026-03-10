@@ -21,33 +21,55 @@ class EnsembleModel:
     when stacking doesn't improve over best base model.
     """
 
-    def __init__(self, xgb_params=None, lgb_params=None, ridge_alpha=1.0, use_oof=True):
+    def __init__(self, xgb_params=None, lgb_params=None, ridge_alpha=1.0,
+                 use_oof=True, use_daily=False):
         import xgboost as xgb
         from sklearn.linear_model import Ridge
 
-        self.xgb_params = xgb_params or {
-            "n_estimators": 80,
-            "max_depth": 3,
-            "learning_rate": 0.05,
-            "subsample": 0.60,
-            "colsample_bytree": 0.60,
-            "min_child_weight": 15,
-            "reg_alpha": 3.0,
-            "reg_lambda": 5.0,
-            "gamma": 0.3,
-            "n_jobs": -1,
-            "verbosity": 0,
-        }
-
-        self.xgb_model = xgb.XGBRegressor(**self.xgb_params)
-        self.meta_model = Ridge(alpha=ridge_alpha)
-        self._use_oof = use_oof
-
-        self.lgb_model = None
-        self._has_lgb = False
-        try:
-            import lightgbm as lgb
-            self.lgb_params = lgb_params or {
+        if use_daily:
+            # Daily models: moderate depth, less regularization
+            # (fewer samples than 15-min, but higher SNR)
+            default_xgb = {
+                "n_estimators": 100,
+                "max_depth": 3,
+                "learning_rate": 0.05,
+                "subsample": 0.70,
+                "colsample_bytree": 0.70,
+                "min_child_weight": 10,
+                "reg_alpha": 1.0,
+                "reg_lambda": 3.0,
+                "gamma": 0.1,
+                "n_jobs": -1,
+                "verbosity": 0,
+            }
+            default_lgb = {
+                "n_estimators": 100,
+                "max_depth": 4,
+                "learning_rate": 0.05,
+                "subsample": 0.70,
+                "colsample_bytree": 0.70,
+                "min_child_weight": 10,
+                "reg_alpha": 1.0,
+                "reg_lambda": 3.0,
+                "n_jobs": -1,
+                "verbosity": -1,
+            }
+        else:
+            # Intraday models (V11 config)
+            default_xgb = {
+                "n_estimators": 80,
+                "max_depth": 3,
+                "learning_rate": 0.05,
+                "subsample": 0.60,
+                "colsample_bytree": 0.60,
+                "min_child_weight": 15,
+                "reg_alpha": 3.0,
+                "reg_lambda": 5.0,
+                "gamma": 0.3,
+                "n_jobs": -1,
+                "verbosity": 0,
+            }
+            default_lgb = {
                 "n_estimators": 80,
                 "max_depth": 4,
                 "learning_rate": 0.05,
@@ -59,6 +81,18 @@ class EnsembleModel:
                 "n_jobs": -1,
                 "verbosity": -1,
             }
+
+        self.xgb_params = xgb_params or default_xgb
+
+        self.xgb_model = xgb.XGBRegressor(**self.xgb_params)
+        self.meta_model = Ridge(alpha=ridge_alpha)
+        self._use_oof = use_oof
+
+        self.lgb_model = None
+        self._has_lgb = False
+        try:
+            import lightgbm as lgb
+            self.lgb_params = lgb_params or default_lgb
             self.lgb_model = lgb.LGBMRegressor(**self.lgb_params)
             self._has_lgb = True
         except ImportError:
