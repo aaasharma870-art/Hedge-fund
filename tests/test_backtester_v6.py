@@ -186,7 +186,7 @@ class TestSimulateTradesStateful:
         )
         assert isinstance(trades, list)
         if trades:
-            assert len(trades[0]) == 4  # (pnl, resolved, pos_size, ticker)
+            assert len(trades[0]) == 5  # (pnl, resolved, pos_size, ticker, side)
 
     def test_empty_df_returns_empty(self):
         trades = simulate_trades_stateful(
@@ -309,9 +309,10 @@ class TestBarsHeldIntegration:
         # Just verify we get trades and they have valid structure
         assert isinstance(trades, list)
         for t in trades:
-            assert len(t) == 4
+            assert len(t) == 5
             assert isinstance(t[0], float)
             assert isinstance(t[1], bool)
+            assert t[4] in ('LONG', 'SHORT')
 
 
 # ==============================================================================
@@ -324,18 +325,18 @@ class TestRiskMetricsV6:
     def test_position_sized_trades_affect_metrics(self):
         """Trades with different position sizes should affect total return."""
         # 2x sized win vs 0.5x sized win
-        trades_big = [(2.0 * 2.0, True, 2.0, 'A')]  # 4R effective
-        trades_small = [(2.0 * 0.5, True, 0.5, 'A')]  # 1R effective
+        trades_big = [(2.0 * 2.0, True, 2.0, 'A', 'LONG')]  # 4R effective
+        trades_small = [(2.0 * 0.5, True, 0.5, 'A', 'LONG')]  # 1R effective
         m_big = compute_risk_metrics(trades_big)
         m_small = compute_risk_metrics(trades_small)
         assert m_big['TotalReturn_R'] > m_small['TotalReturn_R']
 
     def test_mixed_resolved_unresolved(self):
         trades = [
-            (1.5, True, 1.0, 'A'),
-            (-0.3, False, 1.0, 'A'),
-            (2.0, True, 1.0, 'B'),
-            (-0.5, True, 1.0, 'B'),  # resolved loss so PF_Res is computable
+            (1.5, True, 1.0, 'A', 'LONG'),
+            (-0.3, False, 1.0, 'A', 'SHORT'),
+            (2.0, True, 1.0, 'B', 'LONG'),
+            (-0.5, True, 1.0, 'B', 'SHORT'),  # resolved loss so PF_Res is computable
         ]
         m = compute_risk_metrics(trades)
         assert m['Trades'] == 4

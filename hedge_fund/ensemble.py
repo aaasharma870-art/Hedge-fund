@@ -6,8 +6,11 @@ Out-of-Fold (OOF) stacking to prevent data leakage.
 """
 
 import logging
+import warnings
 
 import numpy as np
+
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
 
 class EnsembleModel:
@@ -23,15 +26,15 @@ class EnsembleModel:
         from sklearn.linear_model import Ridge
 
         self.xgb_params = xgb_params or {
-            "n_estimators": 100,
-            "max_depth": 2,
-            "learning_rate": 0.05,
-            "subsample": 0.50,
-            "colsample_bytree": 0.50,
-            "min_child_weight": 10,
-            "reg_alpha": 5.0,
-            "reg_lambda": 10.0,
-            "gamma": 0.5,
+            "n_estimators": 50,
+            "max_depth": 1,
+            "learning_rate": 0.03,
+            "subsample": 0.40,
+            "colsample_bytree": 0.40,
+            "min_child_weight": 25,
+            "reg_alpha": 10.0,
+            "reg_lambda": 20.0,
+            "gamma": 1.0,
             "n_jobs": -1,
             "verbosity": 0,
         }
@@ -45,14 +48,14 @@ class EnsembleModel:
         try:
             import lightgbm as lgb
             self.lgb_params = lgb_params or {
-                "n_estimators": 100,
-                "max_depth": 3,
-                "learning_rate": 0.05,
-                "subsample": 0.50,
-                "colsample_bytree": 0.50,
-                "min_child_weight": 10,
-                "reg_alpha": 5.0,
-                "reg_lambda": 10.0,
+                "n_estimators": 50,
+                "max_depth": 2,
+                "learning_rate": 0.03,
+                "subsample": 0.40,
+                "colsample_bytree": 0.40,
+                "min_child_weight": 25,
+                "reg_alpha": 10.0,
+                "reg_lambda": 20.0,
                 "n_jobs": -1,
                 "verbosity": -1,
             }
@@ -68,6 +71,8 @@ class EnsembleModel:
 
     def fit(self, X, y, sample_weight=None):
         """Train ensemble using OOF stacking or equal-weight fallback."""
+        if hasattr(X, 'columns'):
+            self._feature_names = list(X.columns)
         X_arr = np.array(X)
         y_arr = np.array(y)
 
@@ -185,7 +190,7 @@ class EnsembleModel:
         if not self._is_fitted:
             raise RuntimeError("EnsembleModel not fitted. Call fit() first.")
 
-        X_arr = np.array(X)
+        X_arr = np.array(X)  # Always use numpy to avoid feature name warnings
         if self.stacking_method_ == 'oof':
             base_preds = self._base_predictions(X_arr)
             return self.meta_model.predict(base_preds)
