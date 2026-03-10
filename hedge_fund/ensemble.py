@@ -26,15 +26,15 @@ class EnsembleModel:
         from sklearn.linear_model import Ridge
 
         self.xgb_params = xgb_params or {
-            "n_estimators": 50,
-            "max_depth": 1,
-            "learning_rate": 0.03,
-            "subsample": 0.40,
-            "colsample_bytree": 0.40,
-            "min_child_weight": 25,
-            "reg_alpha": 10.0,
-            "reg_lambda": 20.0,
-            "gamma": 1.0,
+            "n_estimators": 80,
+            "max_depth": 3,
+            "learning_rate": 0.05,
+            "subsample": 0.60,
+            "colsample_bytree": 0.60,
+            "min_child_weight": 15,
+            "reg_alpha": 3.0,
+            "reg_lambda": 5.0,
+            "gamma": 0.3,
             "n_jobs": -1,
             "verbosity": 0,
         }
@@ -48,14 +48,14 @@ class EnsembleModel:
         try:
             import lightgbm as lgb
             self.lgb_params = lgb_params or {
-                "n_estimators": 50,
-                "max_depth": 2,
-                "learning_rate": 0.03,
-                "subsample": 0.40,
-                "colsample_bytree": 0.40,
-                "min_child_weight": 25,
-                "reg_alpha": 10.0,
-                "reg_lambda": 20.0,
+                "n_estimators": 80,
+                "max_depth": 4,
+                "learning_rate": 0.05,
+                "subsample": 0.60,
+                "colsample_bytree": 0.60,
+                "min_child_weight": 15,
+                "reg_alpha": 3.0,
+                "reg_lambda": 5.0,
                 "n_jobs": -1,
                 "verbosity": -1,
             }

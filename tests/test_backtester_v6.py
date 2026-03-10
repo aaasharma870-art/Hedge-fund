@@ -218,10 +218,10 @@ class TestSimulateTradesStateful:
         )
         assert len(trades_strict) <= len(trades_minimal)
 
-    def test_regime_volatile_blocks_shorts(self):
-        """In volatile regime (Regime_Volatile=1), shorts should be blocked."""
+    def test_volatile_regime_reduces_short_size(self):
+        """V11: In volatile regime, shorts still execute but with reduced size
+        (regime size scalar applied via determine_entry, not gated)."""
         df = _make_test_df()
-        # Set volatile regime and all predictions negative (short signals)
         df['Regime_Volatile'] = 1.0
         df['Regime_Trending'] = 0.0
         df['Regime_MeanRev'] = 0.0
@@ -230,7 +230,10 @@ class TestSimulateTradesStateful:
             df, pred_threshold=0.1, sl_mult=1.5, tp_mult=3.0, max_bars=10,
             filter_mode="MINIMAL",
         )
-        assert len(trades) == 0
+        # V11: simplified entry allows shorts through; verify they execute
+        assert len(trades) > 0
+        # All should be SHORT direction
+        assert all(t[4] == 'SHORT' for t in trades)
 
     def test_governor_reduces_size_in_drawdown(self):
         """After many losses, governor should reduce position sizes."""
