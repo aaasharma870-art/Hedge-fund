@@ -617,7 +617,8 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
                              hurst_limit=0.5, adx_min=0,
                              scale_out_r=1.5, use_kelly=True,
                              regime_filter_mode='soft',
-                             filter_counter=None):
+                             filter_counter=None,
+                             direction_bias=1.0):
     """
     V7 stateful trade simulation with:
     - Percentile-based pred_threshold (already computed as raw value)
@@ -752,6 +753,10 @@ def simulate_trades_stateful(test_df, pred_threshold, sl_mult, tp_mult, max_bars
             avg_l = total_loss_r / loss_count if loss_count > 0 else 1.0
             kelly_frac = kelly_criterion(wr, avg_w, avg_l, shrinkage=0.35)
             pos_size = float(np.clip(kelly_frac / 0.015, 0.5, 2.0))
+
+        # Direction bias: reduce short position sizes
+        if side == 'SHORT' and direction_bias < 1.0:
+            pos_size *= direction_bias
 
         # Confidence scalar
         conf_scalar = compute_confidence_scalar(abs(pred_r), pred_threshold)
@@ -978,11 +983,13 @@ def compute_risk_metrics(trades):
             current_loss = 0
 
     if len(outcomes) > 1:
-        mean_r = np.mean(outcomes)
-        std_r = np.std(outcomes, ddof=1)
-        sharpe_per_trade = mean_r / std_r if std_r > 0 else 0
-        trades_per_year = min(len(outcomes) * (252 * 6.5 / max(len(outcomes), 1)), 2000)
-        sharpe_annual = sharpe_per_trade * np.sqrt(trades_per_year)
+        # Normalize R-multiples to portfolio returns assuming 2% Kelly risk per trade
+        normalized_returns = [o * 0.02 for o in outcomes]
+        mean_r = np.mean(normalized_returns)
+        std_r = np.std(normalized_returns, ddof=1)
+        sharpe_per_trade = mean_r / std_r if std_r > 1e-10 else 0
+        # Annualize: assume ~4 trades per day on average across universe
+        sharpe_annual = sharpe_per_trade * np.sqrt(252 * 4)
     else:
         sharpe_annual = 0
 
@@ -1105,6 +1112,7 @@ def create_optuna_objective(predictions_cache_by_bucket):
         scale_out_r = trial.suggest_float("scale_out_r", 1.0, 3.0)
         regime_filter_mode = trial.suggest_categorical("regime_filter_mode", ["soft", "hard"])
         lambda_decay = trial.suggest_float("lambda_decay", 0.5, 4.0)
+        direction_bias = trial.suggest_float("direction_bias", 0.3, 1.0)
 
         # Pick the label bucket whose SL/TP best matches this trial
         bucket_key = _pick_label_bucket(sl_mult, tp_rr)
@@ -1113,8 +1121,18 @@ def create_optuna_objective(predictions_cache_by_bucket):
             return -5.0
 
         all_trades = []
+        per_ticker_trades = {}
         tickers_with_trades = set()
         filter_counter = TradeFilterCounter()
+
+        # Compute per-ticker prediction confidence for weighting
+        all_pred_stds = []
+        for t, test_df in predictions_cache.items():
+            preds = test_df['Predictions'].dropna()
+            if len(preds) > 10:
+                all_pred_stds.append((t, float(np.std(preds))))
+        universe_avg_confidence = np.mean([s for _, s in all_pred_stds]) if all_pred_stds else 1.0
+        ticker_confidence_weights = {t: s / max(universe_avg_confidence, 1e-10) for t, s in all_pred_stds}
 
         for t, test_df in predictions_cache.items():
             # Compute percentile-based threshold from this ticker's predictions
@@ -1131,46 +1149,55 @@ def create_optuna_objective(predictions_cache_by_bucket):
                 scale_out_r=scale_out_r, use_kelly=True,
                 regime_filter_mode=regime_filter_mode,
                 filter_counter=filter_counter,
+                direction_bias=direction_bias,
             )
             all_trades.extend(t_results)
             if t_results:
                 tickers_with_trades.add(t)
+                per_ticker_trades[t] = t_results
 
         n_trades = len(all_trades)
 
-        # Hard prune: too few trades
-        if n_trades < 15:
+        # Hard prune: too few trades (30 = ~1.7 per ticker minimum)
+        if n_trades < 30:
             trial.report(-5.0, step=0)
             raise optuna.TrialPruned()
 
         metrics = compute_risk_metrics(all_trades)
 
-        pf = metrics['PF_Res']
-        wr = metrics['WR_Res']
+        pf = metrics.get('PF_Raw', metrics['PF_Res'])
+        wr = metrics['WR_Raw']
         dd = abs(metrics['MaxDD_R'])
         sharpe = metrics['Sharpe']
+        avg_dd_per_trade = dd / max(n_trades, 1)
 
-        if dd > 35:
-            trial.report(-3.0, step=0)
-            raise optuna.TrialPruned()
-
-        if wr < 0.38:
+        if wr < 0.28:
             trial.report(-2.0, step=0)
             raise optuna.TrialPruned()
 
         # Composite score
         pf_score = np.clip(np.log(max(pf, 0.01)) / np.log(4.0), -1.0, 1.0)
         sharpe_score = np.clip(min(sharpe, 3.0) / 3.0, -1.0, 1.0)
-        dd_score = np.clip(1.0 - (dd / 20.0), -1.0, 1.0)
-        trade_score = np.clip(np.log(max(n_trades, 1) / 15) / np.log(500 / 15), 0.0, 1.0)
+        dd_score = np.clip(1.0 - (avg_dd_per_trade / 3.0), -1.0, 1.0)
+        trade_score = np.clip(np.log(max(n_trades, 1) / 30) / np.log(500 / 30), 0.0, 1.0)
         ticker_score = np.clip(len(tickers_with_trades) / 5.0, 0.0, 1.0)
 
+        # Per-ticker consistency: fraction of tickers with PF > 1.0
+        ticker_pfs = {}
+        for t, t_results in per_ticker_trades.items():
+            if len(t_results) >= 5:
+                t_metrics = compute_risk_metrics(t_results)
+                ticker_pfs[t] = t_metrics.get('PF_Raw', 0)
+        n_profitable_tickers = sum(1 for pf_val in ticker_pfs.values() if pf_val > 1.0)
+        consistency_score = n_profitable_tickers / max(len(ticker_pfs), 1)
+
         composite = (
-            0.30 * pf_score +
-            0.25 * sharpe_score +
-            0.20 * dd_score +
+            0.28 * pf_score +
+            0.22 * sharpe_score +
+            0.18 * dd_score +
             0.15 * trade_score +
-            0.10 * ticker_score
+            0.12 * consistency_score +
+            0.05 * ticker_score
         )
 
         trial.set_user_attr("metrics", metrics)
@@ -1184,6 +1211,8 @@ def create_optuna_objective(predictions_cache_by_bucket):
         trial.set_user_attr("win_rate", round(wr, 4))
         trial.set_user_attr("n_tickers_trading", len(tickers_with_trades))
         trial.set_user_attr("pred_threshold_pct", pred_threshold_pct)
+        trial.set_user_attr("n_profitable_tickers", n_profitable_tickers)
+        trial.set_user_attr("ticker_pfs", {k: round(v, 3) for k, v in ticker_pfs.items()})
 
         return composite
 
@@ -1329,12 +1358,16 @@ def main():
         show_progress_bar=True,
         callbacks=[
             lambda study, trial: (
-                print(f"\n  Trial {trial.number}: composite={trial.value:.4f} | "
-                      f"PF={trial.user_attrs.get('pf','?')} | "
-                      f"Sharpe={trial.user_attrs.get('sharpe','?')} | "
-                      f"Trades={trial.user_attrs.get('n_trades','?')} | "
-                      f"Tickers={trial.user_attrs.get('n_tickers_trading','?')}")
-                if trial.number % 10 == 0 and trial.value is not None else None
+                print(
+                    f"\n  Trial {trial.number}: "
+                    f"composite={trial.value:.4f} | "
+                    f"PF={trial.user_attrs.get('pf', 'pruned')} | "
+                    f"Sharpe={trial.user_attrs.get('sharpe', 'pruned')} | "
+                    f"Trades={trial.user_attrs.get('n_trades', 'pruned')} | "
+                    f"Tickers={trial.user_attrs.get('n_tickers_trading', 'pruned')} | "
+                    f"WR={trial.user_attrs.get('win_rate', 'pruned')}"
+                )
+                if trial.number % 5 == 0 and trial.value is not None else None
             )
         ],
     )
