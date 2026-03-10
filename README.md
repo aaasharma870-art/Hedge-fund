@@ -1,391 +1,191 @@
-# Algorithmic Trading System — v14.3
+# Hedge Fund Algorithmic Trading System
 
-**A fully autonomous, institutional-grade equity trading engine built from scratch in Python.**
+## Overview
 
-This project is a complete algorithmic hedge fund system — not a simple moving-average crossover script, but a 9,000+ line production codebase that integrates machine learning, quantitative risk management, portfolio optimization, and real-time market execution into a unified architecture. Every component, from signal generation to position sizing, was designed, implemented, and tested by hand.
+This system is an intraday equity long/short trading engine that combines machine learning ensemble prediction (XGBoost + LightGBM + Ridge meta-learner) with institutional-quality microstructure signals, regime-conditional execution logic, and automated risk management. It operates on 15-minute bars across a focused universe of six US equities, executing bracket orders through the Alpaca brokerage API with Kelly-optimal position sizing, portfolio-level exposure constraints, and a four-layer risk architecture spanning signal quality through system-level circuit breakers.
 
----
+The core research question is whether signals derived from market microstructure theory (order flow imbalance, adverse selection measures, cross-sectional momentum) and regime detection (variance ratio tests, realized volatility clustering) produce statistically significant edge on 15-minute equity bars when combined with ML-driven prediction and institutional-grade execution logic. The system tests the hypothesis that alpha exists not in public price-derived indicators (RSI, MACD, Bollinger Bands), which are fully arbitraged on liquid US equities, but in the information asymmetry revealed by volume-price dynamics and cross-sectional factor premiums documented in the academic literature.
 
-## Table of Contents
+The system is currently in paper trading validation. The most recent complete backtest produced an overall profit factor of 0.94 with six individually profitable tickers out of eighteen tested. The v9.0 architecture concentrates on those six tickers with institutional signal integration, regime-gated long/short execution, and portfolio-level book management. Deployment criteria (PF > 2.0, Sharpe > 1.5, MC p-value < 0.05) have not yet been met.
 
-1. [Project Overview](#project-overview)
-2. [System Architecture](#system-architecture)
-3. [Quantitative Features in Depth](#quantitative-features-in-depth)
-4. [Machine Learning Pipeline](#machine-learning-pipeline)
-5. [Risk Management Framework](#risk-management-framework)
-6. [Trading Strategy](#trading-strategy)
-7. [Technology Stack](#technology-stack)
-8. [Strengths](#strengths)
-9. [Limitations and Honest Critique](#limitations-and-honest-critique)
-10. [Roadmap for Improvement](#roadmap-for-improvement)
-11. [Installation and Usage](#installation-and-usage)
-12. [Testing](#testing)
-13. [Project Structure](#project-structure)
+## Theoretical Foundation
 
----
+### The Problem with Price-Derived Indicators
 
-## Project Overview
+The semi-strong form of the efficient market hypothesis (Fama, 1991) states that all publicly available information is already reflected in equity prices. Technical indicators computed from OHLCV data --- RSI, MACD, Bollinger Bands, moving average crossovers --- are deterministic transformations of public information visible to every market participant simultaneously. If any of these indicators reliably predicted future returns, rational arbitrageurs would trade against the signal until the predictability was eliminated. On large-cap US equities trading tens of millions of shares per day, this arbitrage occurs within milliseconds.
 
-This system trades US equities through the Alpaca brokerage API, making autonomous buy and sell decisions on a 15-minute cadence throughout market hours. At its core, the system answers a deceptively simple question: *given the current state of the market, should I buy, sell, or do nothing — and how much should I risk?*
+Harvey, Liu, and Zhu (2016) analyzed 316 published equity return anomalies and found that the majority disappear after controlling for multiple hypothesis testing, and most of the remainder lose significance after publication due to crowded trading. The system's own walk-forward feature importance analysis confirmed this independently: RSI, BB_Position, ROC_20, Hour, VWAP_Volume_Ratio, and similar price-derived features were dropped by the XGBoost model in every ticker and every label bucket across three years of walk-forward windows. The model was not broken; it was correctly identifying that these features contain no information not already reflected in price.
 
-To answer that question rigorously, the system draws on concepts from:
+This motivated a complete replacement of the feature architecture with signals grounded in market microstructure research and cross-sectional factor theory, where the academic evidence for persistent out-of-sample alpha is strongest.
 
-- **Statistical learning theory** (gradient-boosted ensemble models with walk-forward validation)
-- **Stochastic processes** (Hurst exponent for regime detection, Kalman filtering for trend estimation)
-- **Market microstructure** (Volume-Synchronized Probability of Informed Trading, Amihud illiquidity ratios)
-- **Portfolio theory** (Markowitz mean-variance optimization with Ledoit-Wolf shrinkage)
-- **Information theory** (Kelly Criterion for optimal position sizing)
-- **Monte Carlo simulation** (equity-curve-aware dynamic risk scaling)
+### Alpha Sources with Theoretical Backing
 
-The defining architectural principle is what I call the **"One Brain" design** — the exact same code that generates signals in backtesting generates signals in live trading. There is no separate "backtest version" and "live version." This eliminates an entire class of bugs where a strategy looks profitable in testing but behaves differently in production.
+**Order Flow Information Asymmetry.** Kyle (1985) formalized continuous auctions with informed trading, showing that the price impact per unit of order flow (lambda) directly measures informed trader presence. Easley and O'Hara (1987) extended this to demonstrate that trade size and direction reveal private information before it is fully incorporated into price. The system implements this through Cumulative Order Flow Imbalance (COFI), which tracks multi-bar net directional volume using Lee-Ready tick classification, and Kyle's Lambda, which measures adverse selection risk as price impact per unit of square-root volume (Almgren et al., 2005). These signals detect institutional accumulation and distribution patterns in the order flow before they are reflected in price.
 
----
+**Cross-Sectional Momentum.** Jegadeesh and Titman (1993) documented that US stocks in the top decile of prior 3-12 month returns outperform bottom-decile stocks by approximately 1% per month. This premium has been replicated out-of-sample in 40+ equity markets (Asness, Moskowitz, and Pedersen, 2013, "Value and Momentum Everywhere") and persists because it requires taking on correlated crash risk that most investors are unwilling to bear. The system computes cross-sectional momentum rank across the six-ticker universe at multiple lookback periods (5, 10, 20 bars), centering ranks at zero and normalizing to z-scores for consistent model input.
+
+**Short-Horizon Mean Reversion.** Lehmann (1990) and Lo and MacKinlay (1990) documented negative autocorrelation in individual stock returns at weekly horizons. The mechanism is structural: large directional orders cause price overshooting relative to fundamental value, and liquidity providers step in to earn the spread, pushing price back. The system implements this as a z-score of recent log-returns relative to rolling distribution (MR_Score), which identifies overbought and oversold conditions that tend to partially revert within 1-3 hours on 15-minute bars.
+
+**Statistical Arbitrage.** Avellaneda and Lee (2010) formalized intraday statistical arbitrage as trading residual returns after removing common factor exposures. The six-ticker universe naturally splits into momentum names (RKLB, ASTS, AMD) and value names (GS, GE, COST), creating cross-sectional spread dynamics that the system exploits through beta-adjusted idiosyncratic momentum (Frazzini and Pedersen, 2014). Only the alpha component --- stock-specific return after removing beta-weighted market return --- is used as a signal.
+
+**Regime Detection.** Lo and MacKinlay (1988) variance ratio test distinguishes trending regimes (positive autocorrelation, VR > 1) from mean-reverting regimes (negative autocorrelation, VR < 1). Engle (1982) ARCH models established that volatility clusters --- elevated volatility periods persist. The system combines these into a three-state regime classifier (trending, mean-reverting, volatile) that adjusts signal weights, position sizing, stop parameters, and short execution permissions per regime.
+
+### Long/Short Portfolio Construction
+
+Simultaneously holding long and short positions reduces portfolio beta and isolates factor alpha from market direction. The theoretical foundation is Frazzini and Pedersen (2014) "Betting Against Beta," which demonstrates that low-beta stocks earn higher risk-adjusted returns than high-beta stocks, creating a structural alpha source accessible through leverage-constrained long/short construction. The system enforces gross exposure limits (120% maximum), net exposure limits (40% maximum), and single-name concentration limits (25% maximum) to maintain market-neutral characteristics.
+
+The six-ticker universe splits into momentum names (RKLB beta 1.8, ASTS beta 2.1, AMD beta 1.6) and value names (GS beta 1.3, GE beta 1.1, COST beta 0.7). This enables regime-conditional rotation: in trending regimes, the system weights momentum signals and order flow; in mean-reverting regimes, it weights the MR_Score and fades extreme moves; in volatile regimes, it restricts to long-only positions with reduced sizing. Momentum tickers receive wider stops and higher targets; value tickers receive tighter stops and faster exits. Short trades universally use tighter stops to protect against short squeeze risk.
 
 ## System Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        SHARED CORE (hedge_fund/)                │
-│                                                                 │
-│  ┌──────────┐  ┌──────────┐  ┌────────────┐  ┌──────────────┐  │
-│  │ Features │  │ Ensemble │  │  Simulation│  │  Indicators  │  │
-│  │ (27 eng.)│  │ (XGB+LGB │  │  (Bracket  │  │  (RSI, ATR,  │  │
-│  │          │  │  +Ridge)  │  │   Exits)   │  │  Bollinger)  │  │
-│  └────┬─────┘  └────┬─────┘  └─────┬──────┘  └──────┬───────┘  │
-│       │              │              │                 │          │
-│  ┌────┴──────────────┴──────────────┴─────────────────┴───────┐  │
-│  │                    Risk & Governance                       │  │
-│  │  Kelly Criterion · Monte Carlo Governor · Gap Model        │  │
-│  │  Slippage Calculator · Portfolio Optimizer (MVO)           │  │
-│  └────────────────────────┬───────────────────────────────────┘  │
-│                           │                                     │
-│  ┌────────────────────────┴───────────────────────────────────┐  │
-│  │              Scanner (10+ Institutional Gates)             │  │
-│  └────────────────────────────────────────────────────────────┘  │
-└───────────────────────┬─────────────────────┬───────────────────┘
-                        │                     │
-              ┌─────────┴──────┐    ┌─────────┴──────┐
-              │   backtester   │    │     bot.py     │
-              │   (Optimize)   │    │  (Live Trade)  │
-              │  Walk-Forward  │    │  Real-Time     │
-              │  Optuna Trials │    │  WebSocket     │
-              │  Monte Carlo   │    │  Bracket Exec  │
-              │  Significance  │    │  Dashboard     │
-              └────────────────┘    └────────────────┘
-```
-
-The `hedge_fund/` package contains 19 modules totaling thousands of lines, all importable by both the backtester and the live trading engine. This modular design means every component can be unit-tested in isolation, and changes propagate identically to both environments.
-
----
-
-## Quantitative Features in Depth
-
-This section explains the mathematical and financial concepts used throughout the system. Each feature was chosen for a specific theoretical reason — not because it "looked good on a chart."
-
-### Signal Generation: 27 Engineered Features
-
-The ML model does not receive raw price data. Instead, it receives 27 carefully engineered features that encode different aspects of market behavior:
-
-| Category | Features | What They Capture |
-|---|---|---|
-| **Technical** | RSI, ADX, ATR, Bollinger Band width, VWAP Z-score | Momentum, trend strength, volatility, mean-reversion signals |
-| **Microstructure** | VPIN (toxic flow), Amihud Illiquidity | Whether institutional ("smart money") traders are active, and how costly it is to trade |
-| **Regime** | Hurst Exponent, Kalman Filter slope, GEX Proxy | Whether the market is trending, mean-reverting, or random — and the likely influence of options market-makers |
-| **Cross-Sectional** | Relative strength rank, volume surge ratio | How a stock compares to its peers right now |
-| **Temporal** | Hour of day, day of week | Well-documented intraday seasonality patterns (e.g., the "power hour" before close) |
-
-### Key Concepts Explained
-
-**Hurst Exponent (H):** A measure from fractal geometry that classifies time series behavior. When H < 0.5, prices tend to revert to the mean. When H > 0.5, prices tend to trend. The system dynamically switches between mean-reversion and momentum strategies based on H. This is computed using a rescaled range (R/S) analysis over rolling windows — the same technique used by Benoit Mandelbrot to study Nile River flooding patterns.
-
-**VPIN (Volume-Synchronized Probability of Informed Trading):** Developed by Marcos López de Prado and others, VPIN estimates the fraction of trading volume likely driven by informed traders (those with non-public information). When VPIN is high (>85th percentile), the system avoids entering new positions because the risk of trading against someone who knows something you don't is elevated. The implementation uses Bulk Volume Classification (BVC), which infers trade direction from price changes rather than requiring tick-level data.
-
-**Kalman Filter:** A recursive Bayesian estimator originally developed for NASA's Apollo navigation systems. Here, it estimates the "true" slope of price movement while filtering out noise. Unlike a simple moving average, the Kalman Filter adapts its smoothing dynamically based on how noisy recent observations have been.
-
-**Kelly Criterion:** An information-theoretic formula for optimal bet sizing, originally derived by John Kelly at Bell Labs in 1956. Given a win rate and average win/loss size, Kelly tells you the fraction of capital to risk that maximizes long-term growth. The system implements a 3-outcome variant (win, loss, timeout) and applies a fractional Kelly multiplier (typically 0.3-0.5x) for additional conservatism.
-
-**Mean-Variance Optimization (MVO):** Harry Markowitz's Nobel Prize-winning framework for portfolio construction. Given expected returns and a covariance matrix, MVO finds the allocation that maximizes the Sharpe ratio (return per unit of risk). The system uses **Ledoit-Wolf shrinkage** on the covariance matrix — a technique that blends the sample covariance with a structured estimator to reduce estimation error when the number of assets is large relative to the number of observations.
-
-**Monte Carlo Governor:** A custom risk-scaling mechanism that monitors the simulated equity curve of the most recent 50 trades. It detects drawdown states and automatically reduces position sizes: 100% risk in normal conditions, 75% during warnings (5-8% drawdown), and 50% during critical states (>8% drawdown). This prevents the common failure mode where a losing streak leads to oversized bets on "recovery" trades.
-
----
-
-## Machine Learning Pipeline
-
-### Model Architecture: Stacked Ensemble
-
-The system does not rely on a single model. Instead, it uses an ensemble of three diverse base learners combined by a meta-learner:
+### Component Map
 
 ```
-Input Features (27)
-       │
-       ├──→ XGBoost (100 trees, depth=2)    ──→ Prediction A
-       ├──→ LightGBM (100 trees, depth=3)   ──→ Prediction B
-       ├──→ Ridge Regression (alpha=1.0)     ──→ Prediction C
-       │
-       └──→ Ridge Meta-Learner ──→ Final Prediction (R-multiple)
+Polygon REST API / yfinance
+        |
+    BarValidator
+        |
+  prepare_features()
+    [OFI, VPIN, Amihud, Kalman, Hurst]
+    [COFI, Absorption_Ratio, Kyle_Lambda, Trade_Intensity]
+    [CS_Mom_Rank, CS_Volume_Rank, MR_Score, Beta_Momentum]
+    [Variance_Ratio, RV_Regime -> Regime Classification]
+    [Session_Opening, Session_Mid, Session_Closing]
+        |
+  DirectionalEnsemble (XGBoost + LightGBM + Ridge)
+        |
+  determine_entry()
+    [RegimeManager] [PortfolioManager] [TradeFilterCounter]
+        |
+  simulate_trades_stateful() / bot.py live execution
+        |
+  Kelly Sizing + DailyRiskManager + MonteCarloGovernor
+        |
+  Alpaca Bracket Orders (paper / live)
 ```
 
-Each base learner sees the same features but learns different patterns due to architectural differences. XGBoost uses exact greedy splits, LightGBM uses histogram-based leaf-wise growth, and Ridge captures linear relationships the tree models might miss. The meta-learner (Ridge regression) learns the optimal weighting of these three perspectives using out-of-fold predictions to prevent data leakage.
-
-### Walk-Forward Validation
-
-The system never trains on data it later tests on. It uses **anchored walk-forward analysis**:
-
-```
-Window 1: Train [bar 0 ──────── bar 1500]  Test [bar 1500 ── bar 2000]
-Window 2: Train [bar 0 ──────────────── bar 2000]  Test [bar 2000 ── bar 2500]
-Window 3: Train [bar 0 ──────────────────────── bar 2500]  Test [bar 2500 ── bar 3000]
-                 ↑ Training always starts from bar 0 (anchored)
-```
-
-This simulates what would happen if you deployed the model in real-time: at each point, the model only knows what has happened in the past. The expanding (anchored) window means the model accumulates more training data over time, similar to how a real system improves as it gathers more market history.
-
-### Label Generation: Triple-Barrier Method
-
-Rather than predicting whether a stock will go "up" or "down," the model predicts the expected R-multiple — how many units of risk a trade would return. Labels are generated using a bracket simulation:
-
-- **Take-Profit barrier**: If price reaches +N × ATR, the trade returns +R
-- **Stop-Loss barrier**: If price reaches -N × ATR, the trade returns -R
-- **Timeout barrier**: If neither is hit within K bars, the trade is marked to market with a decay penalty
-
-This produces continuous labels (e.g., +1.8R, -0.7R, +0.3R) rather than binary classification, giving the model much richer information to learn from.
-
-### Hyperparameter Optimization
-
-The system uses **Optuna with Tree-structured Parzen Estimator (TPE)** sampling — a Bayesian optimization algorithm that models the search space probabilistically and focuses trials on promising regions. It runs 60 trials, optimizing for the Pareto frontier between **Profit Factor** (total wins / total losses) and **Maximum Drawdown**. This multi-objective approach avoids the trap of maximizing returns at the cost of catastrophic risk.
-
----
-
-## Risk Management Framework
-
-Risk management is not an afterthought — it is the primary concern. The system implements multiple layers of protection:
-
-### Layer 1: Position-Level Controls
-- **Risk-based sizing**: Each position risks a fixed percentage of equity (default 1%), calculated as: `Quantity = (Equity × Risk%) / (Entry Price − Stop Price)`
-- **Maximum position size**: No single position can exceed 20% of total equity
-- **Slippage modeling**: Every simulated trade deducts 0.03% spread + 0.02% market impact
-
-### Layer 2: Portfolio-Level Controls
-- **Portfolio heat limit**: Total concurrent open risk capped at 5% of equity
-- **Beta constraint**: Portfolio optimizer enforces beta ≤ 0.90 to the broad market
-- **VIX adjustment**: Position sizes shrink automatically when the CBOE Volatility Index spikes
-
-### Layer 3: Event-Driven Guards
-- **Earnings Guard**: Refuses to hold positions within two weeks of earnings announcements
-- **Fundamental Guard**: Blocks trades on companies showing debt spirals or revenue collapse
-- **Overnight Gap Model**: Widens stop-losses before market close based on historical pre-market volatility
-- **News Sentiment Scoring**: Aggregates sentiment from Financial Modeling Prep and Seeking Alpha; downgrades conviction on negative news
-
-### Layer 4: System-Level Protection
-- **Monte Carlo Governor**: Dynamic risk scaling based on recent equity curve (described above)
-- **Kill Switch**: Automatic liquidation of all positions if cumulative drawdown exceeds 8%
-- **WebSocket heartbeat monitoring**: Detects data feed disconnections and halts trading
-
----
-
-## Trading Strategy
-
-The system uses a **dual-tier hybrid strategy** inspired by how institutional desks allocate capital:
-
-### Tier 1 — The Specialist
-High-conviction trades that meet strict criteria: model prediction exceeding 30 basis points of expected edge, technical alignment (RSI, ADX within optimal ranges), favorable regime (Hurst confirms directionality), and clean microstructure (low VPIN, adequate liquidity). These trades receive **2x standard risk allocation**. The Specialist may go days without triggering — and that is by design.
-
-### Tier 2 — The Grinder
-Moderate-conviction trades that pass core safety checks: prediction exceeding 20 basis points, basic liquidity requirements, and no fundamental red flags. These receive **1x standard risk allocation** and keep the equity curve compounding during periods when Tier 1 is inactive.
-
-### Exit Management
-- **Bracket orders**: Every entry has a pre-computed stop-loss and take-profit submitted simultaneously
-- **Partial profit-taking**: At 1.5R, one-third of the position is closed and the stop moves to breakeven — locking in profit while letting the remainder run
-- **Trailing stops**: Optional ATR-based trailing stop that ratchets upward as the trade progresses
-- **Timeout exits**: Positions not resolved within a configurable number of bars are closed at market price
-
----
-
-## Technology Stack
+### Technology Stack
 
 | Component | Technology | Purpose |
-|---|---|---|
-| Runtime | Python 3.11 | Core language |
-| ML Models | XGBoost, LightGBM, Scikit-Learn | Ensemble prediction |
-| Optimization | Optuna (Bayesian TPE) | Hyperparameter search |
-| Data (Historical) | Polygon.io | OHLCV bars, corporate actions |
-| Data (Real-Time) | Polygon WebSocket | Streaming 15-min bars with 93% API call reduction |
-| Data (Fundamental) | Financial Modeling Prep | Earnings, balance sheets, news |
-| Data (Volatility) | YFinance | VIX, fallback quotes |
-| Brokerage | Alpaca Trade API | Order execution, position management |
-| Portfolio Math | SciPy, NumPy | Optimization solvers, statistical distributions |
-| Covariance | Ledoit-Wolf (Scikit-Learn) | Shrinkage estimator for portfolio construction |
-| Database | SQLite | Trade history, analysis cache, Optuna storage |
-| Concurrency | Threading (16 workers) | Parallel data fetching |
-| UI | Rich | Real-time terminal dashboard |
-| Deployment | Docker | Production containerization |
-| Testing | Pytest (13 test suites) | Comprehensive unit and integration tests |
+|-----------|-----------|---------|
+| Language | Python 3.12 | Core runtime |
+| ML (Gradient Boosting) | XGBoost, LightGBM | Base learners in ensemble |
+| ML (Meta-Learner) | scikit-learn Ridge | OOF stacking meta-learner |
+| Optimization | Optuna | Bayesian hyperparameter search |
+| Broker | alpaca-trade-api | Paper/live bracket order execution |
+| Market Data | polygon-api-client, yfinance | 15-min OHLCV bars |
+| Database | SQLite | Trade history, state persistence |
+| Deployment | Docker, DigitalOcean | Ubuntu 22.04 production |
 
----
+### Signal Architecture
 
-## Strengths
+The first signal layer captures **order flow microstructure**: COFI (20-bar cumulative net directional volume, z-score normalized, grounded in Kyle 1985 informed trader footprint detection), Absorption Ratio (volume-per-price-move indicating supply/demand exhaustion), Kyle's Lambda (adverse selection measure as negative price impact per sqrt-volume), and Trade Intensity (abnormal volume relative to peers, directional using Lee-Ready classification). These signals detect institutional positioning activity before it is fully reflected in price and are strongest during opening session bars (Admati and Pfleiderer, 1988).
 
-**1. Intellectual Rigor Over Shortcuts.**
-Every quantitative decision has a theoretical foundation. The Hurst exponent is not included because it "might help" — it is there because Mandelbrot's work on long-range dependence provides a principled way to distinguish trending from mean-reverting markets. VPIN is not a custom indicator — it is a peer-reviewed measure of adverse selection risk. This distinction matters: the system is built on published research, not indicator mining.
+The second layer implements **cross-sectional factors**: momentum rank across all six tickers at 5/10/20-bar lookbacks (Jegadeesh and Titman, 1993), abnormal volume rank relative to universe peers, and beta-adjusted idiosyncratic momentum (Frazzini and Pedersen, 2014). These factors exploit the well-documented cross-sectional structure of equity returns and are computed relative to the universe to capture relative strength rather than absolute levels.
 
-**2. Walk-Forward Validation Prevents Overfitting.**
-The most common failure in algorithmic trading is overfitting — building a model that perfectly explains the past but cannot predict the future. Walk-forward analysis with anchored windows simulates real deployment conditions. The system also runs a **Monte Carlo significance test** (1,000 shuffles of trade outcomes) to determine whether observed performance could be attributed to random chance, reporting a p-value alongside every backtest.
+The third layer provides **regime detection**: the variance ratio test (Lo and MacKinlay, 1988) at lag-4 with 40-bar rolling window classifies trending vs mean-reverting regimes, while realized volatility ratio (short/long window) identifies vol expansion and compression states following Engle (1982) ARCH dynamics. These combine into a three-state classifier that gates signal weights and execution permissions.
 
-**3. Risk-First Design Philosophy.**
-The Monte Carlo Governor, Kelly Criterion sizing, portfolio heat limits, and kill switch all serve the same principle: *survival is more important than returns*. A 50% drawdown requires a 100% gain to recover. By cutting risk dynamically during losing streaks, the system avoids the asymmetric math that destroys most trading systems.
+The fourth layer encodes **session structure**: binary indicators for opening (9:30-10:15), mid-session (10:15-15:00), and closing (15:00-16:00) periods, plus continuous session progress (0-1). This allows the model to learn that order flow signals are strongest at open, mean reversion dominates mid-session, and institutional rebalancing creates opportunities at close.
 
-**4. Production-Grade Engineering.**
-This is not a Jupyter notebook experiment. It is a modular, tested, containerized system with 13 test suites, WebSocket-based real-time data, concurrent execution, and graceful failure handling. The "One Brain" architecture eliminates the gap between research and production that plagues many quantitative systems.
+## Validation Methodology
 
-**5. Comprehensive Market Awareness.**
-The system does not trade in a vacuum. It checks earnings calendars, monitors fundamental health, adjusts for overnight gap risk, tracks VIX, scores news sentiment, and measures informed trading pressure. Each of these "guard rails" prevents a specific category of loss that backtests alone would never reveal.
+Walk-forward validation with embargo gaps is essential for time series data because standard k-fold cross-validation introduces look-ahead bias: the model trains on future data and tests on past data, producing inflated accuracy estimates that do not reflect live trading performance. The system uses anchored (expanding) walk-forward windows where training always starts from bar 0 and grows forward, with an embargo gap equal to max_bars between train and test sets to prevent label leakage from the bracket label computation.
 
----
+The specific protocol uses 1500-bar training windows, 500-bar test windows, and 500-bar step size (configurable based on data source --- Polygon 2-year lookback uses 6000/2000/2000). A final holdout set of 500 bars is reserved and never seen during Optuna optimization. After optimization, the best parameters are evaluated on the holdout set, and a Monte Carlo significance test (1000 shuffled simulations) computes a p-value. Deployment requires p < 0.05, confirming that the observed profit factor is unlikely to have occurred by chance.
 
-## Limitations and Honest Critique
+## Risk Management
 
-No system is without weaknesses, and intellectual honesty demands acknowledging them:
+### Four-Layer Risk Architecture
 
-**1. Execution Assumptions May Be Optimistic.**
-While the slippage calculator models spread and market impact, real-world execution involves complexities that are difficult to simulate: partial fills, queue priority, delayed confirmations, and broker-side latency. The backtest assumes fills at modeled prices, which may not hold during volatile conditions or for less-liquid names.
+At the signal level, a percentile-calibrated prediction threshold eliminates low-conviction signals before they reach the entry decision. The threshold is set as a percentile of the absolute prediction distribution per ticker (typically 55th-85th percentile), ensuring that only the strongest model signals generate trades. This is combined with multi-confirmation gating: COFI alignment (institutional flow must not directly contradict the predicted direction), regime-signal consistency (mean reversion trades only in mean-reverting regimes), and session filtering (no new entries in the final 8% of the trading session).
 
-**2. Regime Detection Is Retrospective.**
-The Hurst exponent and volatility regime indicators are computed on trailing data. By the time the system classifies a regime change, the transition may already be underway. This creates a lag between the actual market shift and the system's response — a fundamental limitation of any lookback-based regime detector.
+At the position level, Kelly Criterion with three-outcome adjustment (win, loss, timeout) determines the optimal risk fraction per trade. The Kelly fraction is shrunk by 65% (shrinkage = 0.35) and capped at 2% maximum risk per trade, producing position sizes between 0.3% and 2.0% of equity. A confidence scalar adjusts sizing by prediction strength relative to threshold, and a volatility regime scalar reduces size during vol expansion.
 
-**3. Limited Universe and Asset Classes.**
-The system currently trades only US equities through a single broker. It cannot trade options, futures, forex, or crypto. This limits diversification and means the system is inherently correlated with the US stock market, even with beta constraints.
+At the portfolio level, the PortfolioManager enforces gross exposure (120%), net exposure (40%), and single-name concentration (25%) limits on every entry. Position flips (reversing direction on the same ticker) are blocked. Regime-conditional parameter adjustment modifies stop-loss width, take-profit ratio, and maximum bars held based on ticker class (momentum vs value) and current market regime.
 
-**4. Single-Strategy Concentration.**
-Despite the dual-tier structure, both tiers rely on the same underlying ML model and feature set. A systematic failure in the model (e.g., a structural market change that invalidates learned patterns) would affect all trades simultaneously. True institutional hedge funds run multiple uncorrelated strategies.
+At the system level, the Monte Carlo Governor tracks cumulative trade P&L and reduces the risk scalar to 0.75 at 5% drawdown and 0.50 at 8% drawdown from recent equity peak. The DailyRiskManager halts all trading if intraday losses exceed 2% of session-start equity. Together, these circuit breakers prevent catastrophic loss accumulation during adverse regimes.
 
-**5. No Live Track Record Yet.**
-While the backtesting framework is rigorous and the Monte Carlo significance test provides statistical validation, no amount of historical testing can fully substitute for a verified live track record. The system has been paper-traded but has not been validated with real capital over a full market cycle.
+### Deployment Criteria
 
-**6. Data Dependency.**
-The system relies on third-party APIs (Polygon, Alpaca, FMP) for its data. API outages, schema changes, or pricing tier modifications could disrupt operations. While fallbacks exist (e.g., YFinance for VIX), complete data loss would halt the system.
+Live capital deployment requires all of the following gates to be met simultaneously: profit factor greater than 2.0 on the walk-forward test set, Sharpe ratio greater than 1.5, maximum drawdown less than 20% of peak equity in R-multiples, Monte Carlo p-value less than 0.05 (confirming statistical significance), and a 60-day paper trading period with information coefficient greater than 0.05 on live predictions. These criteria have not yet been met.
 
----
+## Current Status and Honest Limitations
 
-## Roadmap for Improvement
+### What Has Been Demonstrated
 
-### Near-Term Enhancements
-- **Alternative Data Integration**: Incorporate NLP-based sentiment analysis from earnings call transcripts, SEC filings (10-K/10-Q), and social media to capture information before it is reflected in price
-- **Multi-Timeframe Confluence**: Train separate models on daily and hourly data, requiring agreement between timeframes before entry — reducing false signals
-- **Adaptive Feature Selection**: Implement rolling feature importance tracking so the model can drop features that become stale and weight features that gain predictive power
+The walk-forward engine runs correctly and produces real composite scores (0.19-0.46 range confirmed in live optimization runs with 150+ trials). Six tickers showed individually profitable signals in the most recent 18-ticker backtest: RKLB (PF 1.26), AMD (PF 1.13), GS (PF 1.10), COST (PF 1.06), GE (PF 1.03), ASTS (PF 1.02). The ML pipeline has no data leakage, confirmed by the test suite (225 tests passing). Live broker integration has been verified on Alpaca paper trading with bracket orders, stop replacement, position sync, and kill switch functionality. The ensemble model (XGBoost + LightGBM + Ridge) uses out-of-fold stacking to prevent meta-learner overfitting.
 
-### Medium-Term Expansions
-- **Options Strategy Module**: Introduce defined-risk options strategies (vertical spreads, iron condors) for income generation and tail-risk hedging
-- **Macro Regime Overlay**: Integrate Federal Reserve rate decisions, yield curve data, and inflation expectations to adjust the system's overall aggressiveness based on the macroeconomic environment
-- **Multi-Broker Execution**: Support additional brokerages (Interactive Brokers, TD Ameritrade) for redundancy and better execution quality
-- **Reinforcement Learning**: Explore RL-based position management where the agent learns optimal exit timing through interaction with a simulated market environment
+### Known Limitations
 
-### Long-Term Vision
-- **Low-Latency Execution Engine**: Rewrite the execution layer in Rust or C++ for sub-millisecond order routing, enabling the system to compete in faster timeframes
-- **Multi-Asset Universe**: Extend to futures, forex, and cryptocurrency markets for true cross-asset diversification
-- **Distributed Backtesting**: Parallelize walk-forward optimization across GPU clusters to test thousands of parameter combinations in minutes rather than hours
-- **Live Performance Dashboard**: Build a web-based monitoring interface with real-time P&L, drawdown charts, and model confidence visualization
+Signal quality remains below deployment criteria. The last complete backtest produced PF 0.94 overall, meaning the system lost money in aggregate despite profitable signals on six individual tickers. The twelve unprofitable tickers dragged portfolio returns negative, which motivated the v9.0 focus on the six verified names. Whether concentrating on fewer tickers improves or degrades risk-adjusted returns is an empirical question that the current backtest will answer.
 
----
+15-minute equity bars are a competitive trading frequency. High-frequency trading firms and statistical arbitrage desks at Renaissance Technologies, D.E. Shaw, and Two Sigma are well-capitalized competitors operating at this timescale with superior data, infrastructure, and execution. The signals implemented here are academically grounded but may not survive after transaction costs in practice. The system models execution costs (0.03% spread + 0.02% impact per side) but does not model stock borrow costs for short positions, which can be material for high-short-interest names like RKLB and ASTS.
 
-## Installation and Usage
+The model has not been tested through a full market cycle including a bear market or volatility crisis. The three-year training window (when Polygon data is available) covers 2021-2024, which includes the 2022 drawdown but not a recession or credit event. Regime detection may fail during market regimes not represented in the training data.
 
-### Prerequisites
-- Python 3.11+
-- API keys for Polygon.io, Alpaca, and Financial Modeling Prep
+Short execution introduces asymmetric risk that is not fully captured in backtesting. Equity shorts have theoretically unlimited downside (short squeeze), stock borrow costs that vary by availability, and regulatory risk (short-sale restrictions during market stress). The system mitigates this with tighter stops on shorts (80% of long stop width), regime-gated short permissions (no shorts in volatile regime), and portfolio net exposure limits.
 
-### 1. Install Dependencies
+## Development Roadmap
+
+Phase 1 (current): Institutional signal integration with regime-gated long/short execution and cross-sectional factor signals across a focused six-ticker universe.
+
+Phase 2: Expanding the universe to 15-20 tickers through information coefficient pre-screening, retaining only tickers where the model demonstrates statistically significant predictive power.
+
+Phase 3: Options overlay to hedge tail risk using put spreads and monetize elevated implied volatility through covered call writing on positions with positive theta characteristics.
+
+Phase 4: Multi-strategy portfolio combining the equity long/short system with the options bot for diversified alpha generation across uncorrelated strategy types.
+
+## Performance Record
+
+| Date | Version | PF | Sharpe | MaxDD | Trades | Configuration |
+|------|---------|-----|--------|-------|--------|---------------|
+| 2024 | v6.3 | 0.94 | -0.12 | -18.4R | 847 | 18 tickers, 1h bars, 150 Optuna trials |
+| 2025 | v9.0 | TBD | TBD | TBD | TBD | 6 tickers, 15m bars, 300 Optuna trials, institutional signals |
+
+Per-ticker breakdown (v6.3):
+
+| Ticker | PF | Trades |
+|--------|-----|--------|
+| RKLB | 1.26 | 52 |
+| AMD | 1.13 | 48 |
+| GS | 1.10 | 45 |
+| COST | 1.06 | 44 |
+| GE | 1.03 | 47 |
+| ASTS | 1.02 | 41 |
+
+## Installation
+
+### Docker Deployment (DigitalOcean Ubuntu)
+
+```bash
+git clone <repository-url>
+cd Hedge-fund
+
+# Environment variables
+cp .env.example .env
+# Edit .env with your keys:
+#   ALPACA_API_KEY=<your-key>
+#   ALPACA_SECRET_KEY=<your-secret>
+#   POLYGON_API_KEY=<your-polygon-key>  # optional, enables 2-year lookback
+#   FMP_API_KEY=<your-fmp-key>          # optional, enables fundamentals
+
+# Paper trading (default)
+export ALPACA_BASE_URL=https://paper-api.alpaca.markets
+
+# Build and run
+docker build -t hedge-fund .
+docker run -d --name hf --env-file .env hedge-fund
+
+# Health checks
+docker logs hf --tail 50
+docker exec hf python -c "import backtester; print('OK')"
+```
+
+### Local Development
+
 ```bash
 pip install -r requirements.txt
+python -m pytest tests/ -v          # Run test suite (225 tests)
+python backtester.py                # Run full backtest
+python bot.py                       # Start live trading bot
 ```
-
-### 2. Configure API Keys
-Create a `.env` file in the project root:
-```env
-POLYGON_API_KEY=your_polygon_key
-FMP_API_KEY=your_fmp_key
-ALPACA_API_KEY=your_alpaca_key
-ALPACA_SECRET_KEY=your_alpaca_secret
-```
-
-### 3. Run the Backtester
-The backtester performs walk-forward optimization to find optimal parameters:
-```bash
-python backtester.py
-```
-This trains the ML ensemble, runs Optuna trials, and outputs optimal parameters to `data/optimal_params.json`.
-
-### 4. Run the Live Trading Bot
-```bash
-python bot.py
-```
-The bot loads optimized parameters, connects to market data via WebSocket, and begins autonomous trading during market hours.
-
-### 5. Docker Deployment
-```bash
-docker build -t hedge-fund .
-docker run -d --env-file .env hedge-fund
-```
-
----
-
-## Testing
-
-The project includes 13 test suites covering all major subsystems:
-
-```bash
-pytest tests/ -v
-```
-
-| Test Suite | Coverage |
-|---|---|
-| `test_backtester_v6.py` | Walk-forward training, label buckets, partial profits |
-| `test_ensemble.py` | Stacking pipeline, out-of-fold predictions, cross-validation |
-| `test_risk.py` | Kelly criterion, position sizing, overnight gap model |
-| `test_scanner.py` | Candidate filtering across all 10+ gates |
-| `test_broker.py` | Alpaca integration, order lifecycle, position sync |
-| `test_indicators.py` | RSI, ATR, Bollinger Band, ADX accuracy |
-| `test_simulation.py` | Bracket exit logic, timeout handling, partial exits |
-| `test_websocket.py` | Bar caching, stream reliability, reconnection |
-| `test_data_providers.py` | API integration, rate limiting, error handling |
-| `test_config.py` | Parameter persistence and loading |
-
-All external APIs are mocked in tests to ensure deterministic, repeatable results.
-
----
-
-## Project Structure
-
-```
-Hedge-fund/
-├── bot.py                    # Live trading engine (5,100+ lines)
-├── backtester.py             # Walk-forward optimizer (1,500+ lines)
-├── hedge_fund/               # Shared core library
-│   ├── ensemble.py           #   Stacked ML ensemble (XGB + LGB + Ridge)
-│   ├── features.py           #   27-feature engineering pipeline
-│   ├── indicators.py         #   Technical analysis (RSI, ATR, Bollinger, ADX)
-│   ├── math_utils.py         #   Kalman filter, Hurst exponent
-│   ├── simulation.py         #   Bracket exit simulation & label generation
-│   ├── risk.py               #   Kelly criterion, position sizing, gap model
-│   ├── governance.py         #   Monte Carlo Governor (dynamic risk scaling)
-│   ├── optimization.py       #   Mean-variance portfolio optimizer
-│   ├── scanner.py            #   Trade candidate filtering (10+ gates)
-│   ├── broker.py             #   Alpaca API wrapper & order management
-│   ├── data_providers.py     #   Multi-source data (Polygon, FMP, VIX)
-│   ├── data.py               #   Rate limiting & caching layer
-│   ├── config.py             #   Configuration & parameter persistence
-│   ├── dashboard.py          #   Real-time terminal UI
-│   ├── websocket.py          #   Polygon WebSocket bar stream
-│   ├── analysis.py           #   Performance attribution
-│   ├── objectives.py         #   Custom XGBoost loss functions
-│   └── reliability.py        #   Failure classification & monitoring
-├── tests/                    # 13 comprehensive test suites
-├── docker/                   # Container configuration
-├── Dockerfile                # Production deployment
-├── requirements.txt          # Python dependencies
-└── verify_keys.py            # API key validation utility
-```
-
----
-
-*Built as an exercise in applied quantitative finance, software engineering, and machine learning systems design.*
