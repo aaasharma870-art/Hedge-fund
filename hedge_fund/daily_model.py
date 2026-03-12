@@ -88,8 +88,9 @@ def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3):
             continue
 
         ranked = sorted(preds.items(), key=lambda x: x[1], reverse=True)
-        longs = [(t, s) for t, s in ranked[:top_n] if s > 0]
-        shorts = [(t, abs(s)) for t, s in ranked[-bottom_n:] if s < 0]
+        # Cross-sectional: long the best, short the worst — absolute sign irrelevant
+        longs = [(t, s) for t, s in ranked[:top_n]]
+        shorts = [(t, abs(s)) for t, s in ranked[-bottom_n:]]
 
         if longs or shorts:
             watchlist[d] = {'longs': longs, 'shorts': shorts}

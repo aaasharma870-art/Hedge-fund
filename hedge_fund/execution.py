@@ -70,19 +70,33 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
     """
     Full hybrid backtest.
 
-    For each day: check exits on open positions, then enter new from watchlist.
-    Exits use daily close prices + daily ATR brackets.
+    Iterates over ALL trading days (not just watchlist dates) so SL/TP
+    is checked every day. New entries only happen on watchlist dates.
 
     Returns list of trade tuples: (pnl_r, resolved, size, ticker, direction)
     compatible with compute_risk_metrics() format.
     """
     trades = []
     positions = {}
-    sorted_dates = sorted(watchlist.keys())
 
-    for day_idx, today in enumerate(sorted_dates):
+    # Build complete list of ALL trading days from daily data
+    all_dates = set()
+    for ticker, df in daily_data.items():
+        if hasattr(df.index, 'date'):
+            all_dates.update(df.index.date)
+        else:
+            all_dates.update(df.index)
 
-        # -- CHECK EXITS --
+    # Only keep dates within the watchlist date range
+    wl_dates = sorted(watchlist.keys())
+    if not wl_dates:
+        return trades
+    min_date, max_date = wl_dates[0], wl_dates[-1]
+    all_trading_days = sorted(d for d in all_dates if min_date <= d <= max_date)
+
+    for today in all_trading_days:
+
+        # -- CHECK EXITS (runs EVERY trading day) --
         to_close = []
         for ticker, pos in positions.items():
             if ticker not in daily_data:
@@ -94,9 +108,9 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
             if current_price is None:
                 continue
 
-            # Count days held
-            days_held = sum(1 for d in sorted_dates[max(0, day_idx - pos.get('max_idx', 50)):day_idx]
-                          if d > pos['entry_date'])
+            # Count ACTUAL trading days held
+            days_held = sum(1 for d in all_trading_days
+                           if pos['entry_date'] < d <= today)
 
             # Check daily high/low for SL/TP intraday hits
             daily_high = _get_field(daily_df, today, 'High')
@@ -147,8 +161,10 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
             if pos:
                 trades.append((pnl_r, resolved, 1.0, ticker, pos['direction']))
 
-        # -- ENTER NEW POSITIONS --
+        # -- ENTER NEW POSITIONS (only on watchlist dates) --
         signals = watchlist.get(today, {})
+        if not signals:
+            continue
 
         for direction_key in ['longs', 'shorts']:
             direction = 'LONG' if direction_key == 'longs' else 'SHORT'
@@ -201,12 +217,11 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     'cost_r': cost_r,
                     'partial_taken': False,
                     'partial_pnl': 0.0,
-                    'max_idx': max_hold_days + 5,
                 }
 
     # Close remaining at last price
-    if sorted_dates:
-        last = sorted_dates[-1]
+    if all_trading_days:
+        last = all_trading_days[-1]
         for ticker, pos in positions.items():
             if ticker in daily_data:
                 p = _get_price(daily_data[ticker], last)
