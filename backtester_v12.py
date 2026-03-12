@@ -64,7 +64,7 @@ KEYS = {
 IO_WORKERS = 16
 
 _HAS_POLYGON_KEY = bool(os.environ.get("POLYGON_API_KEY", ""))
-LOOKBACK_DAYS = 756 if _HAS_POLYGON_KEY else 730  # ~3 years for 504 trading days
+LOOKBACK_DAYS = 1000 if _HAS_POLYGON_KEY else 730  # ~4 years for more training data
 
 TICKERS = [
     # High-beta momentum
@@ -321,7 +321,7 @@ def compute_signal_accuracy(watchlist, daily_data, forward_days=5):
 # COST ANALYSIS
 # ==============================================================================
 
-def compute_cost_analysis(trades, daily_data):
+def compute_cost_analysis(trades, daily_data, sl_atr_mult=1.5):
     """
     Per-ticker cost analysis.
     Returns dict of {ticker: {'avg_cost_r': float, 'n_trades': int}}.
@@ -340,9 +340,7 @@ def compute_cost_analysis(trades, daily_data):
             df = daily_data[ticker]
             if 'Daily_ATR' in df.columns and 'Close' in df.columns:
                 avg_atr_pct = (df['Daily_ATR'] / df['Close']).mean()
-                # cost_r = (cost_pct * price * 2) / (sl_atr_mult * atr)
-                # Approximate with sl_atr_mult=1.5
-                cost_r = (COST_PCT * 2) / (1.5 * avg_atr_pct) if avg_atr_pct > 0 else 0
+                cost_r = (COST_PCT * 2) / (sl_atr_mult * avg_atr_pct) if avg_atr_pct > 0 else 0
                 result[ticker] = {
                     'avg_cost_r': round(cost_r, 4),
                     'n_trades': info['n_trades'],
@@ -417,13 +415,26 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
 
         # Diagnostic for first 3 trials
         if trial.number < 3:
-            print(f"\n      [DIAG Trial {trial.number}] n_trades={n_trades}")
+            long_n = len([t for t in trades if len(t) >= 5 and t[4] == 'LONG'])
+            short_n = len([t for t in trades if len(t) >= 5 and t[4] == 'SHORT'])
+            print(f"\n      [DIAG Trial {trial.number}] n_trades={n_trades} (L:{long_n} S:{short_n})")
             if n_trades > 0:
                 outcomes = [t[0] for t in trades]
                 gw = sum(x for x in outcomes if x > 0)
                 gl = abs(sum(x for x in outcomes if x < 0))
                 pf = gw / gl if gl > 0 else 0
                 print(f"      [DIAG] Mean PnL={np.mean(outcomes):.4f}, PF={pf:.3f}")
+                # Per-ticker breakdown
+                diag_tickers = {}
+                for t in trades:
+                    tk = t[3]
+                    if tk not in diag_tickers:
+                        diag_tickers[tk] = []
+                    diag_tickers[tk].append(t)
+                for tk, tt in sorted(diag_tickers.items()):
+                    if len(tt) >= 3:
+                        tm = compute_risk_metrics(tt)
+                        print(f"        {tk}: PF={tm['PF_Raw']:.2f} Trades={tm['Trades']}")
 
         if n_trades < 30:
             return -5.0
@@ -467,6 +478,8 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
         trial.set_user_attr("n_trades", n_trades)
         trial.set_user_attr("pf", round(pf, 4))
         trial.set_user_attr("sharpe", round(sharpe, 4))
+        trial.set_user_attr("long_n", len([t for t in trades if len(t) >= 5 and t[4] == 'LONG']))
+        trial.set_user_attr("short_n", len([t for t in trades if len(t) >= 5 and t[4] == 'SHORT']))
         trial.set_user_attr("ticker_pfs", {k: round(v, 3) for k, v in ticker_pfs.items()})
 
         return score
@@ -581,23 +594,36 @@ def main():
         print("No data after feature computation.")
         return
 
-    # ── 2b. Prepare intraday data with microstructure features ──
-    print("\nComputing intraday features...")
+    # ── 2b. Prepare intraday data with execution features ──
+    print("\nComputing intraday execution features (VPIN, OFI, VWAP_ZScore)...")
     intraday_featured = {}
     for t, raw in intraday_cache.items():
         try:
-            from backtester import prepare_features
-            df = prepare_features(raw, ticker=t)
+            from hedge_fund.features import calculate_vpin, compute_ofi
+            df = raw.copy()
+
+            # VPIN
+            df['VPIN'] = calculate_vpin(df)
+
+            # OFI
+            df['OFI'] = compute_ofi(df)
+
+            # VWAP_ZScore
+            typical = (df['High'] + df['Low'] + df['Close']) / 3
+            vwap = (typical * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum().clip(lower=1)
+            vwap_std = (df['Close'] - vwap).rolling(50).std().clip(lower=1e-10)
+            df['VWAP_ZScore'] = (df['Close'] - vwap) / vwap_std
+
+            df.dropna(subset=['VPIN', 'OFI', 'VWAP_ZScore'], inplace=True)
             intraday_featured[t] = df
-            print(f"   {t}: {len(df)} 15m bars with features")
+            print(f"   {t}: {len(df)} 15m bars with execution features")
         except Exception as e:
-            # Minimal fallback: ensure VPIN/OFI/VWAP_ZScore exist
+            print(f"   {t}: Intraday features failed ({e}), using raw")
             raw = raw.copy()
             for col in ['VPIN', 'OFI', 'VWAP_ZScore']:
                 if col not in raw.columns:
                     raw[col] = 0.0
             intraday_featured[t] = raw
-            print(f"   {t}: {len(raw)} 15m bars (minimal features)")
 
     # ── 3. Split holdout ──
     print(f"\nSplitting holdout ({HOLDOUT_DAYS} trading days)...")
@@ -826,7 +852,7 @@ def main():
 
     # ── Cost analysis ──
     console.print(f"\n[bold cyan]COST ANALYSIS:[/bold cyan]")
-    cost_info = compute_cost_analysis(best_trades, daily_featured)
+    cost_info = compute_cost_analysis(best_trades, daily_featured, sl_atr_mult=bp['sl_atr_mult'])
     cost_table = Table(show_header=True, header_style="bold cyan")
     for col in ["Ticker", "ATR%", "Cost_R", "Trades"]:
         cost_table.add_column(col, justify="right" if col != "Ticker" else "left")
