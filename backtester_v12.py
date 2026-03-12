@@ -161,7 +161,14 @@ class Polygon_Helper:
             't': 'Datetime', 'c': 'Close', 'o': 'Open',
             'h': 'High', 'l': 'Low', 'v': 'Volume'
         })
-        df['Datetime'] = pd.to_datetime(df['Datetime'], unit='ms', utc=True).dt.tz_convert("America/New_York")
+        df['Datetime'] = pd.to_datetime(df['Datetime'], unit='ms', utc=True)
+        if timespan == 'day':
+            # Daily bars: Polygon timestamps at midnight UTC = correct trading date
+            # Converting to ET shifts to previous day — use UTC date instead
+            df['Datetime'] = df['Datetime'].dt.tz_localize(None).dt.normalize()
+        else:
+            # Intraday bars: convert to ET normally
+            df['Datetime'] = df['Datetime'].dt.tz_convert("America/New_York")
         df = df.set_index('Datetime').sort_index()
         df = df[~df.index.duplicated()]
         return df
@@ -578,6 +585,14 @@ def main():
     if not daily_cache:
         print("No daily data available.")
         return
+
+    # Verify daily bar dates are correct (no timezone shift)
+    for t in list(daily_cache.keys())[:1]:
+        sample_dates = daily_cache[t].index[:3]
+        print(f"   Date check ({t}): {[str(d) for d in sample_dates]}")
+        if hasattr(sample_dates[0], 'dayofweek'):
+            dow = sample_dates[0].dayofweek
+            print(f"   Day of week: {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][dow]}")
 
     # ── 2. Compute daily features ──
     print("\nComputing daily features...")
