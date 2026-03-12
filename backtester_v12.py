@@ -2,14 +2,13 @@
 # HYBRID BACKTESTER V12: DAILY ALPHA + INTRADAY EXECUTION
 # ==============================================================================
 # Two-tier institutional system:
-#   Tier 1 — Daily ML model predicts 5-day forward returns, outputs ranked watchlist
-#   Tier 2 — Intraday execution engine finds optimal 15-min entry points
+#   Tier 1 — Daily ML predicts 5-day forward returns → ranked watchlist
+#   Tier 2 — Intraday execution via 15-min VPIN/OFI/VWAP entry timing
 #
-# Key advantages over V11 intraday-only approach:
-#   - Daily momentum/mean-reversion factors have 30+ years of documented alpha
-#   - Holding 3-10 days = 20-40 trades/year/ticker vs 5000 in V11
-#   - Transaction costs drop ~10x
-#   - Intraday features used for TIMING, not DIRECTION
+# Root causes fixed from V11:
+#   1. Labels were noise (98% timeout at ~0.0) → 5-day forward returns
+#   2. Features useless on 15-min (momentum pruned 56/60) → daily factors
+#   3. Costs destroyed edge (0.285R/trade) → 0.025R/trade with 3-10d holds
 # ==============================================================================
 
 import sys
@@ -44,11 +43,12 @@ except ImportError:
 
 from hedge_fund.daily_features import DAILY_FEATURES, compute_daily_features
 from hedge_fund.daily_model import (
-    walk_forward_daily, generate_daily_watchlist, FORWARD_DAYS
+    walk_forward_daily, generate_watchlist, FORWARD_DAYS,
+    compute_daily_labels,
 )
 from hedge_fund.execution import simulate_hybrid_trades
 from hedge_fund.data import RateLimiter
-from hedge_fund.risk import SlippageCalculator
+from hedge_fund.ensemble import EnsembleModel
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -64,7 +64,7 @@ KEYS = {
 IO_WORKERS = 16
 
 _HAS_POLYGON_KEY = bool(os.environ.get("POLYGON_API_KEY", ""))
-LOOKBACK_DAYS = 504 if _HAS_POLYGON_KEY else 365  # 2 years daily data
+LOOKBACK_DAYS = 756 if _HAS_POLYGON_KEY else 730  # ~3 years for 504 trading days
 
 TICKERS = [
     # High-beta momentum
@@ -76,21 +76,20 @@ TICKERS = [
 ]
 
 # Walk-forward settings for daily model
-WF_TRAIN_DAYS = 250   # ~1 year
-WF_TEST_DAYS = 60     # ~3 months
-WF_STEP_DAYS = 60     # non-overlapping
-HOLDOUT_DAYS = 60     # last 60 trading days
+DAILY_TRAIN_DAYS = 250    # ~1 year
+DAILY_TEST_DAYS = 60      # ~3 months
+DAILY_STEP_DAYS = 60      # non-overlapping
+HOLDOUT_DAYS = 60         # last 60 trading days
 
 # Optuna
 OPTUNA_N_TRIALS = 60
 OPTUNA_TIMEOUT = None
-OPTUNA_STORAGE = "sqlite:///optuna_v12.db"
+
+# Cost
+COST_PCT = 0.0005         # 0.05% per side = 0.10% round-trip
 
 # Monte Carlo
 MONTE_CARLO_RUNS = 1000
-
-# Execution cost
-ROUND_TRIP_COST_PCT = 0.001  # 10bps round-trip (daily holds → lower cost)
 
 console = Console()
 
@@ -169,15 +168,18 @@ class Polygon_Helper:
 
 
 # ==============================================================================
-# RISK METRICS (adapted for hybrid trade dicts)
+# RISK METRICS (adapted for V12 trade tuples)
 # ==============================================================================
 
-def compute_hybrid_metrics(trades):
-    """Compute risk metrics from a list of trade dicts."""
+def compute_risk_metrics(trades):
+    """
+    Compute risk metrics from trade tuples: (pnl_r, resolved, size, ticker, direction).
+    """
     if not trades:
         return _empty_metrics()
 
-    outcomes = [t['pnl_r'] for t in trades]
+    outcomes = [t[0] for t in trades]
+    resolved = [t[0] for t in trades if t[1]]
     n_total = len(outcomes)
 
     wins = sum(1 for x in outcomes if x > 0)
@@ -185,6 +187,16 @@ def compute_hybrid_metrics(trades):
     gross_loss = abs(sum(x for x in outcomes if x < 0))
     pf_raw = gross_win / gross_loss if gross_loss > 0 else 0
     wr_raw = wins / n_total if n_total > 0 else 0
+
+    if resolved:
+        res_wins = sum(1 for x in resolved if x > 0)
+        gross_win_res = sum(x for x in resolved if x > 0)
+        gross_loss_res = abs(sum(x for x in resolved if x < 0))
+        pf_res = gross_win_res / gross_loss_res if gross_loss_res > 0 else 0
+        wr_res = res_wins / len(resolved)
+    else:
+        pf_res = 0
+        wr_res = 0
 
     equity = np.cumsum(outcomes)
     peak = np.maximum.accumulate(equity)
@@ -209,13 +221,16 @@ def compute_hybrid_metrics(trades):
     payoff_ratio = avg_win / avg_loss if avg_loss > 0 else 0
 
     # Direction breakdown
-    long_trades = [t for t in trades if t['direction'] == 'LONG']
-    short_trades = [t for t in trades if t['direction'] == 'SHORT']
+    long_trades = [t for t in trades if len(t) >= 5 and t[4] == 'LONG']
+    short_trades = [t for t in trades if len(t) >= 5 and t[4] == 'SHORT']
 
     return {
-        'PF': round(pf_raw, 3),
-        'WR': round(wr_raw, 3),
+        'PF_Raw': round(pf_raw, 3),
+        'PF_Res': round(pf_res, 3),
+        'WR_Raw': round(wr_raw, 3),
+        'WR_Res': round(wr_res, 3),
         'Trades': n_total,
+        'Resolved': len(resolved),
         'MaxDD_R': round(max_dd, 2),
         'Sharpe': round(sharpe_annual, 2),
         'TotalReturn_R': round(total_return, 2),
@@ -229,51 +244,50 @@ def compute_hybrid_metrics(trades):
 
 def _empty_metrics():
     return {
-        'PF': 0, 'WR': 0, 'Trades': 0, 'MaxDD_R': 0, 'Sharpe': 0,
+        'PF_Raw': 0, 'PF_Res': 0, 'WR_Raw': 0, 'WR_Res': 0,
+        'Trades': 0, 'Resolved': 0, 'MaxDD_R': 0, 'Sharpe': 0,
         'TotalReturn_R': 0, 'AvgWin_R': 0, 'AvgLoss_R': 0, 'PayoffRatio': 0,
         'LongTrades': 0, 'ShortTrades': 0,
     }
 
 
+# ==============================================================================
+# SIGNAL ACCURACY
+# ==============================================================================
+
 def compute_signal_accuracy(watchlist, daily_data, forward_days=5):
     """
-    Measure daily signal accuracy: what % of top-N longs actually went up?
-    What % of bottom-N shorts actually went down?
+    Measure daily signal accuracy:
+      - What % of top-N longs actually went up over 5 days?
+      - What % of bottom-N shorts actually went down?
     """
     long_correct = 0
     long_total = 0
     short_correct = 0
     short_total = 0
 
-    sorted_dates = sorted(watchlist.keys())
-
-    for d in sorted_dates:
+    for d in sorted(watchlist.keys()):
         signals = watchlist[d]
 
         for ticker, conv in signals.get('longs', []):
             if ticker not in daily_data:
                 continue
             df = daily_data[ticker]
-            entry_price = None
-            exit_price = None
             try:
                 if hasattr(df.index, 'date'):
                     mask = df.index.date == d
                     if mask.any():
                         entry_price = float(df.loc[mask, 'Close'].iloc[-1])
-                        # Find price N trading days later
                         entry_loc = df.index.get_loc(df.loc[mask].index[-1])
                         if isinstance(entry_loc, slice):
                             entry_loc = entry_loc.stop - 1
                         exit_loc = min(entry_loc + forward_days, len(df) - 1)
                         exit_price = float(df.iloc[exit_loc]['Close'])
+                        long_total += 1
+                        if exit_price > entry_price:
+                            long_correct += 1
             except Exception:
                 continue
-
-            if entry_price and exit_price:
-                long_total += 1
-                if exit_price > entry_price:
-                    long_correct += 1
 
         for ticker, conv in signals.get('shorts', []):
             if ticker not in daily_data:
@@ -289,13 +303,11 @@ def compute_signal_accuracy(watchlist, daily_data, forward_days=5):
                             entry_loc = entry_loc.stop - 1
                         exit_loc = min(entry_loc + forward_days, len(df) - 1)
                         exit_price = float(df.iloc[exit_loc]['Close'])
+                        short_total += 1
+                        if exit_price < entry_price:
+                            short_correct += 1
             except Exception:
                 continue
-
-            if entry_price and exit_price:
-                short_total += 1
-                if exit_price < entry_price:
-                    short_correct += 1
 
     return {
         'long_accuracy': long_correct / max(long_total, 1),
@@ -305,12 +317,55 @@ def compute_signal_accuracy(watchlist, daily_data, forward_days=5):
     }
 
 
+# ==============================================================================
+# COST ANALYSIS
+# ==============================================================================
+
+def compute_cost_analysis(trades, daily_data):
+    """
+    Per-ticker cost analysis.
+    Returns dict of {ticker: {'avg_cost_r': float, 'n_trades': int}}.
+    """
+    ticker_costs = {}
+    for t in trades:
+        ticker = t[3]  # (pnl_r, resolved, size, ticker, direction)
+        if ticker not in ticker_costs:
+            ticker_costs[ticker] = {'costs': [], 'n_trades': 0}
+        ticker_costs[ticker]['n_trades'] += 1
+
+    # Estimate cost_r from daily ATR and cost_pct
+    result = {}
+    for ticker, info in ticker_costs.items():
+        if ticker in daily_data:
+            df = daily_data[ticker]
+            if 'Daily_ATR' in df.columns and 'Close' in df.columns:
+                avg_atr_pct = (df['Daily_ATR'] / df['Close']).mean()
+                # cost_r = (cost_pct * price * 2) / (sl_atr_mult * atr)
+                # Approximate with sl_atr_mult=1.5
+                cost_r = (COST_PCT * 2) / (1.5 * avg_atr_pct) if avg_atr_pct > 0 else 0
+                result[ticker] = {
+                    'avg_cost_r': round(cost_r, 4),
+                    'n_trades': info['n_trades'],
+                    'atr_pct': round(avg_atr_pct * 100, 2),
+                }
+            else:
+                result[ticker] = {'avg_cost_r': 0, 'n_trades': info['n_trades'], 'atr_pct': 0}
+        else:
+            result[ticker] = {'avg_cost_r': 0, 'n_trades': info['n_trades'], 'atr_pct': 0}
+
+    return result
+
+
+# ==============================================================================
+# MONTE CARLO
+# ==============================================================================
+
 def monte_carlo_test(trades, observed_pf, n_simulations=1000):
     """Sign-randomization test for profit factor significance."""
     if len(trades) < 10:
         return 1.0
 
-    outcomes = [t['pnl_r'] for t in trades]
+    outcomes = [t[0] for t in trades]
     magnitudes = [abs(x) for x in outcomes]
     beat_count = 0
 
@@ -331,6 +386,7 @@ def monte_carlo_test(trades, observed_pf, n_simulations=1000):
 
 def create_hybrid_objective(watchlist, intraday_data, daily_data):
     """Create Optuna objective for hybrid system."""
+
     def objective(trial):
         sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.0, 2.5)
         tp_atr_mult = trial.suggest_float("tp_atr_mult", 2.0, 5.0)
@@ -354,7 +410,7 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
             max_hold_days=max_hold_days,
             entry_threshold=entry_threshold,
             partial_exit_atr=partial_exit_atr,
-            cost_pct=ROUND_TRIP_COST_PCT / 2,  # Half of round-trip per side
+            cost_pct=COST_PCT,
         )
 
         n_trades = len(trades)
@@ -363,23 +419,24 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
         if trial.number < 3:
             print(f"\n      [DIAG Trial {trial.number}] n_trades={n_trades}")
             if n_trades > 0:
-                outcomes = [t['pnl_r'] for t in trades]
-                print(f"      [DIAG] Mean PnL={np.mean(outcomes):.4f}, "
-                      f"PF={sum(x for x in outcomes if x > 0) / max(abs(sum(x for x in outcomes if x < 0)), 1e-10):.3f}")
+                outcomes = [t[0] for t in trades]
+                gw = sum(x for x in outcomes if x > 0)
+                gl = abs(sum(x for x in outcomes if x < 0))
+                pf = gw / gl if gl > 0 else 0
+                print(f"      [DIAG] Mean PnL={np.mean(outcomes):.4f}, PF={pf:.3f}")
 
-        if n_trades < 10:
+        if n_trades < 30:
             return -5.0
 
-        metrics = compute_hybrid_metrics(trades)
-        pf = metrics['PF']
+        metrics = compute_risk_metrics(trades)
+        pf = metrics.get('PF_Raw', 0)
         sharpe = metrics['Sharpe']
-        wr = metrics['WR']
-        dd = abs(metrics['MaxDD_R'])
+        wr = metrics['WR_Raw']
 
-        # Per-ticker breakdown
+        # Per-ticker consistency
         ticker_trades = {}
         for t in trades:
-            tk = t['ticker']
+            tk = t[3]
             if tk not in ticker_trades:
                 ticker_trades[tk] = []
             ticker_trades[tk].append(t)
@@ -387,29 +444,26 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
         ticker_pfs = {}
         for tk, tt in ticker_trades.items():
             if len(tt) >= 5:
-                tk_metrics = compute_hybrid_metrics(tt)
-                ticker_pfs[tk] = tk_metrics['PF']
+                tm = compute_risk_metrics(tt)
+                ticker_pfs[tk] = tm.get('PF_Raw', 0)
 
-        profitable = sum(1 for v in ticker_pfs.values() if v >= 0.95)
-        ticker_consistency = profitable / max(len(ticker_pfs), 1)
+        profitable = sum(1 for v in ticker_pfs.values() if v >= 0.90)
+        consistency = profitable / max(len(ticker_pfs), 1)
 
         # Graduated scoring
         pf_score = np.clip(np.log(max(pf, 0.01)) / np.log(2.0), -1.5, 1.0)
-        sharpe_score = np.clip(sharpe / 3.0, -1.0, 1.0)
-        trade_score = np.clip(np.log(max(n_trades, 1) / 10) / np.log(500 / 10), 0.0, 1.0)
-        wr_score = np.clip((wr - 0.35) / 0.30, -0.5, 1.0)
-        dd_score = np.clip(1.0 - abs(dd) / max(n_trades, 1) / 2.0, -1.0, 1.0)
+        sharpe_score = np.clip(sharpe / 2.0, -1.0, 1.0)
+        wr_score = np.clip((wr - 0.40) / 0.25, -1.0, 1.0)
+        trade_score = np.clip(np.log(max(n_trades, 1) / 30) / np.log(300 / 30), 0, 1)
 
         score = (
             0.30 * pf_score +
             0.25 * sharpe_score +
-            0.20 * ticker_consistency +
-            0.15 * trade_score +
-            0.10 * wr_score
+            0.15 * wr_score +
+            0.15 * consistency +
+            0.15 * trade_score
         )
 
-        trial.set_user_attr("metrics", metrics)
-        trial.set_user_attr("trades", trades)
         trial.set_user_attr("n_trades", n_trades)
         trial.set_user_attr("pf", round(pf, 4))
         trial.set_user_attr("sharpe", round(sharpe, 4))
@@ -426,8 +480,8 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
 
 def main():
     console.print("[bold green]HYBRID BACKTESTER V12.0 (DAILY ALPHA + INTRADAY EXECUTION)[/bold green]")
-    console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Daily WF: {WF_TRAIN_DAYS}/{WF_TEST_DAYS}/{WF_STEP_DAYS}d[/dim]")
-    console.print(f"[dim]Universe: {len(TICKERS)} tickers | Cost: {ROUND_TRIP_COST_PCT*100:.2f}% RT[/dim]")
+    console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Daily WF: {DAILY_TRAIN_DAYS}/{DAILY_TEST_DAYS}/{DAILY_STEP_DAYS}d[/dim]")
+    console.print(f"[dim]Universe: {len(TICKERS)} tickers | Cost: {COST_PCT*100:.3f}% per side[/dim]")
     console.print(f"[dim]Daily features: {len(DAILY_FEATURES)} | Forward: {FORWARD_DAYS}d[/dim]")
     console.print(f"[dim]Optuna: {OPTUNA_N_TRIALS} trials, 6 params[/dim]\n")
 
@@ -477,18 +531,18 @@ def main():
                     intraday_cache[t] = raw
                     print(f"   {t}: {len(raw)} 15m bars")
     else:
-        # yfinance fallback for daily data
+        # yfinance fallback
         try:
             import yfinance as yf
         except ImportError:
             print("No Polygon API key and yfinance not available.")
             return
 
-        print(f"Downloading daily data from yfinance ({min(LOOKBACK_DAYS, 365)}d)...")
+        print(f"Downloading daily data from yfinance...")
         for t in TICKERS:
             try:
-                raw = yf.download(t, period=f'{min(LOOKBACK_DAYS, 365)}d',
-                                  interval='1d', auto_adjust=True, progress=False)
+                raw = yf.download(t, period='2y', interval='1d',
+                                  auto_adjust=True, progress=False)
                 if raw is not None and len(raw) > 200:
                     raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
                     daily_cache[t] = raw
@@ -496,7 +550,7 @@ def main():
             except Exception as e:
                 print(f"   {t}: Failed ({e})")
 
-        print(f"Downloading 15m data from yfinance (57d)...")
+        print(f"Downloading 15m data from yfinance (57d max)...")
         for t in TICKERS:
             try:
                 raw = yf.download(t, period='57d', interval='15m',
@@ -517,7 +571,7 @@ def main():
     daily_featured = {}
     for t, raw in daily_cache.items():
         try:
-            df = compute_daily_features(raw, universe_daily=daily_cache, ticker=t)
+            df = compute_daily_features(raw, ticker=t, universe_daily=daily_cache)
             daily_featured[t] = df
             print(f"   {t}: {len(df)} bars after features")
         except Exception as e:
@@ -537,7 +591,7 @@ def main():
             intraday_featured[t] = df
             print(f"   {t}: {len(df)} 15m bars with features")
         except Exception as e:
-            # Minimal fallback: just ensure VPIN/OFI/VWAP_ZScore exist
+            # Minimal fallback: ensure VPIN/OFI/VWAP_ZScore exist
             raw = raw.copy()
             for col in ['VPIN', 'OFI', 'VWAP_ZScore']:
                 if col not in raw.columns:
@@ -550,7 +604,7 @@ def main():
     train_daily = {}
     holdout_daily = {}
     for t, df in daily_featured.items():
-        if len(df) > HOLDOUT_DAYS + WF_TRAIN_DAYS:
+        if len(df) > HOLDOUT_DAYS + DAILY_TRAIN_DAYS:
             train_daily[t] = df.iloc[:-HOLDOUT_DAYS]
             holdout_daily[t] = df.iloc[-HOLDOUT_DAYS:]
             print(f"   {t}: Train {len(train_daily[t])} | Holdout {len(holdout_daily[t])}")
@@ -560,15 +614,15 @@ def main():
             print(f"   {t}: All {len(df)} for training (no holdout)")
 
     # ── 4. Walk-forward daily model ──
-    print(f"\nRunning daily walk-forward ({WF_TRAIN_DAYS}d train, {WF_TEST_DAYS}d test)...")
+    print(f"\nRunning daily walk-forward ({DAILY_TRAIN_DAYS}d train, {DAILY_TEST_DAYS}d test)...")
     daily_predictions = {}
     for t, df in train_daily.items():
         avail_feats = [f for f in DAILY_FEATURES if f in df.columns]
         result = walk_forward_daily(
             df, avail_feats,
-            train_days=WF_TRAIN_DAYS,
-            test_days=WF_TEST_DAYS,
-            step_days=WF_STEP_DAYS,
+            train_days=DAILY_TRAIN_DAYS,
+            test_days=DAILY_TEST_DAYS,
+            step_days=DAILY_STEP_DAYS,
         )
         if result is not None:
             daily_predictions[t] = result
@@ -580,57 +634,57 @@ def main():
         print("No daily predictions generated.")
         return
 
-    # ── 5. Generate full watchlist (max top_n for Optuna to subset) ──
+    # ── 5. Generate full watchlist (max top_n=5 for Optuna to subset) ──
     print("\nGenerating daily watchlist...")
-    full_watchlist = generate_daily_watchlist(
-        daily_predictions, top_n=5, bottom_n=5, min_conviction=0.0)
+    full_watchlist = generate_watchlist(daily_predictions, top_n=5, bottom_n=5)
     print(f"   {len(full_watchlist)} trading days with signals")
 
     if not full_watchlist:
         print("No watchlist generated.")
         return
 
-    # Signal accuracy on training period
+    # ── Signal accuracy on training period ──
     signal_acc = compute_signal_accuracy(full_watchlist, daily_featured)
     console.print(f"\n[bold cyan]DAILY SIGNAL ACCURACY (training):[/bold cyan]")
-    console.print(f"   Long accuracy: {signal_acc['long_accuracy']:.1%} "
+    console.print(f"   Long accuracy:  {signal_acc['long_accuracy']:.1%} "
                   f"({signal_acc['long_total']} signals)")
     console.print(f"   Short accuracy: {signal_acc['short_accuracy']:.1%} "
                   f"({signal_acc['short_total']} signals)")
 
-    # ── 6. Optuna optimization ──
+    # ── 6. Split watchlist 75/25 for opt/val ──
+    sorted_wl_dates = sorted(full_watchlist.keys())
+    split_idx = int(len(sorted_wl_dates) * 0.75)
+    opt_dates = set(sorted_wl_dates[:split_idx])
+    val_dates = set(sorted_wl_dates[split_idx:])
+
+    opt_watchlist = {d: full_watchlist[d] for d in opt_dates}
+    val_watchlist = {d: full_watchlist[d] for d in val_dates}
+
+    print(f"\n   Opt watchlist: {len(opt_watchlist)} days | Val watchlist: {len(val_watchlist)} days")
+
+    # ── 7. Optuna optimization ──
     print(f"\nStarting Optuna ({OPTUNA_N_TRIALS} trials, 6 params)...")
 
-    try:
-        study = optuna.create_study(
-            study_name="hedge_fund_v12",
-            direction="maximize",
-            storage=OPTUNA_STORAGE,
-            load_if_exists=False,
-            sampler=optuna.samplers.TPESampler(
-                n_startup_trials=15, multivariate=True, seed=42),
-        )
-    except Exception:
-        study = optuna.create_study(
-            study_name="hedge_fund_v12",
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(
-                n_startup_trials=15, multivariate=True, seed=42),
-        )
+    study = optuna.create_study(
+        study_name="hedge_fund_v12",
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(
+            n_startup_trials=15, multivariate=True, seed=42),
+    )
 
     # Seed trials
     seed_configs = [
         {'sl_atr_mult': 1.5, 'tp_atr_mult': 3.0, 'max_hold_days': 10,
-         'entry_threshold': 0.40, 'top_n': 4, 'partial_exit_atr': 1.5},
+         'entry_threshold': 0.40, 'top_n': 3, 'partial_exit_atr': 1.5},
         {'sl_atr_mult': 2.0, 'tp_atr_mult': 4.0, 'max_hold_days': 8,
-         'entry_threshold': 0.35, 'top_n': 3, 'partial_exit_atr': 2.0},
+         'entry_threshold': 0.35, 'top_n': 4, 'partial_exit_atr': 2.0},
         {'sl_atr_mult': 1.5, 'tp_atr_mult': 3.5, 'max_hold_days': 12,
-         'entry_threshold': 0.30, 'top_n': 4, 'partial_exit_atr': 1.5},
+         'entry_threshold': 0.30, 'top_n': 3, 'partial_exit_atr': 1.5},
     ]
     for sp in seed_configs:
         study.enqueue_trial(sp)
 
-    objective = create_hybrid_objective(full_watchlist, intraday_featured, daily_featured)
+    objective = create_hybrid_objective(opt_watchlist, intraday_featured, daily_featured)
     study.optimize(
         objective, n_trials=OPTUNA_N_TRIALS, timeout=OPTUNA_TIMEOUT,
         show_progress_bar=True,
@@ -648,176 +702,264 @@ def main():
         ],
     )
 
-    # ── 7. Collect and display results ──
-    results = []
+    # ── 8. Collect results ──
+    valid_trials = []
     for trial in study.trials:
         if trial.state != optuna.trial.TrialState.COMPLETE:
             continue
         if trial.value is None or trial.value <= -4.0:
             continue
-        metrics = trial.user_attrs.get("metrics", _empty_metrics())
-        results.append({
-            **metrics,
-            '_score': trial.value,
-            '_params': trial.params,
-            '_trades': trial.user_attrs.get("trades", []),
-        })
+        valid_trials.append(trial)
 
-    if not results:
+    valid_trials.sort(key=lambda t: t.value, reverse=True)
+
+    if not valid_trials:
         console.print("[red]No valid results. Check data and parameters.[/red]")
         return
 
-    results.sort(key=lambda x: x['_score'], reverse=True)
+    # Show trial score distribution
+    all_scores = [t.value for t in study.trials if t.value is not None]
+    n_positive = sum(1 for s in all_scores if s > 0)
+    n_negative = sum(1 for s in all_scores if s <= -4.0)
+    console.print(f"\n[dim]Trial distribution: {n_positive} positive, "
+                  f"{len(all_scores) - n_positive - n_negative} mixed, "
+                  f"{n_negative} zero-trade[/dim]")
 
-    # Display top results
+    # ── Display top results ──
     print("\n" + "=" * 100)
     print("TOP 10 CONFIGS — V12 HYBRID (DAILY ALPHA + INTRADAY EXECUTION)")
     print("=" * 100)
 
     table = Table(show_header=True, header_style="bold magenta",
                   title=f"Top 10 ({len(TICKERS)} tickers, {LOOKBACK_DAYS}d)")
-    for col in ["Rank", "Score", "PF", "WR", "Trades", "Sharpe", "MaxDD",
-                "SL_ATR", "TP_ATR", "HoldDays", "TopN", "Thresh"]:
+    for col in ["Rank", "Score", "PF", "Sharpe", "Trades", "SL", "TP",
+                "Hold", "TopN", "Thresh", "Partial"]:
         table.add_column(col, justify="right" if col != "Rank" else "left")
 
-    best_config = None
-    for idx_r, r in enumerate(results[:10]):
-        if not best_config and r['Trades'] >= 10:
-            best_config = r
-        p = r['_params']
+    best_trial = valid_trials[0]
+    for idx_r, trial in enumerate(valid_trials[:10]):
+        p = trial.params
         table.add_row(
             str(idx_r + 1),
-            f"{r['_score']:.4f}",
-            f"{r['PF']:.2f}",
-            f"{r['WR']:.1%}",
-            str(r['Trades']),
-            f"{r['Sharpe']:.1f}",
-            f"{r['MaxDD_R']:.1f}R",
+            f"{trial.value:.4f}",
+            f"{trial.user_attrs.get('pf', 0):.2f}",
+            f"{trial.user_attrs.get('sharpe', 0):.1f}",
+            str(trial.user_attrs.get('n_trades', 0)),
             f"{p.get('sl_atr_mult', 0):.1f}",
             f"{p.get('tp_atr_mult', 0):.1f}",
             str(p.get('max_hold_days', 0)),
             str(p.get('top_n', 0)),
             f"{p.get('entry_threshold', 0):.2f}",
+            f"{p.get('partial_exit_atr', 0):.1f}",
         )
     console.print(table)
 
-    if not best_config and results:
-        best_config = results[0]
+    # ── 9. Run best config on FULL watchlist for detailed analysis ──
+    bp = best_trial.params
+    console.print(f"\n[bold green]BEST CONFIG:[/bold green]")
+    console.print(f"   SL={bp['sl_atr_mult']:.2f} ATR | TP={bp['tp_atr_mult']:.2f} ATR | "
+                  f"Hold={bp['max_hold_days']}d | Thresh={bp['entry_threshold']:.2f} | "
+                  f"TopN={bp['top_n']} | Partial={bp['partial_exit_atr']:.2f}")
 
-    if best_config:
-        console.print(f"\n[bold green]BEST CONFIG:[/bold green]")
-        console.print(f"   PF={best_config['PF']:.2f} | WR={best_config['WR']:.1%} | "
-                      f"Sharpe={best_config['Sharpe']:.2f} | MaxDD={best_config['MaxDD_R']:.1f}R")
-        console.print(f"   Trades: {best_config['Trades']} (L:{best_config['LongTrades']} S:{best_config['ShortTrades']})")
+    # Rebuild watchlist with best top_n
+    best_watchlist = {}
+    for d, signals in full_watchlist.items():
+        longs = signals.get('longs', [])[:bp['top_n']]
+        shorts = signals.get('shorts', [])[:bp['top_n']]
+        if longs or shorts:
+            best_watchlist[d] = {'longs': longs, 'shorts': shorts}
 
-        # Per-ticker breakdown
-        ticker_trades = {}
-        for t in best_config['_trades']:
-            tk = t['ticker']
-            if tk not in ticker_trades:
-                ticker_trades[tk] = []
-            ticker_trades[tk].append(t)
+    best_trades = simulate_hybrid_trades(
+        best_watchlist, intraday_featured, daily_featured,
+        sl_atr_mult=bp['sl_atr_mult'],
+        tp_atr_mult=bp['tp_atr_mult'],
+        max_hold_days=bp['max_hold_days'],
+        entry_threshold=bp['entry_threshold'],
+        partial_exit_atr=bp['partial_exit_atr'],
+        cost_pct=COST_PCT,
+    )
 
-        console.print(f"\n[bold cyan]PER-TICKER BREAKDOWN:[/bold cyan]")
-        ticker_table = Table(show_header=True, header_style="bold cyan")
-        for col in ["Ticker", "PF", "WR", "Trades", "Return"]:
-            ticker_table.add_column(col, justify="right" if col != "Ticker" else "left")
+    if not best_trades:
+        console.print("[red]No trades from best config.[/red]")
+        return
 
-        for tk in sorted(ticker_trades.keys()):
-            tt = ticker_trades[tk]
-            tm = compute_hybrid_metrics(tt)
-            ticker_table.add_row(
-                tk, f"{tm['PF']:.2f}", f"{tm['WR']:.1%}",
-                str(tm['Trades']), f"{tm['TotalReturn_R']:.1f}R")
-        console.print(ticker_table)
+    best_metrics = compute_risk_metrics(best_trades)
+    console.print(f"\n[bold cyan]FULL TRAINING RESULTS:[/bold cyan]")
+    console.print(f"   PF={best_metrics['PF_Raw']:.2f} | WR={best_metrics['WR_Raw']:.1%} | "
+                  f"Sharpe={best_metrics['Sharpe']:.2f} | MaxDD={best_metrics['MaxDD_R']:.1f}R")
+    console.print(f"   Trades: {best_metrics['Trades']} "
+                  f"(L:{best_metrics['LongTrades']} S:{best_metrics['ShortTrades']})")
+    console.print(f"   TotalReturn: {best_metrics['TotalReturn_R']:.1f}R | "
+                  f"PayoffRatio: {best_metrics['PayoffRatio']:.2f}")
 
-        # Execution quality
-        entries = best_config['_trades']
-        optimal_entries = sum(1 for t in entries if t.get('entry_quality', 0) > 0.4)
-        console.print(f"\n[bold cyan]EXECUTION QUALITY:[/bold cyan]")
-        console.print(f"   Optimal entries: {optimal_entries}/{len(entries)} "
-                      f"({optimal_entries/max(len(entries),1):.1%})")
-        avg_quality = np.mean([t.get('entry_quality', 0) for t in entries]) if entries else 0
-        console.print(f"   Avg entry score: {avg_quality:.2f}")
+    # ── LONG vs SHORT breakdown ──
+    long_trades = [t for t in best_trades if len(t) >= 5 and t[4] == 'LONG']
+    short_trades = [t for t in best_trades if len(t) >= 5 and t[4] == 'SHORT']
 
-        # Monte Carlo
-        p_value = monte_carlo_test(best_config['_trades'], best_config['PF'])
-        console.print(f"\n   Monte Carlo p-value: {p_value:.4f}")
+    if long_trades:
+        lm = compute_risk_metrics(long_trades)
+        console.print(f"\n   LONG PF:  {lm['PF_Raw']:.2f} | WR: {lm['WR_Raw']:.1%} | Trades: {lm['Trades']}")
+    if short_trades:
+        sm = compute_risk_metrics(short_trades)
+        console.print(f"   SHORT PF: {sm['PF_Raw']:.2f} | WR: {sm['WR_Raw']:.1%} | Trades: {sm['Trades']}")
 
-        # ── 8. Holdout validation ──
-        holdout_tickers = {t: h for t, h in holdout_daily.items()
-                          if h is not None and len(h) > 20}
-        if holdout_tickers:
-            console.print(f"\n[bold magenta]HOLDOUT VALIDATION ({HOLDOUT_DAYS} days):[/bold magenta]")
-            bp = best_config['_params']
+    # ── Per-ticker breakdown ──
+    ticker_trades = {}
+    for t in best_trades:
+        tk = t[3]
+        if tk not in ticker_trades:
+            ticker_trades[tk] = []
+        ticker_trades[tk].append(t)
 
-            # Train final model on all training data, predict on holdout
-            holdout_predictions = {}
-            for t, h_df in holdout_tickers.items():
-                if t not in train_daily:
-                    continue
-                full_train = train_daily[t]
-                avail_feats = [f for f in DAILY_FEATURES if f in full_train.columns and f in h_df.columns]
-                if len(avail_feats) < 5:
-                    continue
+    console.print(f"\n[bold cyan]PER-TICKER BREAKDOWN:[/bold cyan]")
+    ticker_table = Table(show_header=True, header_style="bold cyan")
+    for col in ["Ticker", "PF", "WR", "Trades", "Return_R"]:
+        ticker_table.add_column(col, justify="right" if col != "Ticker" else "left")
 
-                from hedge_fund.daily_model import compute_daily_labels
-                labels = compute_daily_labels(full_train)
-                full_train = full_train.copy()
-                full_train['DailyTarget'] = labels
-                train_clean = full_train.dropna(subset=['DailyTarget'])
+    for tk in sorted(ticker_trades.keys()):
+        tt = ticker_trades[tk]
+        tm = compute_risk_metrics(tt)
+        ticker_table.add_row(
+            tk, f"{tm['PF_Raw']:.2f}", f"{tm['WR_Raw']:.1%}",
+            str(tm['Trades']), f"{tm['TotalReturn_R']:.1f}R")
+    console.print(ticker_table)
 
-                if len(train_clean) < 100:
-                    continue
+    # ── Cost analysis ──
+    console.print(f"\n[bold cyan]COST ANALYSIS:[/bold cyan]")
+    cost_info = compute_cost_analysis(best_trades, daily_featured)
+    cost_table = Table(show_header=True, header_style="bold cyan")
+    for col in ["Ticker", "ATR%", "Cost_R", "Trades"]:
+        cost_table.add_column(col, justify="right" if col != "Ticker" else "left")
 
-                model = EnsembleModel(use_daily=True)
-                model.fit(train_clean[avail_feats], train_clean['DailyTarget'])
+    for tk in sorted(cost_info.keys()):
+        ci = cost_info[tk]
+        cost_table.add_row(
+            tk, f"{ci['atr_pct']:.1f}%", f"{ci['avg_cost_r']:.4f}R",
+            str(ci['n_trades']))
+    console.print(cost_table)
 
-                h_df = h_df.copy()
-                h_df['DailyPrediction'] = model.predict(h_df[avail_feats])
-                holdout_predictions[t] = h_df
+    avg_cost = np.mean([ci['avg_cost_r'] for ci in cost_info.values()]) if cost_info else 0
+    console.print(f"   Average cost_in_r: {avg_cost:.4f}R")
 
-            if holdout_predictions:
-                holdout_watchlist = generate_daily_watchlist(
-                    holdout_predictions,
-                    top_n=bp.get('top_n', 4),
-                    bottom_n=bp.get('top_n', 4),
+    # ── Monte Carlo ──
+    p_value = monte_carlo_test(best_trades, best_metrics['PF_Raw'], MONTE_CARLO_RUNS)
+    console.print(f"\n[bold cyan]MONTE CARLO:[/bold cyan]")
+    console.print(f"   p-value: {p_value:.4f} "
+                  f"({'SIGNIFICANT' if p_value < 0.10 else 'NOT significant'} at 10%)")
+
+    # ── 10. Validation on held-out watchlist dates ──
+    if val_watchlist:
+        console.print(f"\n[bold magenta]VALIDATION ({len(val_watchlist)} days, 25% of watchlist):[/bold magenta]")
+        val_wl = {}
+        for d, signals in val_watchlist.items():
+            longs = signals.get('longs', [])[:bp['top_n']]
+            shorts = signals.get('shorts', [])[:bp['top_n']]
+            if longs or shorts:
+                val_wl[d] = {'longs': longs, 'shorts': shorts}
+
+        val_trades = simulate_hybrid_trades(
+            val_wl, intraday_featured, daily_featured,
+            sl_atr_mult=bp['sl_atr_mult'],
+            tp_atr_mult=bp['tp_atr_mult'],
+            max_hold_days=bp['max_hold_days'],
+            entry_threshold=bp['entry_threshold'],
+            partial_exit_atr=bp['partial_exit_atr'],
+            cost_pct=COST_PCT,
+        )
+
+        if val_trades:
+            vm = compute_risk_metrics(val_trades)
+            console.print(f"   Trades: {vm['Trades']} | PF: {vm['PF_Raw']:.2f} | "
+                          f"WR: {vm['WR_Raw']:.1%} | Sharpe: {vm['Sharpe']:.2f}")
+
+            val_sig = compute_signal_accuracy(val_wl, daily_featured)
+            console.print(f"   Signal accuracy: Long {val_sig['long_accuracy']:.1%} | "
+                          f"Short {val_sig['short_accuracy']:.1%}")
+        else:
+            console.print("   [yellow]No validation trades[/yellow]")
+
+    # ── 11. Holdout validation ──
+    holdout_tickers = {t: h for t, h in holdout_daily.items()
+                       if h is not None and len(h) > 20}
+    if holdout_tickers:
+        console.print(f"\n[bold magenta]HOLDOUT VALIDATION ({HOLDOUT_DAYS} days):[/bold magenta]")
+
+        # Train final model on all training data, predict on holdout
+        holdout_predictions = {}
+        for t, h_df in holdout_tickers.items():
+            if t not in train_daily:
+                continue
+            full_train = train_daily[t]
+            avail_feats = [f for f in DAILY_FEATURES
+                          if f in full_train.columns and f in h_df.columns]
+            if len(avail_feats) < 5:
+                continue
+
+            labels = compute_daily_labels(full_train)
+            full_train_copy = full_train.copy()
+            full_train_copy['DailyTarget'] = labels
+            train_clean = full_train_copy.dropna(subset=['DailyTarget'])
+
+            if len(train_clean) < 100:
+                continue
+
+            model = EnsembleModel(use_daily=True)
+            model.fit(train_clean[avail_feats], train_clean['DailyTarget'])
+
+            h_df = h_df.copy()
+            h_df['DailyPrediction'] = model.predict(h_df[avail_feats])
+            holdout_predictions[t] = h_df
+
+        if holdout_predictions:
+            holdout_watchlist = generate_watchlist(
+                holdout_predictions,
+                top_n=bp.get('top_n', 3),
+                bottom_n=bp.get('top_n', 3),
+            )
+
+            if holdout_watchlist:
+                # Subset to best top_n
+                h_wl = {}
+                for d, signals in holdout_watchlist.items():
+                    longs = signals.get('longs', [])[:bp['top_n']]
+                    shorts = signals.get('shorts', [])[:bp['top_n']]
+                    if longs or shorts:
+                        h_wl[d] = {'longs': longs, 'shorts': shorts}
+
+                holdout_trades = simulate_hybrid_trades(
+                    h_wl, intraday_featured, daily_featured,
+                    sl_atr_mult=bp['sl_atr_mult'],
+                    tp_atr_mult=bp['tp_atr_mult'],
+                    max_hold_days=bp['max_hold_days'],
+                    entry_threshold=bp['entry_threshold'],
+                    partial_exit_atr=bp['partial_exit_atr'],
+                    cost_pct=COST_PCT,
                 )
 
-                if holdout_watchlist:
-                    holdout_trades = simulate_hybrid_trades(
-                        holdout_watchlist, intraday_featured, daily_featured,
-                        sl_atr_mult=bp.get('sl_atr_mult', 1.5),
-                        tp_atr_mult=bp.get('tp_atr_mult', 3.0),
-                        max_hold_days=bp.get('max_hold_days', 10),
-                        entry_threshold=bp.get('entry_threshold', 0.4),
-                        partial_exit_atr=bp.get('partial_exit_atr', 1.5),
-                        cost_pct=ROUND_TRIP_COST_PCT / 2,
-                    )
+                if holdout_trades:
+                    h_metrics = compute_risk_metrics(holdout_trades)
+                    console.print(f"   Trades: {h_metrics['Trades']} | "
+                                  f"PF: {h_metrics['PF_Raw']:.2f} | "
+                                  f"WR: {h_metrics['WR_Raw']:.1%} | "
+                                  f"Sharpe: {h_metrics['Sharpe']:.2f}")
 
-                    if holdout_trades:
-                        h_metrics = compute_hybrid_metrics(holdout_trades)
-                        console.print(f"   Trades: {h_metrics['Trades']} | "
-                                      f"PF: {h_metrics['PF']:.2f} | "
-                                      f"WR: {h_metrics['WR']:.1%} | "
-                                      f"Sharpe: {h_metrics['Sharpe']:.2f}")
+                    h_signal_acc = compute_signal_accuracy(h_wl, daily_featured)
+                    console.print(f"   Signal accuracy: "
+                                  f"Long {h_signal_acc['long_accuracy']:.1%} | "
+                                  f"Short {h_signal_acc['short_accuracy']:.1%}")
 
-                        h_signal_acc = compute_signal_accuracy(
-                            holdout_watchlist, daily_featured)
-                        console.print(f"   Holdout signal accuracy: "
-                                      f"Long {h_signal_acc['long_accuracy']:.1%} | "
-                                      f"Short {h_signal_acc['short_accuracy']:.1%}")
-                    else:
-                        console.print("   [yellow]No holdout trades[/yellow]")
+                    h_pval = monte_carlo_test(holdout_trades, h_metrics['PF_Raw'])
+                    console.print(f"   Monte Carlo p-value: {h_pval:.4f}")
                 else:
-                    console.print("   [yellow]No holdout watchlist[/yellow]")
+                    console.print("   [yellow]No holdout trades[/yellow]")
             else:
-                console.print("   [yellow]No holdout predictions[/yellow]")
+                console.print("   [yellow]No holdout watchlist[/yellow]")
+        else:
+            console.print("   [yellow]No holdout predictions[/yellow]")
 
     console.print(f"\n[dim]Universe: {', '.join(TICKERS)}[/dim]")
-    console.print(f"[dim]Features: {', '.join(DAILY_FEATURES[:8])}...[/dim]")
+    console.print(f"[dim]Features ({len(DAILY_FEATURES)}): {', '.join(DAILY_FEATURES)}[/dim]")
 
 
 if __name__ == "__main__":
-    from hedge_fund.ensemble import EnsembleModel
     main()

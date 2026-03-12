@@ -86,7 +86,8 @@ class EnsembleModel:
 
         self.xgb_model = xgb.XGBRegressor(**self.xgb_params)
         self.meta_model = Ridge(alpha=ridge_alpha)
-        self._use_oof = use_oof
+        # Daily data has too few samples for reliable OOF stacking
+        self._use_oof = False if use_daily else use_oof
 
         self.lgb_model = None
         self._has_lgb = False

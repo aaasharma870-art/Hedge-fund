@@ -1,8 +1,7 @@
 """
-Daily Alpha Signal Generator (Tier 1).
+Daily Alpha Signal Generator.
 
-Predicts 5-day forward cross-sectional returns using walk-forward validated
-ML ensemble on daily bars. Outputs a ranked watchlist.
+Walk-forward ML on daily bars -> cross-sectional ranked watchlist.
 """
 
 import numpy as np
@@ -10,35 +9,21 @@ import pandas as pd
 from hedge_fund.ensemble import EnsembleModel
 from hedge_fund.daily_features import DAILY_FEATURES, compute_daily_features
 
-
-# Label: 5-day forward return (continuous, for regression)
-FORWARD_DAYS = 5
+FORWARD_DAYS = 5  # Predict 5-day return
 
 
 def compute_daily_labels(df, forward_days=FORWARD_DAYS):
-    """
-    Compute forward N-day returns as regression labels.
-
-    Simple and direct: if you buy at today's close, what's your
-    return after N trading days? No bracket simulation needed at
-    the daily alpha level — brackets are for the execution layer.
-    """
-    fwd_ret = df['Close'].pct_change(forward_days).shift(-forward_days)
-    return fwd_ret
+    """5-day forward return as regression label."""
+    return df['Close'].pct_change(forward_days).shift(-forward_days)
 
 
 def walk_forward_daily(df, features, train_days=250, test_days=60,
-                       step_days=60, forward_days=FORWARD_DAYS):
+                       step_days=60):
     """
-    Walk-forward training on daily bars with expanding window.
-
-    Train on 250 days (~1 year), predict next 60 days (~3 months).
-    Expanding window: training always starts at day 0.
-
-    Returns DataFrame of test predictions with 'DailyPrediction' column,
-    or None if insufficient data.
+    Walk-forward on daily bars. Expanding (anchored) window.
+    Returns DataFrame with 'DailyPrediction' column or None.
     """
-    labels = compute_daily_labels(df, forward_days)
+    labels = compute_daily_labels(df)
     df = df.copy()
     df['DailyTarget'] = labels
 
@@ -47,8 +32,8 @@ def walk_forward_daily(df, features, train_days=250, test_days=60,
         return None
 
     n = len(df)
-    all_test_dfs = []
-    embargo = forward_days  # Prevent label leakage
+    all_test = []
+    embargo = FORWARD_DAYS
 
     start = 0
     while start + train_days + embargo + test_days <= n:
@@ -56,70 +41,55 @@ def walk_forward_daily(df, features, train_days=250, test_days=60,
         test_start = train_end + embargo
         test_end = min(test_start + test_days, n)
 
-        # Expanding window: always train from bar 0
-        train_df = df.iloc[0:train_end]
+        train_df = df.iloc[0:train_end].dropna(subset=['DailyTarget'])
         test_df = df.iloc[test_start:test_end].copy()
-
-        # Drop rows with NaN labels
-        train_clean = train_df.dropna(subset=['DailyTarget'])
         test_clean = test_df.dropna(subset=['DailyTarget'])
 
-        if len(train_clean) < 100 or len(test_clean) < 10:
+        if len(train_df) < 100 or len(test_clean) < 10:
             start += step_days
             continue
 
         model = EnsembleModel(use_daily=True)
-        model.fit(train_clean[avail], train_clean['DailyTarget'])
+        model.fit(train_df[avail], train_df['DailyTarget'])
 
         preds = model.predict(test_clean[avail])
         test_clean = test_clean.copy()
         test_clean['DailyPrediction'] = preds
-        all_test_dfs.append(test_clean)
+        all_test.append(test_clean)
 
         start += step_days
 
-    if not all_test_dfs:
+    if not all_test:
         return None
+    return pd.concat(all_test)
 
-    return pd.concat(all_test_dfs)
 
-
-def generate_daily_watchlist(daily_predictions_by_ticker, top_n=4, bottom_n=4,
-                             min_conviction=0.0):
+def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3):
     """
-    Generate daily long/short watchlist from cross-sectional ranking.
+    Cross-sectional ranking -> daily long/short watchlist.
 
-    For each trading day:
-    1. Collect all tickers' predictions for that day
-    2. Rank them cross-sectionally
-    3. Top N = long watchlist, Bottom N = short watchlist
-    4. Conviction = prediction magnitude
-
-    Returns dict: {date: {'longs': [(ticker, conviction), ...],
-                          'shorts': [(ticker, conviction), ...]}}
+    Returns: {date: {'longs': [(ticker, score), ...], 'shorts': [...]}}
     """
-    pred_panel = {}
-    for ticker, df in daily_predictions_by_ticker.items():
+    # Build date -> {ticker: prediction} panel
+    panel = {}
+    for ticker, df in predictions_by_ticker.items():
         if 'DailyPrediction' not in df.columns:
             continue
-        for date_idx, row in df.iterrows():
-            d = date_idx.date() if hasattr(date_idx, 'date') else date_idx
-            if d not in pred_panel:
-                pred_panel[d] = {}
-            pred_panel[d][ticker] = row['DailyPrediction']
+        for idx, row in df.iterrows():
+            d = idx.date() if hasattr(idx, 'date') else idx
+            if d not in panel:
+                panel[d] = {}
+            panel[d][ticker] = row['DailyPrediction']
 
     watchlist = {}
-    for d in sorted(pred_panel.keys()):
-        day_preds = pred_panel[d]
-        if len(day_preds) < top_n + bottom_n:
+    for d in sorted(panel.keys()):
+        preds = panel[d]
+        if len(preds) < top_n + bottom_n:
             continue
 
-        sorted_tickers = sorted(day_preds.items(), key=lambda x: x[1], reverse=True)
-
-        longs = [(t, score) for t, score in sorted_tickers[:top_n]
-                 if score > min_conviction]
-        shorts = [(t, abs(score)) for t, score in sorted_tickers[-bottom_n:]
-                  if score < -min_conviction]
+        ranked = sorted(preds.items(), key=lambda x: x[1], reverse=True)
+        longs = [(t, s) for t, s in ranked[:top_n] if s > 0]
+        shorts = [(t, abs(s)) for t, s in ranked[-bottom_n:] if s < 0]
 
         if longs or shorts:
             watchlist[d] = {'longs': longs, 'shorts': shorts}

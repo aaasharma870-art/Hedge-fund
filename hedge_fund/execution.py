@@ -1,20 +1,9 @@
 """
-Intraday Execution Engine (Tier 2).
+Intraday Execution Engine.
 
-Given a daily watchlist (direction + conviction), finds optimal entry points
-on 15-minute bars using microstructure signals.
-
-Entry logic:
-- Only trade during entry windows (first 90 min, last 60 min of session)
-- Score each 15-min bar using VPIN, VWAP deviation, order flow
-- Enter when execution score exceeds threshold
-- If no good entry found by end of day, enter at close (TWAP proxy)
-
-Exit logic:
-- Stop-loss: N × Daily ATR from entry
-- Take-profit: M × Daily ATR from entry
-- Timeout: max_hold_days trading days
-- Partial exit: 1/3 at partial_exit_atr × Daily ATR profit, move stop to breakeven
+Uses 15-minute VPIN, VWAP, OFI for entry timing.
+Uses DAILY ATR for bracket sizing.
+Holding period: 3-15 days.
 """
 
 import numpy as np
@@ -22,18 +11,7 @@ import pandas as pd
 
 
 def score_entry_bar(row, direction):
-    """
-    Score a 15-minute bar for entry quality.
-
-    For LONG entries, we want:
-    - Low VPIN (no informed selling)
-    - VWAP_ZScore < 0 (price below VWAP = buying below average)
-    - Positive OFI (buy pressure building)
-
-    For SHORT entries, the opposite.
-
-    Returns score in [0, 1]. Higher = better entry.
-    """
+    """Score a 15-min bar for entry quality. Returns 0-1."""
     vpin = float(row.get('VPIN', 0.5))
     vwap_z = float(row.get('VWAP_ZScore', 0.0))
     ofi = float(row.get('OFI', 0.0))
@@ -50,130 +28,154 @@ def score_entry_bar(row, direction):
     return 0.4 * vpin_score + 0.35 * vwap_score + 0.25 * ofi_score
 
 
-def is_entry_window(timestamp):
-    """
-    Check if current time is within an entry window.
-    First 90 minutes: 9:30 - 11:00 ET
-    Last 60 minutes: 15:00 - 16:00 ET
-    """
-    if not hasattr(timestamp, 'hour'):
+def is_entry_window(ts):
+    """First 90 min (9:30-11:00) or last 60 min (15:00-16:00)."""
+    if not hasattr(ts, 'hour'):
         return True
+    t = ts.hour * 60 + ts.minute
+    return (570 <= t <= 660) or (900 <= t <= 960)
 
-    h, m = timestamp.hour, timestamp.minute
-    t = h * 60 + m
 
-    morning_open = 9 * 60 + 30
-    morning_close = 11 * 60
-    afternoon_open = 15 * 60
-    afternoon_close = 16 * 60
+def find_intraday_entry(intra_df, trade_date, direction, threshold=0.4):
+    """Find best entry point on 15-min bars for trade_date."""
+    try:
+        if hasattr(intra_df.index, 'date'):
+            day_bars = intra_df[intra_df.index.date == trade_date]
+        else:
+            return None
 
-    return (morning_open <= t <= morning_close) or (afternoon_open <= t <= afternoon_close)
+        if len(day_bars) == 0:
+            return None
+
+        best = None
+        best_score = 0
+
+        for idx, row in day_bars.iterrows():
+            if not is_entry_window(idx):
+                continue
+            score = score_entry_bar(row, direction)
+            if score > threshold and score > best_score:
+                best_score = score
+                best = {'price': float(row['Close']), 'score': score, 'time': idx}
+
+        return best
+    except Exception:
+        return None
 
 
 def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                            sl_atr_mult=1.5, tp_atr_mult=3.0,
                            max_hold_days=10, entry_threshold=0.4,
-                           partial_exit_atr=1.5, cost_pct=0.0005):
+                           partial_exit_atr=1.5, cost_pct=0.001):
     """
-    Full hybrid backtest: daily signals + intraday execution.
+    Full hybrid backtest.
 
-    Args:
-        watchlist: Output from generate_daily_watchlist()
-        intraday_data: Dict of {ticker: 15min_df} with VPIN, OFI, VWAP_ZScore columns
-        daily_data: Dict of {ticker: daily_df} with Daily_ATR column
-        sl_atr_mult: Stop-loss as multiple of daily ATR
-        tp_atr_mult: Take-profit as multiple of daily ATR
-        max_hold_days: Maximum holding period in trading days
-        entry_threshold: Minimum execution score to enter (0-1)
-        partial_exit_atr: ATR multiple for partial profit take
-        cost_pct: Round-trip transaction cost as fraction of price
+    For each day: check exits on open positions, then enter new from watchlist.
+    Exits use daily close prices + daily ATR brackets.
 
-    Returns:
-        List of trade dicts with full P&L details
+    Returns list of trade tuples: (pnl_r, resolved, size, ticker, direction)
+    compatible with compute_risk_metrics() format.
     """
-    all_trades = []
-    open_positions = {}
-
+    trades = []
+    positions = {}
     sorted_dates = sorted(watchlist.keys())
 
-    for day_idx, trade_date in enumerate(sorted_dates):
-        signals = watchlist[trade_date]
+    for day_idx, today in enumerate(sorted_dates):
 
-        # ── Process exits for open positions ──
-        tickers_to_close = []
-        for ticker, pos in open_positions.items():
+        # -- CHECK EXITS --
+        to_close = []
+        for ticker, pos in positions.items():
             if ticker not in daily_data:
+                to_close.append((ticker, 0.0, True))
                 continue
 
             daily_df = daily_data[ticker]
-            entry_date = pos['entry_date']
-            days_held = sum(1 for d in sorted_dates
-                           if entry_date < d <= trade_date)
-
-            current_price = _get_close_price(daily_df, trade_date)
+            current_price = _get_price(daily_df, today)
             if current_price is None:
                 continue
 
-            r_current = _calc_r_multiple(pos, current_price)
+            # Count days held
+            days_held = sum(1 for d in sorted_dates[max(0, day_idx - pos.get('max_idx', 50)):day_idx]
+                          if d > pos['entry_date'])
 
+            # Check daily high/low for SL/TP intraday hits
+            daily_high = _get_field(daily_df, today, 'High')
+            daily_low = _get_field(daily_df, today, 'Low')
+
+            if pos['direction'] == 'LONG':
+                # SL check
+                if daily_low and daily_low <= pos['sl_price']:
+                    pnl_r = -1.0 - pos['cost_r'] + pos.get('partial_pnl', 0)
+                    to_close.append((ticker, pnl_r, True))
+                    continue
+                # TP check
+                if daily_high and daily_high >= pos['tp_price']:
+                    rr = tp_atr_mult / sl_atr_mult
+                    pnl_r = rr - pos['cost_r'] + pos.get('partial_pnl', 0)
+                    to_close.append((ticker, pnl_r, True))
+                    continue
+                # Partial profit
+                partial_level = pos['entry_price'] + partial_exit_atr * pos['daily_atr']
+                if daily_high and daily_high >= partial_level and not pos.get('partial_taken'):
+                    pos['partial_taken'] = True
+                    pos['partial_pnl'] = (1 / 3) * partial_exit_atr / sl_atr_mult
+                    pos['sl_price'] = pos['entry_price']  # Move to breakeven
+            else:
+                if daily_high and daily_high >= pos['sl_price']:
+                    pnl_r = -1.0 - pos['cost_r'] + pos.get('partial_pnl', 0)
+                    to_close.append((ticker, pnl_r, True))
+                    continue
+                if daily_low and daily_low <= pos['tp_price']:
+                    rr = tp_atr_mult / sl_atr_mult
+                    pnl_r = rr - pos['cost_r'] + pos.get('partial_pnl', 0)
+                    to_close.append((ticker, pnl_r, True))
+                    continue
+                partial_level = pos['entry_price'] - partial_exit_atr * pos['daily_atr']
+                if daily_low and daily_low <= partial_level and not pos.get('partial_taken'):
+                    pos['partial_taken'] = True
+                    pos['partial_pnl'] = (1 / 3) * partial_exit_atr / sl_atr_mult
+                    pos['sl_price'] = pos['entry_price']
+
+            # Timeout
             if days_held >= max_hold_days:
-                pnl_r = r_current - pos['cost_r'] + pos.get('partial_pnl', 0)
-                all_trades.append(_make_trade(
-                    pos, current_price, trade_date, pnl_r, 'timeout', days_held))
-                tickers_to_close.append(ticker)
-                continue
+                r = _calc_r(pos, current_price)
+                pnl_r = r - pos['cost_r'] + pos.get('partial_pnl', 0)
+                to_close.append((ticker, pnl_r, False))
 
-            if r_current <= -1.0:
-                pnl_r = -1.0 - pos['cost_r']
-                all_trades.append(_make_trade(
-                    pos, pos['sl_price'], trade_date, pnl_r, 'stop_loss', days_held))
-                tickers_to_close.append(ticker)
+        for ticker, pnl_r, resolved in to_close:
+            pos = positions.pop(ticker, None)
+            if pos:
+                trades.append((pnl_r, resolved, 1.0, ticker, pos['direction']))
 
-            elif r_current >= tp_atr_mult / sl_atr_mult:
-                rr = tp_atr_mult / sl_atr_mult
-                pnl_r = rr - pos['cost_r'] + pos.get('partial_pnl', 0)
-                all_trades.append(_make_trade(
-                    pos, pos['tp_price'], trade_date, pnl_r, 'take_profit', days_held))
-                tickers_to_close.append(ticker)
+        # -- ENTER NEW POSITIONS --
+        signals = watchlist.get(today, {})
 
-            elif (r_current >= partial_exit_atr / sl_atr_mult
-                  and not pos.get('partial_taken')):
-                pos['partial_taken'] = True
-                pos['sl_price'] = pos['entry_price']
-                pos['partial_pnl'] = (1 / 3) * partial_exit_atr / sl_atr_mult
-
-        for t in tickers_to_close:
-            del open_positions[t]
-
-        # ── Process new entries ──
         for direction_key in ['longs', 'shorts']:
             direction = 'LONG' if direction_key == 'longs' else 'SHORT'
 
             for ticker, conviction in signals.get(direction_key, []):
-                if ticker in open_positions:
+                if ticker in positions:
+                    continue
+                if ticker not in daily_data:
                     continue
 
-                if ticker not in intraday_data or ticker not in daily_data:
-                    continue
-
-                intra_df = intraday_data[ticker]
                 daily_df = daily_data[ticker]
-
-                daily_atr = _get_daily_atr(daily_df, trade_date)
+                daily_atr = _get_field(daily_df, today, 'Daily_ATR')
                 if daily_atr is None or daily_atr <= 0:
                     continue
 
-                entry = _find_intraday_entry(
-                    intra_df, trade_date, direction, entry_threshold)
+                # Find intraday entry
+                entry_info = None
+                if ticker in intraday_data:
+                    entry_info = find_intraday_entry(
+                        intraday_data[ticker], today, direction, entry_threshold)
 
-                if entry is None:
-                    entry_price = _get_close_price(daily_df, trade_date)
+                if entry_info:
+                    entry_price = entry_info['price']
+                else:
+                    entry_price = _get_price(daily_df, today)
                     if entry_price is None:
                         continue
-                    entry_quality = 0.3
-                else:
-                    entry_price = entry['price']
-                    entry_quality = entry['score']
 
                 sl_dist = sl_atr_mult * daily_atr
                 tp_dist = tp_atr_mult * daily_atr
@@ -185,136 +187,63 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     sl_price = entry_price + sl_dist
                     tp_price = entry_price - tp_dist
 
-                cost_r = (cost_pct * entry_price) / sl_dist if sl_dist > 0 else 0
+                cost_r = (cost_pct * entry_price * 2) / sl_dist if sl_dist > 0 else 0
 
-                open_positions[ticker] = {
+                positions[ticker] = {
                     'direction': direction,
                     'entry_price': entry_price,
-                    'entry_date': trade_date,
+                    'entry_date': today,
                     'sl_price': sl_price,
                     'tp_price': tp_price,
                     'sl_dist': sl_dist,
                     'daily_atr': daily_atr,
                     'conviction': conviction,
-                    'entry_quality': entry_quality,
                     'cost_r': cost_r,
                     'partial_taken': False,
                     'partial_pnl': 0.0,
-                    'ticker': ticker,
+                    'max_idx': max_hold_days + 5,
                 }
 
-    # Close remaining open positions
-    for ticker, pos in open_positions.items():
-        if ticker in daily_data and sorted_dates:
-            last_date = sorted_dates[-1]
-            current_price = _get_close_price(daily_data[ticker], last_date)
-            if current_price:
-                pnl_r = _calc_r_multiple(pos, current_price)
-                pnl_r = pnl_r - pos['cost_r'] + pos.get('partial_pnl', 0)
-                all_trades.append(_make_trade(
-                    pos, current_price, last_date, pnl_r, 'end_of_backtest', 0))
+    # Close remaining at last price
+    if sorted_dates:
+        last = sorted_dates[-1]
+        for ticker, pos in positions.items():
+            if ticker in daily_data:
+                p = _get_price(daily_data[ticker], last)
+                if p:
+                    r = _calc_r(pos, p)
+                    trades.append((r - pos['cost_r'] + pos.get('partial_pnl', 0),
+                                   False, 1.0, ticker, pos['direction']))
 
-    return all_trades
-
-
-# ── Helper functions ──
-
-def _make_trade(pos, exit_price, exit_date, pnl_r, exit_type, days_held):
-    """Create a standardized trade dict."""
-    return {
-        'ticker': pos['ticker'],
-        'direction': pos['direction'],
-        'entry_price': pos['entry_price'],
-        'exit_price': exit_price,
-        'entry_date': pos['entry_date'],
-        'exit_date': exit_date,
-        'pnl_r': pnl_r,
-        'exit_type': exit_type,
-        'conviction': pos['conviction'],
-        'days_held': days_held,
-        'entry_quality': pos.get('entry_quality', 0),
-    }
+    return trades
 
 
-def _get_close_price(daily_df, date):
-    """Get close price for a date, with fuzzy matching."""
+def _get_price(df, date):
     try:
-        if hasattr(daily_df.index, 'date'):
-            mask = daily_df.index.date == date
+        if hasattr(df.index, 'date'):
+            mask = df.index.date == date
             if mask.any():
-                return float(daily_df.loc[mask, 'Close'].iloc[-1])
-        if date in daily_df.index:
-            return float(daily_df.loc[date, 'Close'])
+                return float(df.loc[mask, 'Close'].iloc[-1])
+        if date in df.index:
+            return float(df.loc[date, 'Close'])
     except Exception:
         pass
     return None
 
 
-def _get_daily_atr(daily_df, date):
-    """Get daily ATR for a date."""
+def _get_field(df, date, field):
     try:
-        if 'Daily_ATR' in daily_df.columns:
-            if hasattr(daily_df.index, 'date'):
-                mask = daily_df.index.date == date
-                if mask.any():
-                    return float(daily_df.loc[mask, 'Daily_ATR'].iloc[-1])
-            if date in daily_df.index:
-                return float(daily_df.loc[date, 'Daily_ATR'])
+        if hasattr(df.index, 'date'):
+            mask = df.index.date == date
+            if mask.any() and field in df.columns:
+                return float(df.loc[mask, field].iloc[-1])
     except Exception:
         pass
     return None
 
 
-def _find_intraday_entry(intra_df, trade_date, direction, threshold):
-    """
-    Scan 15-minute bars on trade_date for best entry point.
-
-    Returns {'price': float, 'score': float, 'time': timestamp} or None.
-    """
-    try:
-        if hasattr(intra_df.index, 'date'):
-            day_bars = intra_df[intra_df.index.date == trade_date]
-        else:
-            return None
-
-        if len(day_bars) == 0:
-            return None
-
-        best_entry = None
-        best_score = 0
-
-        for idx, row in day_bars.iterrows():
-            if not is_entry_window(idx):
-                continue
-
-            score = score_entry_bar(row, direction)
-
-            if score > threshold and score > best_score:
-                best_score = score
-                best_entry = {
-                    'price': float(row['Close']),
-                    'score': score,
-                    'time': idx,
-                }
-
-        return best_entry
-
-    except Exception:
-        return None
-
-
-def _calc_pnl(pos, exit_price, cost_pct):
-    """Calculate PnL in R-multiples."""
+def _calc_r(pos, price):
     if pos['direction'] == 'LONG':
-        raw = (exit_price - pos['entry_price']) / pos['sl_dist']
+        return (price - pos['entry_price']) / pos['sl_dist']
     else:
-        raw = (pos['entry_price'] - exit_price) / pos['sl_dist']
-    return raw - pos['cost_r'] + pos.get('partial_pnl', 0)
-
-
-def _calc_r_multiple(pos, current_price):
-    """Calculate current R-multiple (unrealized)."""
-    if pos['direction'] == 'LONG':
-        return (current_price - pos['entry_price']) / pos['sl_dist']
-    else:
-        return (pos['entry_price'] - current_price) / pos['sl_dist']
+        return (pos['entry_price'] - price) / pos['sl_dist']
