@@ -66,7 +66,8 @@ def find_intraday_entry(intra_df, trade_date, direction, threshold=0.4):
 def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                            sl_atr_mult=1.5, tp_atr_mult=3.0,
                            max_hold_days=10, entry_threshold=0.4,
-                           partial_exit_atr=1.5, cost_pct=0.001):
+                           partial_exit_atr=1.5, cost_pct=0.001,
+                           short_size_mult=0.5):
     """
     Full hybrid backtest.
 
@@ -78,6 +79,9 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
     """
     trades = []
     positions = {}
+    recent_outcomes = {'LONG': [], 'SHORT': []}  # Track last N outcomes per direction
+    REGIME_LOOKBACK = 10   # Check last 10 trades per direction
+    REGIME_MIN_WR = 0.35   # If last 10 trades have <35% WR, reduce exposure
 
     # Build complete list of ALL trading days from daily data
     all_dates = set()
@@ -128,7 +132,9 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
             if pos['direction'] == 'LONG':
                 # SL check
                 if daily_low and daily_low <= pos['sl_price']:
-                    pnl_r = -1.0 - pos['cost_r'] + pos.get('partial_pnl', 0)
+                    # Compute ACTUAL R-multiple from current SL position
+                    actual_r = (pos['sl_price'] - pos['entry_price']) / pos['sl_dist']
+                    pnl_r = actual_r - pos['cost_r'] + pos.get('partial_pnl', 0)
                     to_close.append((ticker, pnl_r, True))
                     continue
                 # TP check
@@ -152,7 +158,9 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                         pos['sl_price'] = trail_level
             else:
                 if daily_high and daily_high >= pos['sl_price']:
-                    pnl_r = -1.0 - pos['cost_r'] + pos.get('partial_pnl', 0)
+                    # Compute ACTUAL R-multiple from current SL position
+                    actual_r = (pos['entry_price'] - pos['sl_price']) / pos['sl_dist']
+                    pnl_r = actual_r - pos['cost_r'] + pos.get('partial_pnl', 0)
                     to_close.append((ticker, pnl_r, True))
                     continue
                 if daily_low and daily_low <= pos['tp_price']:
@@ -182,7 +190,12 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
         for ticker, pnl_r, resolved in to_close:
             pos = positions.pop(ticker, None)
             if pos:
-                trades.append((pnl_r, resolved, 1.0, ticker, pos['direction']))
+                sized_pnl = pnl_r * pos.get('size', 1.0)
+                trades.append((sized_pnl, resolved, pos.get('size', 1.0), ticker, pos['direction']))
+                # Track recent outcomes for regime detection
+                recent_outcomes[pos['direction']].append(1 if pnl_r > 0 else 0)
+                if len(recent_outcomes[pos['direction']]) > REGIME_LOOKBACK:
+                    recent_outcomes[pos['direction']].pop(0)
 
         # -- ENTER NEW POSITIONS (only on watchlist dates) --
         signals = watchlist.get(today, {})
@@ -228,6 +241,18 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
 
                 cost_r = (cost_pct * entry_price * 2) / sl_dist if sl_dist > 0 else 0
 
+                # Regime gate: skip if recent signals for this direction are failing
+                recent = recent_outcomes.get(direction, [])
+                if len(recent) >= REGIME_LOOKBACK:
+                    recent_wr = sum(recent) / len(recent)
+                    if recent_wr < REGIME_MIN_WR:
+                        continue  # Skip this entry — regime is unfavorable
+
+                # Asymmetric sizing: reduce short exposure
+                size = 1.0
+                if direction == 'SHORT':
+                    size = short_size_mult
+
                 positions[ticker] = {
                     'direction': direction,
                     'entry_price': entry_price,
@@ -241,6 +266,7 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     'partial_taken': False,
                     'partial_pnl': 0.0,
                     'best_price': entry_price,
+                    'size': size,
                 }
 
     # Close remaining at last price
@@ -251,8 +277,10 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                 p = _get_price(daily_data[ticker], last)
                 if p:
                     r = _calc_r(pos, p)
-                    trades.append((r - pos['cost_r'] + pos.get('partial_pnl', 0),
-                                   False, 1.0, ticker, pos['direction']))
+                    pnl_r = r - pos['cost_r'] + pos.get('partial_pnl', 0)
+                    sized_pnl = pnl_r * pos.get('size', 1.0)
+                    trades.append((sized_pnl, False, pos.get('size', 1.0),
+                                   ticker, pos['direction']))
 
     return trades
 
