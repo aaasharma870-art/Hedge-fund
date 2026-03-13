@@ -64,9 +64,11 @@ def walk_forward_daily(df, features, train_days=250, test_days=60,
     return pd.concat(all_test)
 
 
-def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3):
+def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3,
+                       min_spread=0.0):
     """
     Cross-sectional ranking -> daily long/short watchlist.
+    min_spread: skip days where top-bottom prediction gap is below this.
 
     Returns: {date: {'longs': [(ticker, score), ...], 'shorts': [...]}}
     """
@@ -88,6 +90,13 @@ def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3):
             continue
 
         ranked = sorted(preds.items(), key=lambda x: x[1], reverse=True)
+
+        # Conviction filter: skip days with low spread between best and worst
+        if min_spread > 0:
+            spread = ranked[0][1] - ranked[-1][1]
+            if spread < min_spread:
+                continue
+
         # Cross-sectional: long the best, short the worst — absolute sign irrelevant
         longs = [(t, s) for t, s in ranked[:top_n]]
         shorts = [(t, abs(s)) for t, s in ranked[-bottom_n:]]

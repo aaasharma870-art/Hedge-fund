@@ -116,6 +116,15 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
             daily_high = _get_field(daily_df, today, 'High')
             daily_low = _get_field(daily_df, today, 'Low')
 
+            # Track best price for trailing stop
+            if current_price:
+                if pos['direction'] == 'LONG':
+                    if current_price > pos.get('best_price', 0):
+                        pos['best_price'] = current_price
+                else:
+                    if current_price < pos.get('best_price', float('inf')):
+                        pos['best_price'] = current_price
+
             if pos['direction'] == 'LONG':
                 # SL check
                 if daily_low and daily_low <= pos['sl_price']:
@@ -134,6 +143,13 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     pos['partial_taken'] = True
                     pos['partial_pnl'] = (1 / 3) * partial_exit_atr / sl_atr_mult
                     pos['sl_price'] = pos['entry_price']  # Move to breakeven
+                # Trailing stop: after partial taken, trail behind best price
+                if pos.get('partial_taken') and current_price:
+                    if current_price > pos.get('best_price', 0):
+                        pos['best_price'] = current_price
+                    trail_level = pos['best_price'] - 1.0 * pos['daily_atr']
+                    if trail_level > pos['sl_price']:
+                        pos['sl_price'] = trail_level
             else:
                 if daily_high and daily_high >= pos['sl_price']:
                     pnl_r = -1.0 - pos['cost_r'] + pos.get('partial_pnl', 0)
@@ -149,6 +165,13 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     pos['partial_taken'] = True
                     pos['partial_pnl'] = (1 / 3) * partial_exit_atr / sl_atr_mult
                     pos['sl_price'] = pos['entry_price']
+                # Trailing stop for shorts
+                if pos.get('partial_taken') and current_price:
+                    if current_price < pos.get('best_price', float('inf')):
+                        pos['best_price'] = current_price
+                    trail_level = pos['best_price'] + 1.0 * pos['daily_atr']
+                    if trail_level < pos['sl_price']:
+                        pos['sl_price'] = trail_level
 
             # Timeout
             if days_held >= max_hold_days:
@@ -217,6 +240,7 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     'cost_r': cost_r,
                     'partial_taken': False,
                     'partial_pnl': 0.0,
+                    'best_price': entry_price,
                 }
 
     # Close remaining at last price

@@ -64,7 +64,7 @@ KEYS = {
 IO_WORKERS = 16
 
 _HAS_POLYGON_KEY = bool(os.environ.get("POLYGON_API_KEY", ""))
-LOOKBACK_DAYS = 1000 if _HAS_POLYGON_KEY else 730  # ~4 years for more training data
+LOOKBACK_DAYS = 1500 if _HAS_POLYGON_KEY else 730  # ~6 years for more walk-forward windows
 
 TICKERS = [
     # High-beta momentum
@@ -79,10 +79,10 @@ TICKERS = [
 DAILY_TRAIN_DAYS = 250    # ~1 year
 DAILY_TEST_DAYS = 60      # ~3 months
 DAILY_STEP_DAYS = 60      # non-overlapping
-HOLDOUT_DAYS = 60         # last 60 trading days
+HOLDOUT_DAYS = 90         # last 90 trading days
 
 # Optuna
-OPTUNA_N_TRIALS = 60
+OPTUNA_N_TRIALS = 80
 OPTUNA_TIMEOUT = None
 
 # Cost
@@ -389,24 +389,41 @@ def monte_carlo_test(trades, observed_pf, n_simulations=1000):
 # OPTUNA OBJECTIVE
 # ==============================================================================
 
+def _filter_watchlist(watchlist, top_n, min_spread=0.0):
+    """Filter watchlist by top_n and minimum prediction spread."""
+    filtered = {}
+    for d, signals in watchlist.items():
+        longs = signals.get('longs', [])[:top_n]
+        shorts = signals.get('shorts', [])[:top_n]
+
+        # Skip low-conviction days
+        if min_spread > 0 and longs and shorts:
+            best_score = longs[0][1] if longs else 0
+            worst_score = shorts[0][1] if shorts else 0
+            spread = abs(best_score) + abs(worst_score)
+            if spread < min_spread:
+                continue
+
+        if longs or shorts:
+            filtered[d] = {'longs': longs, 'shorts': shorts}
+    return filtered
+
+
 def create_hybrid_objective(watchlist, intraday_data, daily_data):
     """Create Optuna objective for hybrid system."""
 
     def objective(trial):
-        sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.0, 2.5)
-        tp_atr_mult = trial.suggest_float("tp_atr_mult", 2.0, 5.0)
-        max_hold_days = trial.suggest_int("max_hold_days", 5, 15)
-        entry_threshold = trial.suggest_float("entry_threshold", 0.25, 0.55)
-        top_n = trial.suggest_int("top_n", 2, 5)
-        partial_exit_atr = trial.suggest_float("partial_exit_atr", 1.0, 2.5)
+        sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.3, 2.0)
+        tp_rr = trial.suggest_float("tp_rr", 2.0, 4.0)
+        tp_atr_mult = sl_atr_mult * tp_rr
+        max_hold_days = trial.suggest_int("max_hold_days", 5, 12)
+        entry_threshold = trial.suggest_float("entry_threshold", 0.25, 0.50)
+        top_n = trial.suggest_int("top_n", 2, 3)
+        partial_exit_atr = trial.suggest_float("partial_exit_atr", 1.0, 2.0)
+        min_spread = trial.suggest_float("min_spread", 0.0, 0.02)
 
-        # Regenerate watchlist with this trial's top_n
-        trial_watchlist = {}
-        for d, signals in watchlist.items():
-            longs = signals.get('longs', [])[:top_n]
-            shorts = signals.get('shorts', [])[:top_n]
-            if longs or shorts:
-                trial_watchlist[d] = {'longs': longs, 'shorts': shorts}
+        # Regenerate watchlist with this trial's top_n and min_spread
+        trial_watchlist = _filter_watchlist(watchlist, top_n, min_spread)
 
         trades = simulate_hybrid_trades(
             trial_watchlist, intraday_data, daily_data,
@@ -468,16 +485,20 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
         profitable = sum(1 for v in ticker_pfs.values() if v >= 0.90)
         consistency = profitable / max(len(ticker_pfs), 1)
 
-        # Graduated scoring
+        # Graduated scoring — WR-prioritized
         pf_score = np.clip(np.log(max(pf, 0.01)) / np.log(2.0), -1.5, 1.0)
         sharpe_score = np.clip(sharpe / 2.0, -1.0, 1.0)
-        wr_score = np.clip((wr - 0.40) / 0.25, -1.0, 1.0)
+        wr_score = np.clip((wr - 0.40) / 0.15, -1.0, 1.0)
         trade_score = np.clip(np.log(max(n_trades, 1) / 30) / np.log(300 / 30), 0, 1)
 
+        # Penalize configs where WR < 42%
+        if wr < 0.42:
+            pf_score *= 0.5
+
         score = (
-            0.30 * pf_score +
-            0.25 * sharpe_score +
-            0.15 * wr_score +
+            0.25 * pf_score +
+            0.20 * sharpe_score +
+            0.25 * wr_score +
             0.15 * consistency +
             0.15 * trade_score
         )
@@ -677,7 +698,7 @@ def main():
 
     # ── 5. Generate full watchlist (max top_n=5 for Optuna to subset) ──
     print("\nGenerating daily watchlist...")
-    full_watchlist = generate_watchlist(daily_predictions, top_n=5, bottom_n=5)
+    full_watchlist = generate_watchlist(daily_predictions, top_n=5, bottom_n=5, min_spread=0.0)
     print(f"   {len(full_watchlist)} trading days with signals")
 
     if not full_watchlist:
@@ -715,12 +736,14 @@ def main():
 
     # Seed trials
     seed_configs = [
-        {'sl_atr_mult': 1.5, 'tp_atr_mult': 3.0, 'max_hold_days': 10,
-         'entry_threshold': 0.40, 'top_n': 3, 'partial_exit_atr': 1.5},
-        {'sl_atr_mult': 2.0, 'tp_atr_mult': 4.0, 'max_hold_days': 8,
-         'entry_threshold': 0.35, 'top_n': 4, 'partial_exit_atr': 2.0},
-        {'sl_atr_mult': 1.5, 'tp_atr_mult': 3.5, 'max_hold_days': 12,
-         'entry_threshold': 0.30, 'top_n': 3, 'partial_exit_atr': 1.5},
+        {'sl_atr_mult': 1.5, 'tp_rr': 3.0, 'max_hold_days': 6,
+         'entry_threshold': 0.40, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
+        {'sl_atr_mult': 1.5, 'tp_rr': 2.0, 'max_hold_days': 8,
+         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.01},
+        {'sl_atr_mult': 1.7, 'tp_rr': 2.5, 'max_hold_days': 7,
+         'entry_threshold': 0.30, 'top_n': 3, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
+        {'sl_atr_mult': 2.0, 'tp_rr': 2.0, 'max_hold_days': 10,
+         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 2.0, 'min_spread': 0.0},
     ]
     for sp in seed_configs:
         study.enqueue_trial(sp)
@@ -773,8 +796,8 @@ def main():
 
     table = Table(show_header=True, header_style="bold magenta",
                   title=f"Top 10 ({len(TICKERS)} tickers, {LOOKBACK_DAYS}d)")
-    for col in ["Rank", "Score", "PF", "Sharpe", "Trades", "SL", "TP",
-                "Hold", "TopN", "Thresh", "Partial"]:
+    for col in ["Rank", "Score", "PF", "Sharpe", "Trades", "SL", "R:R",
+                "Hold", "TopN", "Thresh", "Spread"]:
         table.add_column(col, justify="right" if col != "Rank" else "left")
 
     best_trial = valid_trials[0]
@@ -787,33 +810,29 @@ def main():
             f"{trial.user_attrs.get('sharpe', 0):.1f}",
             str(trial.user_attrs.get('n_trades', 0)),
             f"{p.get('sl_atr_mult', 0):.1f}",
-            f"{p.get('tp_atr_mult', 0):.1f}",
+            f"{p.get('tp_rr', 0):.1f}",
             str(p.get('max_hold_days', 0)),
             str(p.get('top_n', 0)),
             f"{p.get('entry_threshold', 0):.2f}",
-            f"{p.get('partial_exit_atr', 0):.1f}",
+            f"{p.get('min_spread', 0):.3f}",
         )
     console.print(table)
 
     # ── 9. Run best config on FULL watchlist for detailed analysis ──
     bp = best_trial.params
+    bp_tp_atr = bp['sl_atr_mult'] * bp['tp_rr']
     console.print(f"\n[bold green]BEST CONFIG:[/bold green]")
-    console.print(f"   SL={bp['sl_atr_mult']:.2f} ATR | TP={bp['tp_atr_mult']:.2f} ATR | "
+    console.print(f"   SL={bp['sl_atr_mult']:.2f} ATR | TP={bp_tp_atr:.2f} ATR (R:R 1:{bp['tp_rr']:.1f}) | "
                   f"Hold={bp['max_hold_days']}d | Thresh={bp['entry_threshold']:.2f} | "
-                  f"TopN={bp['top_n']} | Partial={bp['partial_exit_atr']:.2f}")
+                  f"TopN={bp['top_n']} | Spread>{bp['min_spread']:.3f}")
 
-    # Rebuild watchlist with best top_n
-    best_watchlist = {}
-    for d, signals in full_watchlist.items():
-        longs = signals.get('longs', [])[:bp['top_n']]
-        shorts = signals.get('shorts', [])[:bp['top_n']]
-        if longs or shorts:
-            best_watchlist[d] = {'longs': longs, 'shorts': shorts}
+    # Rebuild watchlist with best top_n and min_spread
+    best_watchlist = _filter_watchlist(full_watchlist, bp['top_n'], bp['min_spread'])
 
     best_trades = simulate_hybrid_trades(
         best_watchlist, intraday_featured, daily_featured,
         sl_atr_mult=bp['sl_atr_mult'],
-        tp_atr_mult=bp['tp_atr_mult'],
+        tp_atr_mult=bp_tp_atr,
         max_hold_days=bp['max_hold_days'],
         entry_threshold=bp['entry_threshold'],
         partial_exit_atr=bp['partial_exit_atr'],
@@ -865,6 +884,22 @@ def main():
             str(tm['Trades']), f"{tm['TotalReturn_R']:.1f}R")
     console.print(ticker_table)
 
+    # Trade outcome breakdown
+    n = len(best_trades)
+    if n > 0:
+        sl_hits = sum(1 for t in best_trades if t[1] and t[0] < -0.5)
+        tp_hits = sum(1 for t in best_trades if t[1] and t[0] > 1.5)
+        trail_wins = sum(1 for t in best_trades if t[1] and 0 < t[0] <= 1.5)
+        timeouts_pos = sum(1 for t in best_trades if not t[1] and t[0] > 0)
+        timeouts_neg = sum(1 for t in best_trades if not t[1] and t[0] <= 0)
+
+        console.print(f"\n[bold cyan]TRADE OUTCOME BREAKDOWN:[/bold cyan]")
+        console.print(f"   Full SL hits:    {sl_hits:>4} ({sl_hits/n*100:>5.1f}%)")
+        console.print(f"   Full TP hits:    {tp_hits:>4} ({tp_hits/n*100:>5.1f}%)")
+        console.print(f"   Trail/Partial:   {trail_wins:>4} ({trail_wins/n*100:>5.1f}%)")
+        console.print(f"   Timeout (win):   {timeouts_pos:>4} ({timeouts_pos/n*100:>5.1f}%)")
+        console.print(f"   Timeout (loss):  {timeouts_neg:>4} ({timeouts_neg/n*100:>5.1f}%)")
+
     # ── Cost analysis ──
     console.print(f"\n[bold cyan]COST ANALYSIS:[/bold cyan]")
     cost_info = compute_cost_analysis(best_trades, daily_featured, sl_atr_mult=bp['sl_atr_mult'])
@@ -891,17 +926,12 @@ def main():
     # ── 10. Validation on held-out watchlist dates ──
     if val_watchlist:
         console.print(f"\n[bold magenta]VALIDATION ({len(val_watchlist)} days, 25% of watchlist):[/bold magenta]")
-        val_wl = {}
-        for d, signals in val_watchlist.items():
-            longs = signals.get('longs', [])[:bp['top_n']]
-            shorts = signals.get('shorts', [])[:bp['top_n']]
-            if longs or shorts:
-                val_wl[d] = {'longs': longs, 'shorts': shorts}
+        val_wl = _filter_watchlist(val_watchlist, bp['top_n'], bp['min_spread'])
 
         val_trades = simulate_hybrid_trades(
             val_wl, intraday_featured, daily_featured,
             sl_atr_mult=bp['sl_atr_mult'],
-            tp_atr_mult=bp['tp_atr_mult'],
+            tp_atr_mult=bp_tp_atr,
             max_hold_days=bp['max_hold_days'],
             entry_threshold=bp['entry_threshold'],
             partial_exit_atr=bp['partial_exit_atr'],
@@ -956,21 +986,17 @@ def main():
                 holdout_predictions,
                 top_n=bp.get('top_n', 3),
                 bottom_n=bp.get('top_n', 3),
+                min_spread=bp.get('min_spread', 0.0),
             )
 
             if holdout_watchlist:
-                # Subset to best top_n
-                h_wl = {}
-                for d, signals in holdout_watchlist.items():
-                    longs = signals.get('longs', [])[:bp['top_n']]
-                    shorts = signals.get('shorts', [])[:bp['top_n']]
-                    if longs or shorts:
-                        h_wl[d] = {'longs': longs, 'shorts': shorts}
+                # Subset to best top_n and min_spread
+                h_wl = _filter_watchlist(holdout_watchlist, bp['top_n'], bp['min_spread'])
 
                 holdout_trades = simulate_hybrid_trades(
                     h_wl, intraday_featured, daily_featured,
                     sl_atr_mult=bp['sl_atr_mult'],
-                    tp_atr_mult=bp['tp_atr_mult'],
+                    tp_atr_mult=bp_tp_atr,
                     max_hold_days=bp['max_hold_days'],
                     entry_threshold=bp['entry_threshold'],
                     partial_exit_atr=bp['partial_exit_atr'],
