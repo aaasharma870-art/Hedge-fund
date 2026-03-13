@@ -66,8 +66,7 @@ def find_intraday_entry(intra_df, trade_date, direction, threshold=0.4):
 def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                            sl_atr_mult=1.5, tp_atr_mult=3.0,
                            max_hold_days=10, entry_threshold=0.4,
-                           partial_exit_atr=1.5, cost_pct=0.001,
-                           short_size_mult=0.5):
+                           partial_exit_atr=1.5, cost_pct=0.001):
     """
     Full hybrid backtest.
 
@@ -241,17 +240,16 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
 
                 cost_r = (cost_pct * entry_price * 2) / sl_dist if sl_dist > 0 else 0
 
-                # Regime gate: skip if recent signals for this direction are failing
+                # Regime gate: reduce size (don't skip) if recent signals failing
+                regime_size = 1.0
                 recent = recent_outcomes.get(direction, [])
                 if len(recent) >= REGIME_LOOKBACK:
                     recent_wr = sum(recent) / len(recent)
                     if recent_wr < REGIME_MIN_WR:
-                        continue  # Skip this entry — regime is unfavorable
+                        regime_size = 0.5  # Half size, don't skip entirely
 
-                # Asymmetric sizing: reduce short exposure
-                size = 1.0
-                if direction == 'SHORT':
-                    size = short_size_mult
+                # Equal sizing for both directions (market-neutral)
+                size = 1.0 * regime_size
 
                 positions[ticker] = {
                     'direction': direction,
