@@ -421,6 +421,7 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
         top_n = trial.suggest_int("top_n", 2, 3)
         partial_exit_atr = trial.suggest_float("partial_exit_atr", 1.0, 2.0)
         min_spread = trial.suggest_float("min_spread", 0.0, 0.02)
+        short_size_mult = trial.suggest_float("short_size_mult", 0.3, 1.0)
 
         # Regenerate watchlist with this trial's top_n and min_spread
         trial_watchlist = _filter_watchlist(watchlist, top_n, min_spread)
@@ -433,6 +434,7 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
             entry_threshold=entry_threshold,
             partial_exit_atr=partial_exit_atr,
             cost_pct=COST_PCT,
+            short_size_mult=short_size_mult,
         )
 
         n_trades = len(trades)
@@ -524,7 +526,7 @@ def main():
     console.print(f"[dim]Lookback: {LOOKBACK_DAYS}d | Daily WF: {DAILY_TRAIN_DAYS}/{DAILY_TEST_DAYS}/{DAILY_STEP_DAYS}d[/dim]")
     console.print(f"[dim]Universe: {len(TICKERS)} tickers | Cost: {COST_PCT*100:.3f}% per side[/dim]")
     console.print(f"[dim]Daily features: {len(DAILY_FEATURES)} | Forward: {FORWARD_DAYS}d[/dim]")
-    console.print(f"[dim]Optuna: {OPTUNA_N_TRIALS} trials, 6 params[/dim]\n")
+    console.print(f"[dim]Optuna: {OPTUNA_N_TRIALS} trials, 7 params[/dim]\n")
 
     # ── 1. Download data ──
     daily_cache = {}
@@ -737,13 +739,13 @@ def main():
     # Seed trials
     seed_configs = [
         {'sl_atr_mult': 1.5, 'tp_rr': 3.0, 'max_hold_days': 6,
-         'entry_threshold': 0.40, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
+         'entry_threshold': 0.40, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.005, 'short_size_mult': 0.5},
         {'sl_atr_mult': 1.5, 'tp_rr': 2.0, 'max_hold_days': 8,
-         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.01},
+         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.01, 'short_size_mult': 0.5},
         {'sl_atr_mult': 1.7, 'tp_rr': 2.5, 'max_hold_days': 7,
-         'entry_threshold': 0.30, 'top_n': 3, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
+         'entry_threshold': 0.30, 'top_n': 3, 'partial_exit_atr': 1.5, 'min_spread': 0.005, 'short_size_mult': 0.5},
         {'sl_atr_mult': 2.0, 'tp_rr': 2.0, 'max_hold_days': 10,
-         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 2.0, 'min_spread': 0.0},
+         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 2.0, 'min_spread': 0.0, 'short_size_mult': 0.5},
     ]
     for sp in seed_configs:
         study.enqueue_trial(sp)
@@ -837,6 +839,7 @@ def main():
         entry_threshold=bp['entry_threshold'],
         partial_exit_atr=bp['partial_exit_atr'],
         cost_pct=COST_PCT,
+        short_size_mult=bp['short_size_mult'],
     )
 
     if not best_trades:
@@ -936,6 +939,7 @@ def main():
             entry_threshold=bp['entry_threshold'],
             partial_exit_atr=bp['partial_exit_atr'],
             cost_pct=COST_PCT,
+            short_size_mult=bp['short_size_mult'],
         )
 
         if val_trades:
@@ -1001,6 +1005,7 @@ def main():
                     entry_threshold=bp['entry_threshold'],
                     partial_exit_atr=bp['partial_exit_atr'],
                     cost_pct=COST_PCT,
+                    short_size_mult=bp['short_size_mult'],
                 )
 
                 if holdout_trades:
