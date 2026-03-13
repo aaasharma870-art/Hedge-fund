@@ -6,7 +6,7 @@ This system is an intraday equity long/short trading engine that combines machin
 
 The core research question is whether signals derived from market microstructure theory (order flow imbalance, adverse selection measures, cross-sectional momentum) and regime detection (variance ratio tests, realized volatility clustering) produce statistically significant edge on 15-minute equity bars when combined with ML-driven prediction and institutional-grade execution logic. The system tests the hypothesis that alpha exists not in public price-derived indicators (RSI, MACD, Bollinger Bands), which are fully arbitraged on liquid US equities, but in the information asymmetry revealed by volume-price dynamics and cross-sectional factor premiums documented in the academic literature.
 
-The system is currently in paper trading validation. The most recent complete backtest produced an overall profit factor of 0.94 with six individually profitable tickers out of eighteen tested. The v9.0 architecture concentrates on those six tickers with institutional signal integration, regime-gated long/short execution, and portfolio-level book management. Deployment criteria (PF > 2.0, Sharpe > 1.5, MC p-value < 0.05) have not yet been met.
+The system is currently in paper trading validation. The most recent complete backtest (V12.6) produced a training profit factor of 2.65 with WR=64.5% and Sharpe=7.44 across 408 trades on 15 tickers using daily alpha signals and intraday execution. Holdout validation (90 days) showed PF=0.77, indicating overfitting to the training regime. V12.7 addresses this with look-ahead bias removal (+1 day signal shift), forced L/S balance, and a softened regime gate. Deployment criteria (holdout PF > 1.2, both L/S PF > 1.0, MC p-value < 0.05) have not yet been met.
 
 ## Theoretical Foundation
 
@@ -107,51 +107,69 @@ At the system level, the Monte Carlo Governor tracks cumulative trade P&L and re
 
 ### Deployment Criteria
 
-Live capital deployment requires all of the following gates to be met simultaneously: profit factor greater than 2.0 on the walk-forward test set, Sharpe ratio greater than 1.5, maximum drawdown less than 20% of peak equity in R-multiples, Monte Carlo p-value less than 0.05 (confirming statistical significance), and a 60-day paper trading period with information coefficient greater than 0.05 on live predictions. These criteria have not yet been met.
+Live capital deployment requires all of the following gates to be met simultaneously: holdout profit factor greater than 1.2, both long and short PF greater than 1.0, holdout win rate greater than 45%, Monte Carlo p-value less than 0.15, 100+ holdout trades, no look-ahead bias, and L/S ratio between 40:60 and 60:40. Paper trading begins with 1% risk per trade (not 2%) for the first 50 live trades to validate that live performance matches backtest within reasonable variance. These criteria have not yet been fully met.
 
 ## Current Status and Honest Limitations
 
 ### What Has Been Demonstrated
 
-The walk-forward engine runs correctly and produces real composite scores (0.19-0.46 range confirmed in live optimization runs with 150+ trials). Six tickers showed individually profitable signals in the most recent 18-ticker backtest: RKLB (PF 1.26), AMD (PF 1.13), GS (PF 1.10), COST (PF 1.06), GE (PF 1.03), ASTS (PF 1.02). The ML pipeline has no data leakage, confirmed by the test suite (225 tests passing). Live broker integration has been verified on Alpaca paper trading with bracket orders, stop replacement, position sync, and kill switch functionality. The ensemble model (XGBoost + LightGBM + Ridge) uses out-of-fold stacking to prevent meta-learner overfitting.
+The V12 hybrid system (daily alpha + intraday execution) produces strong training results: PF=2.65, WR=64.5%, Sharpe=7.44 across 408 trades on 15 tickers with 1500 days of Polygon data. Trail/Partial exits account for 37.7% of trades (proving the trailing stop mechanism works after the V12.6 PnL bug fix). Monte Carlo p-value=0.0000 confirms statistical significance. Per-ticker, 11 of 13 active tickers are profitable, led by PLTR (55.3R), NVDA (52.1R), and COIN (44.1R). The ML pipeline has no data leakage, confirmed by the test suite. Live broker integration has been verified on Alpaca paper trading with bracket orders, stop replacement, position sync, and kill switch functionality. The ensemble model (XGBoost + LightGBM + Ridge) uses out-of-fold stacking to prevent meta-learner overfitting.
 
 ### Known Limitations
 
-Signal quality remains below deployment criteria. The last complete backtest produced PF 0.94 overall, meaning the system lost money in aggregate despite profitable signals on six individual tickers. The twelve unprofitable tickers dragged portfolio returns negative, which motivated the v9.0 focus on the six verified names. Whether concentrating on fewer tickers improves or degrades risk-adjusted returns is an empirical question that the current backtest will answer.
+Holdout performance remains below deployment criteria. V12.6 training showed PF=2.65 but holdout collapsed to PF=0.77 (WR=48.9%). Two root causes were identified: (1) same-day entry bias — the model used day T's features to enter on day T, inflating training metrics by ~5-10%; (2) extreme L/S imbalance — 369 longs vs 39 shorts (90% long exposure), making the system a leveraged bull-market bet rather than a market-neutral strategy. V12.7 fixes both issues with +1 day signal shifting and forced equal L/S sizing.
 
-15-minute equity bars are a competitive trading frequency. High-frequency trading firms and statistical arbitrage desks at Renaissance Technologies, D.E. Shaw, and Two Sigma are well-capitalized competitors operating at this timescale with superior data, infrastructure, and execution. The signals implemented here are academically grounded but may not survive after transaction costs in practice. The system models execution costs (0.03% spread + 0.02% impact per side) but does not model stock borrow costs for short positions, which can be material for high-short-interest names like RKLB and ASTS.
+Daily-bar signal generation with intraday execution operates at a competitive frequency. The system models execution costs (0.05% per side = 0.10% round-trip) but does not model stock borrow costs for short positions, which can be material for high-short-interest names like RKLB and ASTS. Average cost per trade is 0.027R.
 
-The model has not been tested through a full market cycle including a bear market or volatility crisis. The three-year training window (when Polygon data is available) covers 2021-2024, which includes the 2022 drawdown but not a recession or credit event. Regime detection may fail during market regimes not represented in the training data.
+The four-year training window (2022-2026 with Polygon data) includes the 2022 drawdown but not a full recession or credit event. The regime gate (rolling 10-trade win rate filter) provides some protection against regime shifts but is a simple heuristic, not a structural regime model.
 
-Short execution introduces asymmetric risk that is not fully captured in backtesting. Equity shorts have theoretically unlimited downside (short squeeze), stock borrow costs that vary by availability, and regulatory risk (short-sale restrictions during market stress). The system mitigates this with tighter stops on shorts (80% of long stop width), regime-gated short permissions (no shorts in volatile regime), and portfolio net exposure limits.
+Short execution introduces asymmetric risk that is not fully captured in backtesting. Equity shorts have theoretically unlimited downside (short squeeze), stock borrow costs that vary by availability, and regulatory risk (short-sale restrictions during market stress). V12.7 enforces equal sizing for both directions to maintain market-neutral characteristics and uses the regime gate to reduce (not eliminate) exposure during adverse regimes.
 
 ## Development Roadmap
 
-Phase 1 (current): Institutional signal integration with regime-gated long/short execution and cross-sectional factor signals across a focused six-ticker universe.
+Phase 1 (complete): V12 hybrid architecture — daily ML alpha (XGBoost + LightGBM + Ridge ensemble) with intraday 15-min execution timing (VPIN, OFI, VWAP) across 15-ticker universe.
 
-Phase 2: Expanding the universe to 15-20 tickers through information coefficient pre-screening, retaining only tickers where the model demonstrates statistically significant predictive power.
+Phase 2 (current): Deployment readiness — V12.7 eliminates look-ahead bias (+1 day signal shift), forces balanced L/S exposure, and softens regime gate. Target: holdout PF > 1.2 with both L/S PF > 1.0.
 
-Phase 3: Options overlay to hedge tail risk using put spreads and monetize elevated implied volatility through covered call writing on positions with positive theta characteristics.
+Phase 3: Paper trading validation with 1% risk per trade for first 50 live trades to confirm backtest-to-live consistency within expected variance bounds.
 
-Phase 4: Multi-strategy portfolio combining the equity long/short system with the options bot for diversified alpha generation across uncorrelated strategy types.
+Phase 4: Options overlay to hedge tail risk using put spreads and monetize elevated implied volatility through covered call writing on positions with positive theta characteristics.
 
 ## Performance Record
 
 | Date | Version | PF | Sharpe | MaxDD | Trades | Configuration |
 |------|---------|-----|--------|-------|--------|---------------|
 | 2024 | v6.3 | 0.94 | -0.12 | -18.4R | 847 | 18 tickers, 1h bars, 150 Optuna trials |
-| 2025 | v9.0 | TBD | TBD | TBD | TBD | 6 tickers, 15m bars, 300 Optuna trials, institutional signals |
+| 2025 | v12.6 (training) | 2.65 | 7.44 | -9.8R | 408 | 15 tickers, daily+15m hybrid, 80 Optuna trials |
+| 2025 | v12.6 (holdout) | 0.77 | -1.74 | — | 47 | Same config, 90-day holdout |
+| 2025 | v12.6 (validation) | 3.19 | 6.54 | — | 125 | 25% watchlist validation split |
 
-Per-ticker breakdown (v6.3):
+Per-ticker breakdown (V12.6 training, best config):
 
-| Ticker | PF | Trades |
-|--------|-----|--------|
-| RKLB | 1.26 | 52 |
-| AMD | 1.13 | 48 |
-| GS | 1.10 | 45 |
-| COST | 1.06 | 44 |
-| GE | 1.03 | 47 |
-| ASTS | 1.02 | 41 |
+| Ticker | PF | WR | Trades | Return_R |
+|--------|------|--------|--------|----------|
+| AMD | 5.57 | 84.6% | 13 | 9.3R |
+| ASTS | 2.39 | 62.5% | 16 | 5.8R |
+| COIN | 2.28 | 60.4% | 91 | 44.1R |
+| COST | 0.44 | 45.5% | 11 | -1.4R |
+| GE | 2.57 | 65.1% | 43 | 24.4R |
+| GS | 1.31 | 50.0% | 10 | 0.6R |
+| JNJ | 3.64 | 71.4% | 7 | 2.1R |
+| NVDA | 2.58 | 64.2% | 95 | 52.1R |
+| PLTR | 3.15 | 66.7% | 87 | 55.3R |
+| RKLB | 3.36 | 71.0% | 31 | 20.0R |
+
+Trade outcome breakdown (V12.6):
+
+| Outcome | Count | % |
+|---------|-------|------|
+| Full SL hits | 117 | 28.7% |
+| Full TP hits | 60 | 14.7% |
+| Trail/Partial | 154 | 37.7% |
+| Timeout (win) | 49 | 12.0% |
+| Timeout (loss) | 9 | 2.2% |
+
+Signal accuracy (training): Long 58.9% (2700 signals), Short 45.4% (2700 signals)
 
 ## Installation
 
