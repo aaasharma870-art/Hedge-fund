@@ -68,26 +68,43 @@ def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3,
                        min_spread=0.0):
     """
     Cross-sectional ranking -> daily long/short watchlist.
-    min_spread: skip days where top-bottom prediction gap is below this.
+
+    IMPORTANT: Predictions are shifted forward by 1 day to eliminate
+    same-day entry bias. The model computes features from day T's bar,
+    but the signal is acted on day T+1 (next trading day).
 
     Returns: {date: {'longs': [(ticker, score), ...], 'shorts': [...]}}
     """
     # Build date -> {ticker: prediction} panel
     panel = {}
+    all_prediction_dates = set()
+
     for ticker, df in predictions_by_ticker.items():
         if 'DailyPrediction' not in df.columns:
             continue
         for idx, row in df.iterrows():
             d = idx.date() if hasattr(idx, 'date') else idx
+            all_prediction_dates.add(d)
             if d not in panel:
                 panel[d] = {}
             panel[d][ticker] = row['DailyPrediction']
 
+    # Build sorted list of all dates for shifting
+    sorted_dates = sorted(all_prediction_dates)
+    next_day_map = {}
+    for i in range(len(sorted_dates) - 1):
+        next_day_map[sorted_dates[i]] = sorted_dates[i + 1]
+
     watchlist = {}
-    for d in sorted(panel.keys()):
-        preds = panel[d]
+    for d in sorted_dates:
+        preds = panel.get(d, {})
         if len(preds) < top_n + bottom_n:
             continue
+
+        # Shift signal to NEXT trading day (eliminates same-day bias)
+        trade_date = next_day_map.get(d)
+        if trade_date is None:
+            continue  # Last day has no next day
 
         ranked = sorted(preds.items(), key=lambda x: x[1], reverse=True)
 
@@ -102,6 +119,6 @@ def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3,
         shorts = [(t, abs(s)) for t, s in ranked[-bottom_n:]]
 
         if longs or shorts:
-            watchlist[d] = {'longs': longs, 'shorts': shorts}
+            watchlist[trade_date] = {'longs': longs, 'shorts': shorts}
 
     return watchlist
