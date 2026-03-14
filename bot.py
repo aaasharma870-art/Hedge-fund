@@ -1,13 +1,14 @@
 # ==============================================================================
-# GOD MODE HEDGE FUND MONITOR (v14.3 - PRODUCTION)
-# "Hybrid God Mode: Specialist + Grinder"
+# V12.7 HYBRID BOT — DAILY ALPHA + INTRADAY EXECUTION
 #
-# CRITICAL UPGRADES (v14.3):
-#   1. "One Brain" Architecture: Imports core logic from hedge_fund/ package
-#   2. Hybrid Strategy: TIER_1 (Specialist) and TIER_2 (Grinder) execution
-#   3. Monte Carlo Governor: Dynamic risk scaling based on equity drawdown
-#   4. Portfolio Optimizer: Mean-Variance allocation with Beta constraints
-#   5. Attribution Analysis: ML-driven pattern recognition for trades
+# Architecture:
+#   1. After market close: train daily ML model, generate cross-sectional watchlist
+#   2. At market open: enter positions from watchlist via Alpaca bracket orders
+#   3. During market: manage trailing stops, partial profits, timeout exits
+#   4. Repeat
+#
+# Reuses: Alpaca_Helper, Polygon_Helper, Database_Helper, MonteCarloGovernor,
+#          DailyRiskManager, EarningsGuard, ErrorTracker, Dashboard, send_alert
 # ==============================================================================
 
 # --- COLAB SETUP ---
@@ -18,84 +19,68 @@ try:
     import os
     import time
 
-    # 1. Check NumPy Version (Crucial for GPU/XGBoost compatibility)
     # 1. Strict Version Control (Prevent Dependency Hell)
     try:
         import numpy as np
         import pandas as pd
         import scipy
 
-        # Check for ANY incompatible versions
         bad_np = np.__version__.startswith('2.')
-        bad_pd = pd.__version__ != '2.2.2' # FIX: Match pinned version in installer
+        bad_pd = pd.__version__ != '2.2.2'
 
         if bad_np or bad_pd:
-            print(f"⚠️ Incompatible environment detected (NumPy {np.__version__}, Pandas {pd.__version__}).")
-            print("⏳ Aligning core dependencies (Allocating ~60s)...", flush=True)
-
-            # NUKE AND PAV: Uninstall everything first to clear bad caches
-            # Use os.system to ensure output is VISIBLE to user
+            print(f"Incompatible environment detected (NumPy {np.__version__}, Pandas {pd.__version__}).")
+            print("Aligning core dependencies (~60s)...", flush=True)
             os.system(f"{sys.executable} -m pip uninstall -y numpy pandas scipy pandas_ta")
-
-            # INSTALL CLEAN TRIAD (Updated for Py3.10+ wheels)
-            # Numpy 1.26.4 + Pandas 2.2.2 + Scipy 1.13.1 = GOLDEN RATIO for Colab
             cmd = (
                 f"{sys.executable} -m pip install "
                 "numpy==1.26.4 pandas==2.2.2 scipy==1.13.1 "
                 "--force-reinstall --no-cache-dir --only-binary=:all:"
             )
-            print(f"▶️ Executing: {cmd}", flush=True)
+            print(f"Executing: {cmd}", flush=True)
             ret = os.system(cmd)
-
             if ret != 0:
-                print("⚠️ Binary install failed. Trying standard install...", flush=True)
                 os.system(f"{sys.executable} -m pip install numpy==1.26.4 pandas==2.2.2 scipy==1.13.1 --force-reinstall")
-
-            print("✅ Core stack aligned. 🔄 AUTO-RESTARTING...", flush=True)
+            print("Core stack aligned. AUTO-RESTARTING...", flush=True)
             time.sleep(1)
             os.kill(os.getpid(), 9)
 
     except ImportError:
-        # Initial install
         os.system(f"{sys.executable} -m pip install numpy==1.26.4 pandas==2.2.2 scipy==1.13.1 --only-binary=:all:")
 
-    print(f"✅ Core: NumPy {np.__version__} | Pandas {pd.__version__} | Scipy {scipy.__version__}")
+    print(f"Core: NumPy {np.__version__} | Pandas {pd.__version__} | Scipy {scipy.__version__}")
 
-    print("📦 Installing Apps...", flush=True)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', 'pandas_ta'], check=True)
+    print("Installing dependencies...", flush=True)
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'xgboost'], check=True)
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'alpaca-trade-api', 'pyarrow', 'yfinance'], check=True)
-    subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'websockets'], check=True)
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'tzdata'], check=True)
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'rich'], check=True)
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'optuna', 'joblib'], check=True)
-
-    print("✅ Dependencies ready!")
+    try:
+        subprocess.run([sys.executable, '-m', 'pip', 'install', 'lightgbm'], check=True)
+    except Exception:
+        pass
+    print("Dependencies ready!")
 
     # GPU CHECK
     try:
         import xgboost as xgb
         from xgboost import XGBRegressor
         import numpy as np
-        print(f"🔎 XGBoost Version: {xgb.__version__}")
-        # Quick GPU Test
+        print(f"XGBoost Version: {xgb.__version__}")
         X = np.random.rand(100, 10)
         y = np.random.rand(100)
         try:
-            # Modern XGBoost (2.0+) uses device="cuda"
-            model = XGBRegressor(device="cuda", verbosity=2) # Verbose=2 to show CUDA info
+            model = XGBRegressor(device="cuda", verbosity=0)
             model.fit(X, y)
-            print("✅ GPU DETECTED & WORKING (device='cuda')")
-            print("   (GPU usage will stay low until TRAINING starts)")
+            print("GPU DETECTED & WORKING (device='cuda')")
         except Exception:
             try:
-                # Legacy XGBoost uses tree_method='gpu_hist'
-                model = XGBRegressor(tree_method='gpu_hist', verbosity=2)
+                model = XGBRegressor(tree_method='gpu_hist', verbosity=0)
                 model.fit(X, y)
-                print("✅ GPU DETECTED & WORKING (tree_method='gpu_hist')")
-            except Exception as e:
-                print(f"❌ GPU INIT FAILED: {e}")
-                print("⚠️ Falling back to CPU mode.")
+                print("GPU DETECTED & WORKING (tree_method='gpu_hist')")
+            except Exception:
+                print("Falling back to CPU mode.")
     except Exception as e:
         print(f"Warning during GPU check: {e}")
 except ImportError:
@@ -105,7 +90,6 @@ except SystemExit as e:
 
 import sys
 import os
-# Fix Windows Unicode Encode Error
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding='utf-8')
 
@@ -113,49 +97,21 @@ if sys.platform == "win32":
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    print("✅ Environment variables loaded from .env")
+    print("Environment variables loaded from .env")
 except ImportError:
-    print("⚠️ python-dotenv not installed. Using system environment variables.")
+    print("python-dotenv not installed. Using system environment variables.")
 
-print("\n" + "="*60)
-print("🚀 LAUNCHING HEDGE FUND MONITOR...")
-print("="*60 + "\n")
+print("\n" + "=" * 60)
+print("LAUNCHING V12.7 HYBRID BOT...")
+print("=" * 60 + "\n")
 
-import threading, time, json, sqlite3, logging, warnings, gc, math, traceback, random
+import threading, time, json, sqlite3, logging, warnings, gc, math, traceback
 import datetime
 from datetime import timedelta, timezone
-import concurrent.futures, requests
-import optuna
+import requests
 import numpy as np
 import pandas as pd
-import importlib.metadata # FIX: Required for pandas_ta-openbb on some envs
-try:
-    import pandas_ta as ta
-except ImportError:
-    import pandas_ta_openbb as ta
 from collections import defaultdict, deque
-import joblib
-
-# Scientific / ML
-from scipy.stats import beta, norm
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.linear_model import LogisticRegression, Ridge
-from xgboost import XGBRegressor
-try:
-    import lightgbm as lgb
-    HAS_LGB = True
-except ImportError:
-    HAS_LGB = False
-try:
-    import shap
-    HAS_SHAP = True
-except ImportError:
-    HAS_SHAP = False
-try:
-    import websocket as ws_lib
-    HAS_WS = True
-except ImportError:
-    HAS_WS = False
 
 # Trading / Data
 import alpaca_trade_api as tradeapi
@@ -164,34 +120,9 @@ from logging.handlers import RotatingFileHandler
 
 # --- "ONE BRAIN" IMPORTS ---
 from hedge_fund.governance import MonteCarloGovernor
-from hedge_fund.optimization import PortfolioOptimizer
-from hedge_fund.risk import OvernightGapModel, SlippageCalculator
-from hedge_fund.analysis import run_attribution_analysis
-from hedge_fund.features import (
-    CrossSectionalRanker,
-    EXPECTED_FEATURES,
-    compute_ofi,
-    compute_rv_ratio,
-    compute_momentum_decomp,
-    compute_efficiency_ratio,
-    compute_vpt_acceleration,
-    compute_bar_patterns,
-    compute_beta_alpha,
-    compute_atr_channel_pos,
-)
-from hedge_fund.regime import RegimeManager as _RegimeManager
-from hedge_fund.portfolio import PortfolioManager as _PortfolioManager
 from hedge_fund.config import load_app_config, load_optimal_params, apply_to_settings
 from hedge_fund.dashboard import Dashboard as SharedDashboard
-from hedge_fund.scanner import CandidateScanner
-from hedge_fund.data_providers import (
-    VIX_Helper as _VIX_Helper,
-    Polygon_Helper as _Polygon_Helper,
-    FMP_Helper as _FMP_Helper,
-    FundamentalGuard as _FundamentalGuard,
-    SeekingAlpha_Helper as _SeekingAlpha_Helper,
-)
-from hedge_fund.websocket import ScanBarCache as _ScanBarCache, PolygonBarStream as _PolygonBarStream
+from hedge_fund.data_providers import Polygon_Helper as _Polygon_Helper
 from hedge_fund.broker import Alpaca_Helper as _Alpaca_Helper
 from hedge_fund.reliability import FailureThresholds, ReliabilityMonitor, classify_failure, structured_failure_log
 
@@ -208,7 +139,6 @@ except ImportError:
 # ==============================================================================
 # 0. HARDWARE OPTIMIZATION & LOGGING
 # ==============================================================================
-# Configure logging immediately
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)s | %(message)s',
@@ -216,13 +146,10 @@ logging.basicConfig(
 )
 
 NUM_CORES = os.cpu_count() or 4
-IO_WORKERS = min(32, NUM_CORES * 4)  # High concurrency for API calls
-CPU_WORKERS = NUM_CORES              # Full utilization for Training
-
-# Force XGBoost to use all cores if on CPU
+IO_WORKERS = min(32, NUM_CORES * 4)
 os.environ["OMP_NUM_THREADS"] = str(NUM_CORES)
 
-# --- Timezone helpers (US/Eastern canonical) ---
+# --- Timezone helpers ---
 try:
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
@@ -231,57 +158,10 @@ except ImportError:
         from dateutil.tz import gettz
         ET = gettz("America/New_York")
     except ImportError:
-        ET = datetime.timezone(datetime.timedelta(hours=-5))  # naive EST fallback
+        ET = datetime.timezone(datetime.timedelta(hours=-5))
 
-def is_regular_hours(ts):
-    """True if timestamp falls within 9:30-16:00 ET on a weekday."""
-    if hasattr(ts, 'tzinfo') and ts.tzinfo is not None:
-        ts_et = ts.astimezone(ET)
-    elif hasattr(ts, 'tz_localize'):
-        try:
-            ts_et = ts.tz_localize(ET)
-        except Exception:
-            ts_et = ts  # already localized or naive
-    else:
-        ts_et = ts
-    h, m = ts_et.hour, ts_et.minute
-    if ts_et.weekday() >= 5:
-        return False
-    if h < 9 or h >= 16:
-        return False
-    if h == 9 and m < 30:
-        return False
-    return True
+logging.info(f"HARDWARE: {NUM_CORES} cores | {IO_WORKERS} I/O workers")
 
-def reserve_gpu():
-    """Wake up the GPU and reserve memory so it shows as 'Active' immediately."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            # Allocate 500MB dummy tensor to light up the dashboard
-            _ = torch.ones((10000, 10000)).cuda()
-            logging.info(f"🔥 GPU ACTIVATED: {torch.cuda.get_device_name(0)} (VRAM Reserved)")
-            return True
-    except Exception:
-        pass
-    return False
-
-# Trigger immediate wake-up
-HAS_GPU = reserve_gpu()
-logging.info(f"🔥 HARDWARE: {NUM_CORES} CS | {IO_WORKERS} I/O Workers | Optimized for Colab Pro+")
-
-
-# ==============================================================================
-# 1. INFRASTRUCTURE
-# ==============================================================================
-
-
-# (shared modules already imported above in "ONE BRAIN" section)
-
-
-
-
-# --- MAIN BOT LOGIC ---
 # --- STORAGE SETUP ---
 APP_CONFIG = load_app_config()
 DRIVE_ROOT = APP_CONFIG.data_root
@@ -289,15 +169,15 @@ DRIVE_ROOT = APP_CONFIG.data_root
 try:
     from google.colab import drive
     drive.mount('/content/drive')
-    import sys, subprocess
-    # FIX: Install optuna/joblib for Colab if missing
+    import subprocess
     subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'optuna', 'joblib'], check=True)
 except ImportError:
     pass
 
-# API Keys - env vars only (no hardcoded secrets)
+# ==============================================================================
+# 1. API KEYS & SETTINGS
+# ==============================================================================
 def require_env(name):
-    """Retrieve a required environment variable or raise on critical keys."""
     val = os.getenv(name)
     if not val:
         if name in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
@@ -311,84 +191,31 @@ KEYS = {
     "ALPACA_KEY": require_env("ALPACA_API_KEY"),
     "ALPACA_SEC": require_env("ALPACA_SECRET_KEY"),
     "DISCORD": os.getenv("DISCORD_WEBHOOK", ""),
-    "RAPIDAPI_KEY": os.getenv("RAPIDAPI_KEY", ""),
 }
 ALPACA_URL = "https://paper-api.alpaca.markets"
 
 SETTINGS = {
-    "RISK_PER_TRADE": 0.015,  # 1.5% Risk per trade
-    "MAX_POSITIONS": 5,
-    "STOP_MULT": 1.5,
-    "TP_MULT": 3.0,
-    "MIN_CONFIDENCE": 0.02, # OPTIMIZED: Proven Positive Expectancy
-    "TIER_A_CONF": 0.53,
-    "MAX_PORTFOLIO_HEAT": 0.06,
+    "RISK_PER_TRADE": 0.01,
+    "MAX_POSITIONS": 6,
     "KILL_SWITCH_DD": 0.10,
-    "SCAN_INTERVAL": 60,
-    "ZOMBIE_MINUTES": 60,
-    "PYRAMID_R": 1.5,
-    "HEDGE_TICKER": "PSQ",
-    "ADX_MIN": 15,          # V7: Soft filter threshold (reduce size below this)
-    "HURST_LIMIT": 0.5,     # V7: Hurst directional soft filter center
-    "MIN_HITRATE": 0.35,
     "USE_MARKET_ORDERS": True,
-    "SLIPPAGE_HAIRCUT": 0.10,
-
-    "OPEN_BURNIN_MINUTES": 15,
-    "BURNIN_CONF_ADD": 0.03,
-    "BURNIN_SIZE_MULT": 0.60,
-
-    "NEWS_LOOKBACK_HOURS": 24,
-    "NEWS_HARD_SKIP_SCORE": 3,
-    "NEWS_SOFT_PENALTY_SCORE": 1,
-    "NEWS_PENALTY_CONF_ADD": 0.02,
-    "NEWS_PENALTY_SIZE_MULT": 0.75,
-    "NEWS_OVERRIDE_CONF": 0.80,
-
-    "RATCHET_R": 1.0,
-    "RATCHET_BUFFER_ATR": 0.10,
-    "TRAIL_START_R": 2.0,
-    "TRAIL_ATR_MULT": 1.0,
     "STOP_REPLACE_COOLDOWN_SEC": 60,
-    "MARKET_OPEN_HOUR": 9,
-    "MARKET_OPEN_MIN": 30,
-    "MARKET_CLOSE_HOUR": 16,
-    "MARKET_CLOSE_MIN": 0,
-    "ENABLE_PYRAMIDING": False,
-    "USE_KELLY": True,
-    "KELLY_FRACTION": 0.75,
-    "KELLY_MAX_RISK": 0.03,
-    "KELLY_MIN_RISK": 0.003,
-    "KELLY_MIN_TRADES": 60,
-    "KELLY_EDGE_GATE": 0.02,
-    "KELLY_CONF_BOOST": 0.50,
-    "KELLY_SHRINK": 0.35,
-    "STOP_MULT": 1.5,
-    "TP_MULT": 3.0,
 
-    # Phase 23: Hybrid God Mode (Dual-Tier)
-    # V7: ADX/Hurst are now soft filters applied to risk_mult, not hard gates
-    "TIER_1": {
-        "NAME": "SPECIALIST",
-        "MIN_PROB": 0.30,
-        "RISK_MULT": 2.0,       # Double Size
-        "RR": 2.0,              # 1:2 Risk/Reward
-        "TRAIL": 1.0
-    },
-    "TIER_2": {
-        "NAME": "GRINDER",
-        "MIN_PROB": 0.20,
-        "RISK_MULT": 1.0,       # Standard Size
-        "RR": 1.5,              # 1:1.5 Risk/Reward
-        "TRAIL": 1.0
-    },
-
-    "EV_GATE_R": 0.02,           # Lowered: let more candidates through initial gate
-    "TIER_A_EV": 0.10,           # Lowered: 0.10R EV is still a positive-expectancy trade
-    "TIER_A_CONF": 0.51,         # Lowered: direction-aware model is more calibrated
+    # V12.7 Hybrid Settings (from Optuna best config)
+    'V12_SL_ATR_MULT': 1.3,
+    'V12_TP_RR': 3.6,
+    'V12_MAX_HOLD_DAYS': 10,
+    'V12_TOP_N': 3,
+    'V12_ENTRY_THRESHOLD': 0.43,
+    'V12_PARTIAL_EXIT_ATR': 1.5,
+    'V12_MIN_SPREAD': 0.007,
+    'V12_RISK_PER_TRADE': 0.01,
+    'V12_LOOKBACK_DAYS': 1500,
+    'V12_TRAIN_DAYS': 250,
+    'V12_FORWARD_DAYS': 5,
 }
 
-# --- Auto-load optimized params from backtester ---
+# Auto-load optimized params from backtester
 _optimal = load_optimal_params(config=APP_CONFIG)
 if _optimal:
     _updates = apply_to_settings(SETTINGS, _optimal)
@@ -408,7 +235,10 @@ logging.basicConfig(
 )
 warnings.filterwarnings('ignore')
 
-# Error tracking
+# ==============================================================================
+# 2. INFRASTRUCTURE CLASSES (kept from v14.3)
+# ==============================================================================
+
 class ErrorTracker:
     def __init__(self):
         self.failures = defaultdict(int)
@@ -420,29 +250,26 @@ class ErrorTracker:
         self.reliability.record_failure(component)
         err = error if isinstance(error, Exception) else Exception(str(error))
         structured_failure_log(
-            component=component,
-            symbol=symbol,
-            endpoint=endpoint,
-            retry_count=retry_count,
-            error=err,
-            logger=logging.error,
+            component=component, symbol=symbol, endpoint=endpoint,
+            retry_count=retry_count, error=err, logger=logging.error,
         )
         cls = classify_failure(err)
-        logging.error(f"❌ {component} failed ({self.failures[component]}x, {cls}): {error}")
+        logging.error(f"ERR {component} failed ({self.failures[component]}x, {cls}): {error}")
         if self.reliability.is_degraded(component):
-            logging.warning(f"⚠️ {component} entering degraded mode")
+            logging.warning(f"WARN {component} entering degraded mode")
         if self.reliability.should_safe_stop(component):
-            logging.critical(f"🚨 {component} safe-stop threshold reached ({self.failures[component]} failures)")
-            send_alert(f"🚨 {component} BROKEN", f"Failed {self.failures[component]}x", "high")
+            logging.critical(f"CRIT {component} safe-stop threshold reached")
+            send_alert(f"CRIT {component} BROKEN", f"Failed {self.failures[component]}x", "high")
 
     def record_success(self, component):
         if self.failures[component] > 0:
-            logging.info(f"✅ {component} recovered")
+            logging.info(f"OK {component} recovered")
         self.failures[component] = 0
         self.reliability.record_success(component)
         self.last_success[component] = datetime.datetime.now()
 
 ERROR_TRACKER = ErrorTracker()
+
 
 class DailyRiskManager:
     """Daily loss limit: halt trading if intraday losses exceed threshold."""
@@ -454,7 +281,6 @@ class DailyRiskManager:
         self.halt_reason = None
 
     def initialize_session(self, current_equity):
-        """Call at market open to set the baseline equity for daily P&L tracking."""
         self.session_start_equity = current_equity
         self.trading_halted = False
         self.halt_reason = None
@@ -462,15 +288,12 @@ class DailyRiskManager:
                      f"Max loss=${current_equity * self.max_daily_loss_pct:,.2f}")
 
     def check_can_trade(self, current_equity):
-        """Returns True if trading is allowed, False if daily loss limit hit."""
         if self.trading_halted:
             return False
         if self.session_start_equity is None:
             return True
-
         daily_pnl = current_equity - self.session_start_equity
         daily_pnl_pct = daily_pnl / self.session_start_equity
-
         if daily_pnl_pct <= -self.max_daily_loss_pct:
             self.trading_halted = True
             self.halt_reason = f"Daily loss limit hit: {daily_pnl_pct:.2%} (${daily_pnl:,.2f})"
@@ -482,8 +305,9 @@ class DailyRiskManager:
             return False
         return True
 
+
 # ==============================================================================
-# 2. DATABASE
+# 3. DATABASE
 # ==============================================================================
 class Database_Helper:
     def __init__(self, config=APP_CONFIG):
@@ -491,13 +315,10 @@ class Database_Helper:
         db_path = self.config.db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.lock = threading.Lock()
-
-        # FIX: Enable WAL mode and NORMAL sync for reliability under frequent writes
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
-
         self.create_tables()
-        logging.info(f"💾 Database: {db_path}")
+        logging.info(f"Database: {db_path}")
 
     def create_tables(self):
         with self.lock:
@@ -516,71 +337,32 @@ class Database_Helper:
                          (id INTEGER PRIMARY KEY CHECK (id = 1),
                           equity REAL, regime TEXT, universe_size INT,
                           hedge_active INT, vix REAL, ts TEXT)''')
-            # FIX: Persist pending orders for restart recovery
             c.execute('''CREATE TABLE IF NOT EXISTS pending_orders
                          (order_id TEXT PRIMARY KEY, symbol TEXT, side TEXT, qty INT,
                           price REAL, sl REAL, tp REAL, atr REAL, ts TEXT)''')
-            # ENHANCED: Trade outcomes for learning from mistakes (expanded schema)
             c.execute('''CREATE TABLE IF NOT EXISTS trade_outcomes
                          (id INTEGER PRIMARY KEY AUTOINCREMENT,
                           symbol TEXT, side TEXT,
                           entry_price REAL, exit_price REAL,
-                          pnl REAL, pnl_r REAL,
-                          outcome REAL,
-                          rsi REAL, adx REAL, atr_pct REAL,
-                          vol_rel REAL, kalman_dist REAL, hurst REAL,
-                          bb_width REAL, bb_position REAL, vwap_dist REAL, hl_range REAL,
-                          roc_5 REAL, roc_20 REAL,
-                          vol_surge REAL, money_flow REAL,
-                          volatility_rank REAL, trend_consistency REAL,
-                          sa_news_count_3d INT, sa_sentiment_score REAL,
-                          hour INT, day_of_week INT,
+                          pnl REAL, pnl_r REAL, outcome REAL,
                           reason TEXT,
                           ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-
-            # ENHANCED: Add new feature columns to existing tables (migration)
-            try:
-                new_cols = [
-                    'bb_width REAL', 'bb_position REAL', 'vwap_dist REAL', 'hl_range REAL',
-                    'roc_5 REAL', 'roc_20 REAL', 'vol_surge REAL', 'money_flow REAL',
-                    'volatility_rank REAL', 'trend_consistency REAL',
-                    'sa_news_count_3d INT', 'sa_sentiment_score REAL',
-                    'hour INT', 'day_of_week INT',
-                    'earnings_surprise REAL', 'revenue_growth_yoy REAL',
-                    'pe_ratio REAL', 'news_impact_weight REAL'
-                ]
-                for col in new_cols:
-                    try:
-                        c.execute(f'ALTER TABLE trade_outcomes ADD COLUMN {col}')
-                    except Exception:
-                        pass  # Column already exists
-            except Exception as e:
-                logging.debug(f"Schema migration: {e}")
-
-            # ------------------------------------------------------------------
-            # SECTION 1.1: Production Expansion (State, Orders, Fills, Events)
-            # ------------------------------------------------------------------
             c.execute('''CREATE TABLE IF NOT EXISTS bot_state
                          (id INTEGER PRIMARY KEY CHECK (id=1),
                           last_processed_ts TEXT, model_version TEXT,
                           feature_hash TEXT, risk_state_hash TEXT, updated_at TEXT)''')
-
             c.execute('''CREATE TABLE IF NOT EXISTS orders
                          (client_order_id TEXT PRIMARY KEY, broker_order_id TEXT,
                           symbol TEXT, side TEXT, qty INT, type TEXT, status TEXT,
                           created_ts TEXT, updated_ts TEXT, raw_json TEXT)''')
-
             c.execute('''CREATE TABLE IF NOT EXISTS fills
                          (broker_fill_id TEXT PRIMARY KEY, client_order_id TEXT,
                           symbol TEXT, qty INT, price REAL, ts TEXT, raw_json TEXT)''')
-
             c.execute('''CREATE TABLE IF NOT EXISTS events
                          (id INTEGER PRIMARY KEY AUTOINCREMENT,
                           ts TEXT, type TEXT, payload_json TEXT)''')
-
             self.conn.commit()
 
-    # --- Production DB Methods ---
     def log_event(self, event_type, payload):
         with self.lock:
             try:
@@ -595,34 +377,13 @@ class Database_Helper:
     def upsert_order(self, client_order_id, symbol, side, qty, order_type, status, broker_id=None, raw_json=None):
         with self.lock:
             now = datetime.datetime.now().isoformat()
-            # Check if exists to preserve created_ts
             exists = self.conn.execute("SELECT created_ts FROM orders WHERE client_order_id=?", (client_order_id,)).fetchone()
             created_ts = exists[0] if exists else now
-
             self.conn.execute("""
                 INSERT OR REPLACE INTO orders
                 (client_order_id, broker_order_id, symbol, side, qty, type, status, created_ts, updated_ts, raw_json)
                 VALUES (?,?,?,?,?,?,?,?,?,?)
             """, (client_order_id, broker_id, symbol, side, qty, order_type, status, created_ts, now, raw_json))
-            self.conn.commit()
-
-    def upsert_bot_state(self, last_processed_ts=None, model_ver=None, feat_hash=None):
-        with self.lock:
-            # Simple merge update
-            current = self.conn.execute("SELECT * FROM bot_state WHERE id=1").fetchone()
-            if not current:
-                self.conn.execute("INSERT INTO bot_state (id) VALUES (1)")
-                current = (1, None, None, None, None, None)
-
-            # Map cols: id, last_ts, mod_ver, feat_hash, risk_hash, up_at
-            # Update only provided fields
-            c_ts = last_processed_ts if last_processed_ts else current[1]
-            c_mv = model_ver if model_ver else current[2]
-            c_fh = feat_hash if feat_hash else current[3]
-
-            self.conn.execute("""
-                UPDATE bot_state SET last_processed_ts=?, model_version=?, feature_hash=?, updated_at=? WHERE id=1
-            """, (c_ts, c_mv, c_fh, datetime.datetime.now().isoformat()))
             self.conn.commit()
 
     def save_pending_order(self, order_id, symbol, side, qty, price, sl, tp, atr):
@@ -686,818 +447,26 @@ class Database_Helper:
             )
             self.conn.commit()
 
-    def log_trade_outcome(self, symbol, side, entry_price, exit_price, pnl, pnl_r, outcome, features, reason="Signal"):
-        """
-        ENHANCED: Log a trade outcome with ALL 22 entry features for learning.
-        outcome: R-value (e.g., +2.0 for win, -1.0 for loss)
-        features: dict with all 22 features
-        """
+    def log_trade_outcome(self, symbol, side, entry_price, exit_price, pnl, pnl_r, reason="Signal"):
         with self.lock:
             self.conn.execute(
                 """INSERT INTO trade_outcomes
-                   (symbol, side, entry_price, exit_price, pnl, pnl_r, outcome,
-                    rsi, adx, atr_pct, vol_rel, kalman_dist, hurst,
-                    bb_width, bb_position, vwap_dist, hl_range,
-                    roc_5, roc_20, vol_surge, money_flow,
-                    volatility_rank, trend_consistency,
-                    sa_news_count_3d, sa_sentiment_score,
-                    hour, day_of_week,
-                    earnings_surprise, revenue_growth_yoy, pe_ratio, news_impact_weight,
-                    reason)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (symbol, side, entry_price, exit_price, pnl, pnl_r, outcome,
-                 features.get('RSI'), features.get('ADX'), features.get('ATR_Pct'),
-                 features.get('Vol_Rel'), features.get('Kalman_Dist'), features.get('Hurst'),
-                 features.get('BB_Width'), features.get('BB_Position'), features.get('VWAP_Dist'), features.get('HL_Range'),
-                 features.get('ROC_5'), features.get('ROC_20'), features.get('Vol_Surge'), features.get('Money_Flow'),
-                 features.get('Volatility_Rank'), features.get('Trend_Consistency'),
-                 features.get('sa_news_count_3d'), features.get('sa_sentiment_score'),
-                 features.get('Hour'), features.get('Day_of_Week'),
-                 features.get('earnings_surprise', 0), features.get('revenue_growth_yoy', 0),
-                 features.get('pe_ratio', 20), features.get('news_impact_weight', 0),
-                 reason)
+                   (symbol, side, entry_price, exit_price, pnl, pnl_r, outcome, reason)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (symbol, side, entry_price, exit_price, pnl, pnl_r, pnl_r, reason)
             )
             self.conn.commit()
-            logging.debug(f"📊 Logged trade outcome: {symbol} {side} PnL={pnl:.2f} R={pnl_r:.2f}")
 
     def get_trade_outcomes(self, days=90):
-        """
-        ENHANCED: Retrieve trade outcomes with ALL 22 features for training.
-        Returns list of dicts with features and outcome.
-        """
         with self.lock:
             cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
             c = self.conn.cursor()
             c.execute("""
-                SELECT symbol, side, entry_price, exit_price, pnl, pnl_r, outcome,
-                       rsi, adx, atr_pct, vol_rel, kalman_dist, hurst,
-                       bb_width, bb_position, vwap_dist, hl_range,
-                       roc_5, roc_20, vol_surge, money_flow,
-                       volatility_rank, trend_consistency,
-                       sa_news_count_3d, sa_sentiment_score,
-                       hour, day_of_week,
-                       earnings_surprise, revenue_growth_yoy, pe_ratio, news_impact_weight,
-                       ts
-                FROM trade_outcomes
-                WHERE ts > ?
-                ORDER BY ts DESC
+                SELECT symbol, side, entry_price, exit_price, pnl, pnl_r, reason, ts
+                FROM trade_outcomes WHERE ts > ? ORDER BY ts DESC
             """, (cutoff,))
-            rows = c.fetchall()
+            return c.fetchall()
 
-            results = []
-            for row in rows:
-                # Calculate days ago for recency weighting
-                try:
-                    ts = pd.to_datetime(row[31]) if row[31] else datetime.datetime.now()
-                    days_ago = (datetime.datetime.now() - ts).days
-                except Exception:
-                    days_ago = 0
-
-                results.append({
-                    'symbol': row[0], 'side': row[1],
-                    'entry_price': row[2], 'exit_price': row[3],
-                    'pnl': row[4], 'pnl_r': row[5], 'outcome': row[6],
-                    'RSI': row[7], 'ADX': row[8], 'ATR_Pct': row[9],
-                    'Vol_Rel': row[10], 'Kalman_Dist': row[11], 'Hurst': row[12],
-                    'BB_Width': row[13] or 0, 'BB_Position': row[14] or 0, 'VWAP_Dist': row[15] or 0, 'HL_Range': row[16] or 0,
-                    'ROC_5': row[17] or 0, 'ROC_20': row[18] or 0, 'Vol_Surge': row[19] or 0, 'Money_Flow': row[20] or 0,
-                    'Volatility_Rank': row[21] or 0.5, 'Trend_Consistency': row[22] or 0.5,
-                    'sa_news_count_3d': row[23] or 0, 'sa_sentiment_score': row[24] or 0,
-                    'Hour': row[25] or 12, 'Day_of_Week': row[26] or 2,
-                    'earnings_surprise': row[27] or 0, 'revenue_growth_yoy': row[28] or 0,
-                    'pe_ratio': row[29] or 20, 'news_impact_weight': row[30] or 0,
-                    'days_ago': days_ago
-                })
-            return results
-
-# ==============================================================================
-# 3. MARKET DATA HELPERS
-# ==============================================================================
-class VIX_Helper(_VIX_Helper):
-    """VIX with multi-source fallback (core logic in hedge_fund/data_providers.py)"""
-    def __init__(self):
-        super().__init__(keys=KEYS, error_tracker=ERROR_TRACKER)
-
-    def get_size_multiplier(self):
-        vix = self.get_vix()
-        if vix > 30: return 0.5
-        if vix > 25: return 0.75
-        if vix < 15: return 1.2
-        return 1.0
-
-# FIX #12: Regime detection using DAILY data (not minute)
-class RegimeDetector:
-    """
-    Multi-dimensional regime detector with continuous scores.
-    Dimensions: trend, chop, correlation, volatility.
-    """
-    def __init__(self, vix_helper, vol_target=None, portfolio_risk=None):
-        self.vix_helper = vix_helper
-        self.vol_target = vol_target
-        self.portfolio_risk = portfolio_risk
-        self.cache = {
-            'regime': 'NEUTRAL', 'trend_score': 0.0, 'chop_score': 0.5,
-            'corr_regime': 0.5, 'vol_regime': 0.5, 'conf_adj': 0.0, 'ts': 0
-        }
-        self.cache_ttl = 300
-
-    def get_regime(self):
-        now = time.time()
-        if now - self.cache['ts'] < self.cache_ttl:
-            return self.cache['regime']
-
-        try:
-            tk = yf.Ticker('SPY')
-            spy_df = tk.history(period='1y', interval='1d')
-
-            if len(spy_df) < 200:
-                return 'NEUTRAL'
-
-            close = spy_df['Close']
-            high = spy_df['High']
-            low = spy_df['Low']
-            current = close.iloc[-1]
-            vix = self.vix_helper.get_vix()
-
-            # --- Trend Score (continuous -1 to +1) ---
-            sma50 = close.rolling(50).mean().iloc[-1]
-            sma200 = close.rolling(200).mean().iloc[-1]
-
-            price_vs_50 = (current - sma50) / sma50
-            price_vs_200 = (current - sma200) / sma200
-            sma_cross = (sma50 - sma200) / sma200
-
-            trend_raw = (0.4 * np.clip(price_vs_50 * 10, -1, 1) +
-                         0.3 * np.clip(price_vs_200 * 5, -1, 1) +
-                         0.3 * np.clip(sma_cross * 10, -1, 1))
-
-            vix_adj = 0.0
-            if vix and vix < 15: vix_adj = 0.1
-            elif vix and vix > 28: vix_adj = -0.2
-
-            trend_score = float(np.clip(trend_raw + vix_adj, -1.0, 1.0))
-
-            # --- Chop Score (Choppiness Index, 0 to 1) ---
-            chop_score = 0.5
-            period = 14
-            atr_series = high - low
-            if len(atr_series) >= period:
-                atr_sum = atr_series.rolling(period).sum().iloc[-1]
-                highest_14 = high.rolling(period).max().iloc[-1]
-                lowest_14 = low.rolling(period).min().iloc[-1]
-                hl_range = highest_14 - lowest_14
-                if hl_range > 0:
-                    ci = 100 * np.log10(atr_sum / hl_range) / np.log10(period)
-                    chop_score = float(np.clip(ci / 100.0, 0.0, 1.0))
-
-            # --- Correlation Regime ---
-            corr_regime = 0.5
-            if self.portfolio_risk and getattr(self.portfolio_risk, 'correlation_matrix', None) is not None:
-                try:
-                    cm = self.portfolio_risk.correlation_matrix.values
-                    n = cm.shape[0]
-                    if n > 1:
-                        upper = cm[np.triu_indices(n, k=1)]
-                        corr_regime = float(np.clip(np.nanmean(upper), 0.0, 1.0))
-                except Exception:
-                    pass
-
-            # --- Volatility Regime (percentile rank) ---
-            vol_regime = 0.5
-            returns = close.pct_change().dropna()
-            if len(returns) >= 60:
-                current_vol = returns.tail(20).std() * np.sqrt(252)
-                if self.vol_target and self.vol_target.sigma_hat:
-                    current_vol = self.vol_target.sigma_hat
-                rolling_vol = returns.rolling(20).std() * np.sqrt(252)
-                rolling_vol = rolling_vol.dropna()
-                if len(rolling_vol) > 0:
-                    rank = (rolling_vol < current_vol).sum() / len(rolling_vol)
-                    vol_regime = float(np.clip(rank, 0.0, 1.0))
-
-            # --- Composite Label (backward compat) ---
-            if trend_score > 0.3 and chop_score < 0.6:
-                regime = 'BULL'
-            elif trend_score < -0.3:
-                regime = 'BEAR'
-            elif chop_score > 0.65:
-                regime = 'CHOP'
-            else:
-                regime = 'NEUTRAL'
-
-            # --- Composite Confidence Adjustment ---
-            # FIX: Scaled up coefficients so regime meaningfully affects trade gating
-            # Bull trend → lower threshold (more permissive), chop → raise threshold
-            conf_adj = (-0.04 * trend_score +       # Bull: -0.04, Bear: +0.04
-                        0.06 * chop_score +          # Choppy: +0.06 (require more confidence)
-                        0.04 * max(0, corr_regime - 0.5) +  # High correlation: +0.02
-                        0.04 * max(0, vol_regime - 0.6))     # High vol rank: +0.016
-            conf_adj = float(np.clip(conf_adj, -0.10, 0.12))
-
-            self.cache = {
-                'regime': regime, 'trend_score': trend_score, 'chop_score': chop_score,
-                'corr_regime': corr_regime, 'vol_regime': vol_regime,
-                'conf_adj': conf_adj, 'ts': now
-            }
-
-            logging.info(f"📊 Regime: {regime} | Trend={trend_score:+.2f} Chop={chop_score:.2f} "
-                         f"Corr={corr_regime:.2f} Vol={vol_regime:.2f} | ConfAdj={conf_adj:+.3f}")
-            ERROR_TRACKER.record_success("Regime")
-            return regime
-
-        except Exception as e:
-            ERROR_TRACKER.record_failure("Regime", str(e))
-            return 'NEUTRAL'
-
-    def get_confidence_adjustment(self):
-        self.get_regime()
-        return self.cache.get('conf_adj', 0.0)
-
-    def get_scores(self):
-        self.get_regime()
-        return {
-            'trend_score': self.cache['trend_score'],
-            'chop_score': self.cache['chop_score'],
-            'regime': self.cache['regime'],
-            'corr': self.cache.get('corr_regime', 0.5),
-            'vol': self.cache.get('vol_regime', 0.5)
-        }
-
-    def get_adaptive_threshold(self, base_conf=0.48):
-        """
-        Dynamic Confidence Threshold based on Regime.
-        - Bull/Trend: Base (0.48)
-        - Choppy: +0.05
-        - High Vol (VIX > 25): +0.10
-        - Bear/Crash: +0.12
-        """
-        regime = self.get_regime()
-        vix = self.vix_helper.get_vix()
-
-        adj = 0.0
-
-        # 1. VIX Penalty
-        if vix > 30: adj += 0.10
-        elif vix > 20: adj += 0.05
-
-        # 2. Regime Penalty
-        # Note: The 'regime' variable is derived from trend_score and chop_score.
-        # The specific string values 'BEAR_VOLATILE' and 'CHOPPY' are not directly
-        # produced by the current get_regime() method, which returns 'BULL', 'BEAR', 'CHOP', 'NEUTRAL'.
-        # Assuming these are intended as more granular states or future enhancements.
-        if regime == 'BEAR': adj += 0.07 # Using 'BEAR' as a proxy for 'BEAR_VOLATILE'
-        elif regime == 'CHOP': adj += 0.05 # Using 'CHOP' for 'CHOPPY'
-        elif regime == 'NEUTRAL': adj += 0.02
-
-        # 3. Trend Bonus (Discount)
-        # If strong trend, we can be slightly looser?
-        # No, stick to base. "Don't lose money" is priority.
-
-        return base_conf + adj
-
-# ==============================================================================
-# DIX/GEX INTEGRATION: Gamma Exposure for sizing and entry gating
-# ==============================================================================
-class GEX_Helper:
-    """
-    DIX/GEX Proxy using VIX term structure and SMA.
-
-    NOTE: This is a SIMULATED GEX based on VIX regime.
-    True GEX requires option chain gamma exposure sums (not currently implemented).
-    High Simulated GEX = low VIX = allow full size.
-    """
-
-    def __init__(self):
-        self.cache = {'gex': 0, 'dix': 0.45, 'ts': None}
-        self.gex_history = []  # For percentile calculations
-
-    def fetch_data(self):
-        """
-        Estimate GEX/DIX using VIX term structure (VIX vs VIX3M).
-        - VIX/VIX3M < 0.90 → contango → positive gamma → calm, mean-reverting
-        - VIX/VIX3M > 1.00 → inverted → negative gamma → volatile, trend-following
-        Falls back to VIX-vs-SMA if VIX3M unavailable.
-        """
-        now = datetime.datetime.now()
-
-        if self.cache['ts'] and (now - self.cache['ts']).total_seconds() < 300:
-            return self.cache['gex'], self.cache['dix']
-
-        try:
-            # Primary: VIX term structure ratio (better gamma proxy)
-            vix_tk = yf.Ticker('^VIX')
-            vix_data = vix_tk.history(period='5d', interval='1d')
-
-            vix3m_tk = yf.Ticker('^VIX3M')
-            vix3m_data = vix3m_tk.history(period='5d', interval='1d')
-
-            if len(vix_data) >= 1 and len(vix3m_data) >= 1:
-                vix = float(vix_data['Close'].iloc[-1])
-                vix3m = float(vix3m_data['Close'].iloc[-1])
-
-                if vix3m > 0:
-                    # Term structure ratio: < 1 = contango (calm), > 1 = inverted (stress)
-                    ratio = vix / vix3m
-                    # Map ratio to GEX proxy: contango = positive GEX, backwardation = negative
-                    gex_proxy = float(np.clip((1.0 - ratio) * 100, -30, 30))
-                    # DIX proxy: low VIX + contango = bullish dark pool activity
-                    dix_proxy = float(np.clip(0.50 - (vix - 18) / 100 + (1.0 - ratio) * 0.1, 0.30, 0.60))
-
-                    self.cache = {'gex': gex_proxy, 'dix': dix_proxy, 'ts': now}
-                    self.gex_history.append(gex_proxy)
-                    self.gex_history = self.gex_history[-60:]
-                    return gex_proxy, dix_proxy
-
-            # Fallback: VIX vs its own SMA
-            vix_extended = vix_tk.history(period='1mo', interval='1d')
-            if len(vix_extended) >= 20:
-                vix = float(vix_extended['Close'].iloc[-1])
-                vix_sma = float(vix_extended['Close'].rolling(20).mean().iloc[-1])
-                gex_proxy = float(100 * (vix_sma - vix) / vix_sma)
-                dix_proxy = float(np.clip(0.50 - (vix - 18) / 100, 0.30, 0.60))
-                self.cache = {'gex': gex_proxy, 'dix': dix_proxy, 'ts': now}
-                self.gex_history.append(gex_proxy)
-                self.gex_history = self.gex_history[-60:]
-                return gex_proxy, dix_proxy
-        except Exception:
-            pass
-
-        return 0, 0.45
-
-    def get_size_multiplier(self):
-        """
-        Return position size multiplier based on GEX:
-        - High GEX (>20): 1.0-1.2x (low vol, allow full size)
-        - Normal GEX (0-20): 1.0x
-        - Low GEX (-10 to 0): 0.8x
-        - Very low GEX (<-10): 0.5-0.7x
-        """
-        gex, _ = self.fetch_data()
-
-        if gex > 20:
-            return min(1.2, 1.0 + gex / 100)
-        elif gex > 0:
-            return 1.0
-        elif gex > -10:
-            return 0.8
-        else:
-            return max(0.5, 0.7 + gex / 50)
-
-    def should_allow_entry(self, side, regime='NEUTRAL'):
-        """
-        GEX Gate (Soft): Returns True mostly, only huge red flags return False.
-        Major sizing reduction happens via get_size_multiplier() instead.
-        """
-        # v15.9: Downgraded to soft gate (scaler). Only block extreme outliers if any.
-        return True
-
-    def get_confidence_adjustment(self):
-        """Adjust confidence threshold based on GEX"""
-        gex, _ = self.fetch_data()
-
-        if gex < -10:
-            return 0.05  # Require higher confidence in choppy markets
-        elif gex > 20:
-            return -0.03  # Slightly lower threshold in stable markets
-        return 0.0
-
-# ==============================================================================
-# LIQUIDITY FILTER: Microstructure & Data Quality Checks
-# ==============================================================================
-class LiquidityFilter:
-    SETTINGS = {
-        'MAX_SPREAD_PCT': 0.02,
-        'MIN_DOLLAR_VOLUME': 500000,
-        'MIN_REL_VOLUME': 0.5,
-        'MAX_GAP_MINUTES': 30  # v15: Max allowed gap in minutes
-    }
-
-    @staticmethod
-    def check(df, lookback=20):
-        """
-        Returns True if ticker is liquid enough to trade AND data quality is good
-        """
-        if len(df) < lookback:
-            return False
-
-        try:
-            recent = df.tail(lookback)
-
-            # Spread % Proxy (FIX: Use Close-Open noise instead of High-Low range)
-            # High-Low overestimates spread on volatile 15m bars.
-            spread_pct = (recent['Close'] - recent['Open']).abs() / recent['Close']
-            avg_spread = spread_pct.mean()
-
-            # Dollar volume
-            dollar_volume = (recent['Close'] * recent['Volume']).iloc[-1]
-
-            # Relative volume
-            vol_sma = df['Volume'].rolling(lookback).mean()
-            rel_vol = df['Volume'].iloc[-1] / vol_sma.iloc[-1] if vol_sma.iloc[-1] > 0 else 0
-
-            # All checks must pass
-            if avg_spread > LiquidityFilter.SETTINGS['MAX_SPREAD_PCT']:
-                return False
-            if dollar_volume < LiquidityFilter.SETTINGS['MIN_DOLLAR_VOLUME']:
-                return False
-            if rel_vol < LiquidityFilter.SETTINGS['MIN_REL_VOLUME']:
-                return False
-
-            # v15: GAP DETECTION (Data Hygiene)
-            # Check for missing bars or large timestamp gaps
-            if len(df) > 50:
-                diffs = df.index.to_series().diff().dt.total_seconds() / 60
-                # Dynamic Threshold: 3x the median interval (allows for 1 missing bar in 15m)
-                median_diff = diffs.median()
-                expected = median_diff if median_diff > 0 else 15
-                max_gap = diffs.tail(50).max()
-
-                if max_gap > (expected * 3.0):
-                     # logging.debug(f"💧 Gap detected: {max_gap:.0f} mins (Limit: {expected*3})")
-                     return False
-
-            return True
-        except Exception as e:
-            logging.debug(f"LiquidityFilter.check() failed: {e}")
-            return False
-
-    @staticmethod
-    def get_size_haircut(df):
-        """
-        Calculate size reduction (haircut) based on liquidity/spread.
-        Returns float between 0.05 (5%) and 0.40 (40%).
-        """
-        try:
-            if len(df) < 20: return 0.10
-
-            recent = df.tail(20)
-            # Spread Estimate (FIX: Use Close-Open noise)
-            spread_pct = ((recent['Close'] - recent['Open']).abs() / recent['Close']).mean()
-
-            # Haircut = 20 * spread (e.g., 0.5% spread -> 10% haircut)
-            haircut = spread_pct * 20
-
-            # Clip between 5% and 40%
-            return max(0.05, min(0.40, haircut))
-        except Exception as e:
-            logging.debug(f"LiquidityFilter.get_size_haircut() failed: {e}")
-            return 0.10
-
-# ==============================================================================
-# PORTFOLIO RISK CONTROLS: Sector caps and correlation limits
-# ==============================================================================
-class PortfolioRisk:
-    """
-    Portfolio-level risk controls to prevent concentrated exposure.
-    - Sector caps: max 2 positions per sector
-    - Theme limits: avoid too many correlated bets
-    """
-
-    # Sector mapping for CORE tickers and common high-beta stocks
-    SECTOR_MAP = {
-        # Space/Aerospace
-        'RKLB': 'Space', 'LUNR': 'Space', 'ASTS': 'Space', 'RDW': 'Space',
-        # Semiconductors
-        'NVDA': 'Semis', 'MU': 'Semis', 'AVGO': 'Semis', 'AMD': 'Semis', 'INTC': 'Semis',
-        # AI/Cloud
-        'PLTR': 'AI', 'CRWV': 'AI', 'NET': 'Cloud', 'SNOW': 'Cloud',
-        # Defense
-        'KTOS': 'Defense', 'RCAT': 'Defense', 'LMT': 'Defense',
-        # Biotech/Healthcare
-        'RIGL': 'Biotech', 'VKTX': 'Biotech', 'TMDX': 'Biotech', 'HIMS': 'Healthcare',
-        # Consumer Tech
-        'APP': 'AdTech', 'AAPL': 'Consumer', 'TSLA': 'EV', 'RIVN': 'EV',
-    }
-
-    MAX_PER_SECTOR = 2
-    MAX_CORRELATED = 3  # Max positions with >0.7 correlation
-
-    def __init__(self):
-        self.holdings_history = {}  # {ticker: pd.Series of daily closes}
-        self.universe_history = {}  # {ticker: pd.Series}
-        self.correlation_matrix = None
-        self.last_update = None
-        self.last_universe_update = None
-
-    def update_holdings_data(self, positions):
-        """
-        Fetch and cache 60d daily history for all open positions.
-        """
-        current_tickers = list(positions.keys())
-
-        # Remove closed positions
-        self.holdings_history = {
-            t: data for t, data in self.holdings_history.items()
-            if t in current_tickers
-        }
-
-        # Add new positions
-        for t in current_tickers:
-            if t not in self.holdings_history:
-                try:
-                    df = yf.Ticker(t).history(period='3mo', interval='1d')[-60:]
-                    if not df.empty:
-                        self.holdings_history[t] = df['Close']
-                except Exception as e:
-                    logging.debug(f"Failed to fetch history for {t}: {e}")
-
-    def update_universe_cache(self, universe_list):
-        """
-        Batch download history for entire universe + computing correlation matrix
-        Call this periodically (e.g. every hour) to avoid per-candidate downloads
-        """
-        # Update every 60 mins
-        if self.last_universe_update and (datetime.datetime.now() - self.last_universe_update).total_seconds() < 3600:
-            return
-
-        logging.info("↻ Updating correlation matrix for universe...")
-        try:
-            # Batch download everything (yfinance handles batching internally)
-            # Add HOLDINGS to the universe list so we can correlate them
-            full_list = list(set(universe_list + list(self.holdings_history.keys())))
-
-            # Download in chunks of 50 to be safe
-            all_closes = {}
-            chunk_size = 50
-            for i in range(0, len(full_list), chunk_size):
-                chunk = full_list[i:i+chunk_size]
-                data = yf.download(chunk, period="3mo", interval="1d", progress=False)['Close']
-
-                # yfinance return structure varies for single vs multiple
-                if isinstance(data, pd.Series):
-                    all_closes[chunk[0]] = data
-                else:
-                    for col in data.columns:
-                        all_closes[col] = data[col]
-
-            # Create master DF aligned on date
-            self.universe_history = pd.DataFrame(all_closes).tail(60)
-
-            # Compute correlation matrix
-            # Compute correlation matrix using LOG-RETURNS (not price levels)
-            # FIX: Price correlation is misleading. Returns correlation is reality.
-            # Use log returns: ln(p_today / p_yesterday)
-            # Safety: Drop 0/NaN columns, but allow some missingness (thresh=85%) to avoid nuking universe
-            prices = self.universe_history.replace(0, np.nan)
-            min_obs = int(len(prices) * 0.85) # Must have 85% of bars
-            prices = prices.dropna(axis=1, thresh=min_obs)
-
-            rets = np.log(prices).diff().dropna(how="any") # Now drop rows with any NaNs (minor data loss preferred to invalid cov)
-            self.correlation_matrix = rets.corr()
-
-            self.last_universe_update = datetime.datetime.now()
-            logging.info(f"✅ Correlation matrix updated ({len(self.correlation_matrix)} tickers)")
-
-        except Exception as e:
-            logging.error(f"Correlation matrix update failed: {e}")
-
-    def check_correlation(self, candidate, holdings_list=None, threshold=0.80):  # v15.9: Relaxed from 0.70
-        """
-        Returns False if candidate has > 0.8 correlation with any ticker in holdings_list.
-        """
-        # Default to open positions if no list provided
-        if holdings_list is None:
-            holdings_list = list(self.holdings_history.keys())
-
-        if not holdings_list:
-            return True
-
-        # Fast Path: Use pre-computed matrix
-        if self.correlation_matrix is not None and candidate in self.correlation_matrix.index:
-            try:
-                # Check against current holdings only
-                holdings = holdings_list
-                # Filter holdings that are in the matrix
-                valid_holdings = [h for h in holdings if h in self.correlation_matrix.columns]
-
-                if not valid_holdings:
-                    return True
-
-                corrs = self.correlation_matrix.loc[candidate, valid_holdings]
-                max_corr = corrs.max()
-
-                if max_corr > threshold:
-                    # Find which ticker triggered it
-                    bad_ticker = corrs.idxmax()
-                    logging.debug(f"🔗 Correlation block (MATRIX): {candidate} vs {bad_ticker} ({max_corr:.2f})")
-                    return False
-                return True
-            except Exception as e:
-                logging.debug(f"Matrix corr check failed: {e}")
-                # Fall through to slow check
-
-        # Slow Path: Download individually (fallback)
-        try:
-            cand_df = yf.Ticker(candidate).history(period='3mo', interval='1d')[-60:]
-            if cand_df.empty or len(cand_df) < 30:
-                return True
-
-            cand_close = cand_df['Close']
-
-            for hold_ticker, hold_close in self.holdings_history.items():
-                if hold_ticker == candidate:
-                    continue
-
-                # Align dates
-                aligned = pd.concat([cand_close, hold_close], axis=1, join='inner')
-                if len(aligned) < 30:
-                    continue
-
-                corr = aligned.iloc[:, 0].corr(aligned.iloc[:, 1])
-
-                if corr > threshold:
-                    logging.debug(f"🔗 Correlation block (SLOW): {candidate} vs {hold_ticker} ({corr:.2f})")
-                    return False
-
-            return True
-        except Exception as e:
-            logging.debug(f"Correlation check error: {e}")
-            return True
-
-    @classmethod
-    def get_sector(cls, ticker):
-        """Get sector for a ticker, returns 'Other' if unknown"""
-        return cls.SECTOR_MAP.get(ticker, 'Other')
-
-    @classmethod
-    def check_sector_cap(cls, ticker, positions):
-        """
-        Returns True if adding this ticker would NOT exceed sector cap
-        """
-        new_sector = cls.get_sector(ticker)
-
-        # Count existing positions in same sector
-        sector_count = sum(
-            1 for t in positions.keys()
-            if cls.get_sector(t) == new_sector
-        )
-
-        return sector_count < cls.MAX_PER_SECTOR
-
-    @classmethod
-    def check_theme_limit(cls, ticker, positions, max_same_theme=3):
-        """
-        Check if we're too concentrated in one theme.
-        Themes: Space, Semis, AI, Defense, Biotech
-        """
-        theme = cls.get_sector(ticker)
-        high_concentration_themes = ['Space', 'Semis', 'AI', 'Biotech', 'Defense', 'EV']
-
-        if theme not in high_concentration_themes:
-            return True
-
-        theme_count = sum(
-            1 for t in positions.keys()
-            if cls.get_sector(t) == theme
-        )
-
-        return theme_count < max_same_theme
-
-    def check_portfolio_heat(self, positions, equity):
-        """
-        Check if total open risk exceeds global cap (e.g. 6% of equity).
-        Heat = Sum(Risk$) / Equity
-        """
-        heat = 0.0
-        for p in positions.values():
-            # Use init_risk (per share) * qty for Risk$
-            r = p.get('init_risk', 0)
-            q = p.get('qty', 0)
-            heat += (r * q)
-
-        heat_pct = heat / max(1.0, equity)
-
-        # If heat > MAX (e.g. 0.06), block new entries
-        max_heat = SETTINGS.get('MAX_PORTFOLIO_HEAT', 0.06)
-        if heat_pct >= max_heat:
-            logging.debug(f"🔥 Portfolio Heat Block: {heat_pct:.1%} >= {max_heat:.1%}")
-            return False
-        return True
-
-    def should_allow_entry(self, ticker, positions, equity):
-        """
-        Main check: returns True if entry is allowed based on portfolio constraints
-        """
-        if ticker in positions:
-            return False
-
-        if not self.check_portfolio_heat(positions, equity):
-            return False
-
-        if not self.check_sector_cap(ticker, positions):
-            return False
-
-        if not self.check_theme_limit(ticker, positions):
-            return False
-
-        # 3. Correlation Check (Open + Pending)
-        effective_holdings = list(positions.keys())
-        if not self.check_correlation(ticker, holdings_list=effective_holdings):
-            return False
-
-        return True
-
-# ==============================================================================
-# VOLATILITY TARGETING: Dynamic sizing based on realized vol
-# ==============================================================================
-class VolTarget:
-    """
-    EWMA + simple GARCH(1,1) volatility targeting.
-    sigma_hat = blend * ewma_vol + (1 - blend) * garch_vol
-    w_t = clip(target_vol / sigma_hat, 0.5, w_max)
-    """
-
-    def __init__(self, target_vol=0.15, ewma_lambda=0.94, w_max=2.0,
-                 garch_omega=2e-6, garch_alpha=0.06, garch_beta=0.93,
-                 blend=0.70):
-        self.target_vol = target_vol
-        self.ewma_lambda = ewma_lambda
-        self.w_max = w_max
-        self.garch_omega = garch_omega
-        self.garch_alpha = garch_alpha
-        self.garch_beta = garch_beta
-        self.blend = blend
-        self.scalar = 1.0
-        self.last_update = None
-        self.sigma_hat = None
-        self._spy_cache = None      # FIX: Share SPY data, avoid redundant YF calls
-        self._spy_cache_ts = 0
-
-    def _get_spy_returns(self):
-        """Cached SPY fetch shared across VolTarget and Regime (30min TTL)."""
-        now = time.time()
-        if self._spy_cache is not None and (now - self._spy_cache_ts) < 1800:
-            return self._spy_cache
-        try:
-            spy = yf.Ticker("SPY").history(period="3mo", interval="1d")
-            if len(spy) >= 30:
-                returns = spy['Close'].pct_change().dropna()
-                self._spy_cache = returns
-                self._spy_cache_ts = now
-                return returns
-        except Exception:
-            pass
-        return self._spy_cache  # Return stale if fetch fails
-
-    def _ewma_variance(self, returns):
-        lam = self.ewma_lambda
-        var = returns.iloc[0] ** 2
-        for r in returns.iloc[1:]:
-            var = lam * var + (1 - lam) * (r ** 2)
-        return var
-
-    def _garch_variance(self, returns):
-        omega, alpha, beta_g = self.garch_omega, self.garch_alpha, self.garch_beta
-        var = returns.var()
-        # FIX: Add convergence check - stop if variance explodes or collapses
-        for r in returns:
-            var = omega + alpha * (r ** 2) + beta_g * var
-            if not np.isfinite(var) or var > 1.0:
-                return returns.var()  # Fallback to sample variance
-        return var
-
-    def update_scalar(self):
-        try:
-            if self.last_update and (datetime.datetime.now() - self.last_update).total_seconds() < 900:
-                return self.scalar
-
-            returns = self._get_spy_returns()
-            if returns is None or len(returns) < 30:
-                return self.scalar if self.scalar else 1.0
-
-            ewma_var = self._ewma_variance(returns)
-            ewma_vol = np.sqrt(max(0, ewma_var) * 252)
-
-            garch_var = self._garch_variance(returns)
-            garch_vol = np.sqrt(max(0, garch_var) * 252)
-
-            sigma_hat = self.blend * ewma_vol + (1.0 - self.blend) * garch_vol
-
-            if not np.isfinite(sigma_hat) or sigma_hat <= 0:
-                sigma_hat = returns.tail(20).std() * np.sqrt(252)
-
-            self.sigma_hat = sigma_hat
-
-            if sigma_hat > 0:
-                raw_scalar = self.target_vol / sigma_hat
-                self.scalar = max(0.5, min(self.w_max, raw_scalar))
-            else:
-                self.scalar = 1.0
-
-            self.last_update = datetime.datetime.now()
-            logging.info(f"⚡ VolTarget: EWMA={ewma_vol:.1%} GARCH={garch_vol:.1%} "
-                         f"Blend={sigma_hat:.1%} Target={self.target_vol:.1%} Scalar={self.scalar:.2f}")
-            return self.scalar
-
-        except Exception as e:
-            logging.debug(f"VolTarget update failed: {e}")
-            return self.scalar if self.scalar else 1.0
-
-    def get_scalar(self):
-        return self.scalar
-
-    def get_sigma_hat(self):
-        return self.sigma_hat if self.sigma_hat else self.target_vol
 
 # ==============================================================================
 # 4. ALERTS
@@ -1505,217 +474,40 @@ class VolTarget:
 def send_alert(subject, body, priority="normal"):
     if KEYS['DISCORD']:
         try:
-            color = 65280 if priority=="trade" else 16711680 if priority=="high" else 3447003
+            color = 65280 if priority == "trade" else 16711680 if priority == "high" else 3447003
             requests.post(KEYS['DISCORD'], json={"embeds": [{"title": subject, "description": body, "color": color}]}, timeout=5)
-        except: pass
+        except Exception:
+            pass
+
 
 # ==============================================================================
-# 5. ANALYTICS (FIX #6: Direction-aware historical hit-rate)
+# 5. DAILY ATR HELPER
 # ==============================================================================
-from hedge_fund.math_utils import get_kalman_filter, get_hurst
-
-def get_historical_hitrate(df, side, lookback=100, atr_mult_sl=1.5, atr_mult_tp=3.0, atr_col='ATR', max_bars=20):
-    """
-    Calculate historical hit rate for bracket trades using vectorized simulation.
-    Returns: (wins, losses) - raw counts for Bayesian analysis
-    """
-    try:
-        if atr_col not in df.columns:
-            return 0, 0
-
-        if len(df) < lookback + 50:
-            return 0, 0
-
-        # Ensure ATR is valid
-        df = df.dropna(subset=[atr_col])
-        df = df[df[atr_col] > 0]
-
-        if len(df) < lookback + 50:
-            return 0, 0  # FIX: Always return integers
-
-        wins = 0
-        losses = 0
-
-        for i in range(lookback, len(df) - max_bars - 1, 10):
-            entry = df['Close'].iloc[i]
-            atr = df[atr_col].iloc[i]
-
-            if not np.isfinite(atr) or atr <= 0:
-                continue
-
-            # Market Hours Filter - use proper Eastern time check
-            ts = df.index[i]
-            if not is_regular_hours(ts):
-                continue
-
-            if side == 'LONG':
-                sl = entry - atr_mult_sl * atr
-                tp = entry + atr_mult_tp * atr
-            else:  # SHORT
-                sl = entry + atr_mult_sl * atr
-                tp = entry - atr_mult_tp * atr
-
-            # Check using HIGH/LOW for realistic hit detection
-            for j in range(i + 1, min(i + max_bars + 1, len(df))):
-                high = df['High'].iloc[j]
-                low = df['Low'].iloc[j]
-
-                if side == 'LONG':
-                    # Check SL first (hit if low touched SL)
-                    if low <= sl:
-                        losses += 1
-                        break
-                    # Then check TP (hit if high touched TP)
-                    if high >= tp:
-                        wins += 1
-                        break
-                else:  # SHORT
-                    # Check SL first (hit if high touched SL)
-                    if high >= sl:
-                        losses += 1
-                        break
-                    # Then check TP (hit if low touched TP)
-                    if low <= tp:
-                        wins += 1
-                        break
-
-        total = wins + losses
-        # v15.8: Return RAW wins/losses for Bayesian update
-        return wins, losses
-    except Exception as e:
-        logging.debug(f"get_historical_hitrate() failed: {e}")
-        return 0, 0
-
-def estimate_rr_net(entry, sl, tp):
-    """Calculate Reward/Risk net of execution costs/slippage"""
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-    if risk <= 0: return 0.0
-
-    rr = reward / risk
-
-    # Haircut RR for market orders (slippage reduces effective edge)
-    if SETTINGS.get("USE_MARKET_ORDERS", False):
-        reduction = SETTINGS.get("SLIPPAGE_HAIRCUT", 0.10) * 0.5
-        rr *= (1.0 - reduction)
-
-    return max(0.1, rr)
-
-def estimate_cost_in_R(df, stop_distance):
-    """
-    Estimate transaction costs in R-units.
-    Cost_R = (Spread + Slippage) / Stop_Distance
-    FIX: Use 1-min bars' close-open as noise proxy instead of 15m high-low range.
-    """
-    try:
-        # FIX: Use close-open absolute movement as spread proxy (better than high-low)
-        recent = df.tail(50)  # Use more bars for stability
-        # Median absolute close-open movement as noise/spread proxy
-        noise_proxy = ((recent['Close'] - recent['Open']).abs() / recent['Close']).median()
-
-        # Cap spread estimate to reasonable bounds (0.05% to 1%)
-        spread_estim = max(0.0005, min(0.01, noise_proxy))
-
-        # Slippage assumption
-        slippage = spread_estim * 0.5 if SETTINGS.get("USE_MARKET_ORDERS", False) else 0
-
-        total_cost_pct = spread_estim + slippage
-        price = df['Close'].iloc[-1]
-
-        cost_abs = price * total_cost_pct
-
-        if stop_distance > 0:
-            return cost_abs / stop_distance
-        return 0.1  # Fallback high cost
-    except Exception as e:
-        logging.debug(f"estimate_cost_in_R failed: {e}")
-        return 0.1
-
-def get_bayesian_p_safe(wins, losses, confidence_level=0.10):
-    """
-    Returns the lower bound of the win rate posterior (Safe P).
-    Posterior ~ Beta(wins+1, losses+1)
-    FIX: Minimum sample protection - return neutral 0.50 when data is too sparse
-    to avoid penalizing tickers with no trading history.
-    """
-    try:
-        total = wins + losses
-        if total < 10:
-            # Not enough data - return neutral (don't penalize or reward)
-            return 0.50
-        alpha = wins + 1
-        beta_param = losses + 1
-        p_safe = beta.ppf(confidence_level, alpha, beta_param)
-        return float(np.clip(p_safe, 0.05, 0.95))
-    except Exception as e:
-        logging.debug(f"get_bayesian_p_safe failed: {e}")
-        return 0.5
-
-def kelly_3_outcome(pW, pL, pH, b, d=0.15, f_max=0.04):
-    """
-    3-Outcome Kelly criterion wrapper.
-    Delegates to hedge_fund.risk.kelly_criterion for consistency with the backtester.
-
-    pW: Prob win, pL: Prob loss, pH: Prob hold (timeout).
-    b: Reward multiple (e.g. 2.0R).
-    d: Hold penalty (e.g. 0.15R, used as avg_timeout_r).
-    f_max: Cap on fraction (e.g. 0.04).
-    """
-    from hedge_fund.risk import kelly_criterion
-    return kelly_criterion(
-        win_rate=pW,
-        avg_win_r=b,
-        avg_loss_r=1.0,  # Loss = 1R by definition
-        timeout_rate=pH,
-        avg_timeout_r=-d,  # Hold penalty is negative (cost of capital)
-        shrinkage=0.35,
-        confidence_boost=0.5,
-        min_risk=0.0,
-        max_risk=f_max,
-    )
-
-# Backward compatibility wrapper if needed
-def aggressive_kelly_risk_pct(*args, **kwargs): return 0.01
-
-def ev_to_size_mult(ev_r):
-    """
-    Map EV (in R-units) to a continuous sizing scalar [0.35 .. 1.25].
-    Low-edge trades get smaller, not filtered out. Preserves frequency, improves PF.
-    """
-    return float(np.clip(0.35 + 1.5 * ev_r, 0.35, 1.25))
-
-
-# NOTE: CrossSectionalRanker and OvernightGapModel are now imported from hedge_fund package above.
-
-# FIX #8: Get DAILY ATR for risk sizing (more stable than minute ATR)
 def get_daily_atr(ticker, period=14):
-    """Use daily ATR for risk sizing - more stable than minute bars"""
+    """Use daily ATR for risk sizing."""
     try:
         tk = yf.Ticker(ticker)
         daily = tk.history(period='1mo', interval='1d')
         if len(daily) < period + 1:
             return None
-
         high = daily['High']
         low = daily['Low']
         close = daily['Close']
-
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(period).mean().iloc[-1]
-
         return float(atr)
     except Exception as e:
         logging.debug(f"get_daily_atr({ticker}) failed: {e}")
         return None
 
-# FIX: Cache daily ATR to prevent yfinance rate limiting (call once per 6 hours)
+
 class DailyATRCache:
-    def __init__(self, ttl_sec=6*3600):
+    def __init__(self, ttl_sec=6 * 3600):
         self.ttl = ttl_sec
-        self.cache = {}  # ticker -> (timestamp, atr)
+        self.cache = {}
 
     def get(self, ticker):
         now = time.time()
@@ -1723,131 +515,20 @@ class DailyATRCache:
             ts, atr = self.cache[ticker]
             if now - ts < self.ttl:
                 return atr
-
         atr = get_daily_atr(ticker)
         if atr and np.isfinite(atr) and atr > 0:
             self.cache[ticker] = (now, float(atr))
             return float(atr)
         return None
 
-    def clear_expired(self):
-        """Remove expired entries to prevent memory growth"""
-        now = time.time()
-        expired = [k for k, (ts, _) in self.cache.items() if now - ts >= self.ttl]
-        for k in expired:
-            del self.cache[k]
-
-# Global ATR cache instance
-ATR_CACHE = DailyATRCache(ttl_sec=6*3600)
-def attach_daily_atr_to_15m(df_15m: pd.DataFrame, ticker: str, poly=None, period=14):
-    """
-    Attach daily ATR to 15-min bars using vectorized join (fast).
-    Uses Polygon daily bars if poly provided, else yfinance.
-    """
-    try:
-        d = pd.DataFrame()
-        if poly:
-            # Use Polygon for 5 years of daily data (1 call)
-            d = poly.fetch_daily_data(ticker, days=1825)
-
-        if d.empty:
-            # Fallback to yfinance if Polygon fails or not provided
-            d = yf.Ticker(ticker).history(period="5y", interval="1d")
-            if not d.empty and d.index.tz is not None:
-                d.index = d.index.tz_convert("America/New_York")
-
-        if d.empty or len(d) < period + 2:
-            return df_15m
-
-        # True Range
-        high, low, close = d["High"], d["Low"], d["Close"]
-        tr = pd.concat([(high - low), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-        # FIX: Shift by 1 to prevent Daily ATR leakage into intraday bars
-        d_atr = tr.rolling(period).mean().shift(1).rename("ATR_D")
-
-        # Vectorized join on normalized date (strip tz for both sides of join)
-        d_atr.index = pd.to_datetime(d_atr.index.tz_localize(None) if d_atr.index.tz is None
-                                     else d_atr.index.tz_convert(None)).normalize()
-
-        out = df_15m.copy()
-        _idx = pd.to_datetime(out.index)
-        if _idx.tz is not None:
-            _idx = _idx.tz_convert(None)
-        out["_d"] = _idx.normalize()
-        out = out.join(d_atr, on="_d")
-        out.drop(columns=["_d"], inplace=True)
-        out["ATR_D"] = out["ATR_D"].ffill()
-
-        # Ensure we have a column named ATR_D
-        if "ATR_D" not in out.columns:
-             out["ATR_D"] = np.nan
-
-        return out
-    except Exception as e:
-        logging.debug(f"attach_daily_atr_to_15m failed for {ticker}: {e}")
-        return df_15m
-
-def get_daily_atr_polygon(poly, ticker: str, period=14, cache_ttl_sec=6*3600):
-    """
-    Get daily ATR from Polygon using optimized daily bars (no 1-min resample).
-    """
-    key = ("atrD", ticker, period)
-    now = time.time()
-    if key in poly._mem_cache and (now - poly._mem_cache[key][0] < cache_ttl_sec):
-        return poly._mem_cache[key][1]
-
-    try:
-        # Use optimized daily fetch
-        d = poly.fetch_daily_data(ticker, days=60)
-        if d.empty or len(d) < period + 2:
-            return None
-
-        high, low, close = d["High"], d["Low"], d["Close"]
-        tr = pd.concat([(high - low), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-        # FIX: Shift by 1 to prevent leakage of today's partial ATR
-        atr = float(tr.rolling(period).mean().shift(1).iloc[-1])
-
-        res = atr if np.isfinite(atr) and atr > 0 else None
-        poly._mem_cache[key] = (now, res)
-        return res
-    except Exception as e:
-        logging.debug(f"get_daily_atr_polygon({ticker}) failed: {e}")
-        return None
-
-def compute_bracket_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=20, atr_col='ATR', **_kwargs):
-    """
-    EV-style continuous labels with direction encoded in sign.
-    Delegates to hedge_fund.simulation.compute_bracket_labels which uses
-    simulate_exit with trailing stop support for consistency with the backtester.
-    """
-    from hedge_fund.simulation import compute_bracket_labels as _compute_labels
-    return _compute_labels(df, sl_mult=sl_mult, tp_mult=tp_mult,
-                           max_bars=max_bars, atr_col=atr_col, mode='regression').values
-
-def _simulate_exit(highs, lows, sl, tp, side, trail_dist=None):
-    """
-    Simulate bracket exit using High/Low of future bars.
-    Delegates to hedge_fund.simulation.simulate_exit which supports trailing stops.
-    Returns 'win' if TP hit first, 'loss' if SL hit first, 'timeout' if neither.
-    For backward compatibility, returns just the outcome string when called without
-    trail_dist, or (outcome, exit_price) tuple when trail_dist is provided.
-    """
-    from hedge_fund.simulation import simulate_exit as _sim_exit
-    outcome, exit_price = _sim_exit(highs, lows, sl, tp, side, trail_dist=trail_dist)
-    if trail_dist is not None:
-        return outcome, exit_price
-    return outcome
-
-# ==============================================================================
-# LIQUIDITY FILTER: Skip thin/illiquid trades
-# ==============================================================================
+ATR_CACHE = DailyATRCache(ttl_sec=6 * 3600)
 
 
 # ==============================================================================
-# 6. GUARDS
+# 6. EARNINGS GUARD
 # ==============================================================================
 class EarningsGuard:
-    MAX_CACHE_SIZE = 500  # FIX: Prevent unbounded cache growth
+    MAX_CACHE_SIZE = 500
 
     def __init__(self):
         self.earnings_cache = {}
@@ -1862,256 +543,43 @@ class EarningsGuard:
             if res:
                 earnings_date = pd.to_datetime(res[0]['date']).date()
                 if 0 <= (earnings_date - now).days <= 1:
-                    logging.warning(f"⚠️ EARNINGS SKIP: {ticker}")
+                    logging.warning(f"EARNINGS SKIP: {ticker}")
                     return False
-
-            # FIX: Limit cache size to prevent memory leak
             if len(self.earnings_cache) >= self.MAX_CACHE_SIZE:
-                # Remove oldest entries (approx half)
                 keys_to_remove = list(self.earnings_cache.keys())[:self.MAX_CACHE_SIZE // 2]
                 for k in keys_to_remove:
                     del self.earnings_cache[k]
-
             self.earnings_cache[ticker] = now + datetime.timedelta(days=1)
         except Exception as e:
             logging.debug(f"EarningsGuard.check_safe({ticker}) failed: {e}")
         return True
 
     def check_news(self, ticker):
-        """
-        v15.10: Check FMP News for catastrophic keywords.
-        Returns: (is_safe, penalty_level)
-           - penalty_level 0: No penalty
-           - penalty_level 1: Warning (Tier Drop)
-           - penalty_level 2: Hard Block
-        """
+        """Check FMP News for catastrophic keywords."""
         try:
             url = f"https://financialmodelingprep.com/api/v3/stock_news?tickers={ticker}&limit=5&apikey={KEYS['FMP']}"
             res = requests.get(url, timeout=3).json()
-
-            # Keywords
             block_list = ["fraud", "subpoena", "investigation", "sec ", "bankruptcy", "chapter 11"]
             warn_list = ["lawsuit", "class action", "miss", "plunge", "tumble", "crash"]
-
             for item in res:
-                # Only check recent news (last 24h)
                 pub_date = pd.to_datetime(item.get('publishedDate')).date()
                 if (datetime.date.today() - pub_date).days > 1:
                     continue
-
-                title = item.get('title', '').lower()
-                text = item.get('text', '').lower()
-                content = title + " " + text
-
+                content = (item.get('title', '') + " " + item.get('text', '')).lower()
                 if any(x in content for x in block_list):
-                    logging.warning(f"🚨 NEWS BLOCK {ticker}: {title[:50]}...")
+                    logging.warning(f"NEWS BLOCK {ticker}: {item.get('title', '')[:50]}...")
                     return False, 2
-
                 if any(x in content for x in warn_list):
                     return True, 1
-
             return True, 0
-        except Exception as e:
+        except Exception:
             return True, 0
 
-class HedgeManager:
-    def __init__(self, alpaca):
-        self.alpaca = alpaca
-        self.is_hedged = False
-
-    def check_hedge(self, regime):
-        try:
-            if regime == 'BEAR' and not self.is_hedged:
-                self.deploy_hedge()
-            elif regime != 'BEAR' and self.is_hedged:
-                self.remove_hedge()
-        except Exception as e:
-            ERROR_TRACKER.record_failure("Hedge", str(e))
-
-    def deploy_hedge(self):
-        try:
-            equity = float(self.alpaca.api.get_account().equity)
-            tk = yf.Ticker(SETTINGS['HEDGE_TICKER'])
-            hist = tk.history(period='1d')
-            if hist.empty: return
-            price = hist['Close'].iloc[-1]
-            qty = int((equity * 0.15) / price)
-
-            if qty > 0:
-                self.alpaca.api.submit_order(
-                    symbol=SETTINGS['HEDGE_TICKER'], qty=qty,
-                    side='buy', type='market', time_in_force='day'
-                )
-                self.is_hedged = True
-                send_alert("🛡️ HEDGE DEPLOYED", f"Bought {qty} {SETTINGS['HEDGE_TICKER']}", "high")
-        except Exception as e:
-            ERROR_TRACKER.record_failure("Hedge_Deploy", str(e))
-
-    def remove_hedge(self):
-        try:
-            self.alpaca.api.close_position(SETTINGS['HEDGE_TICKER'])
-            self.is_hedged = False
-        except Exception as e:
-            logging.debug(f"Remove hedge failed: {e}")
-            self.is_hedged = False
 
 # ==============================================================================
-# 6b. COINTEGRATION PAIRS SCANNER
+# 7. RATE LIMITER
 # ==============================================================================
-try:
-    from statsmodels.tsa.stattools import coint as _coint_test
-    HAS_COINT = True
-except ImportError:
-    HAS_COINT = False
-
-
-class PairsScanner:
-    """
-    Engle-Granger cointegration scanner.
-    Finds mean-reverting pairs in the universe and generates spread-trade signals.
-    Market-neutral: profits in CHOP regimes where directional strategies struggle.
-    """
-    def __init__(self, poly, lookback_days=60, rescan_hours=6):
-        self.poly = poly
-        self.lookback_days = lookback_days
-        self._rescan_interval = rescan_hours * 3600
-        self._pairs = []          # List of (tickerA, tickerB, hedge_ratio, half_life)
-        self._last_scan = 0
-        self._spread_cache = {}   # (A, B) -> (ts, z_score)
-        self._lock = threading.Lock()
-
-    def scan_pairs(self, universe, max_pairs=10):
-        """
-        Run Engle-Granger cointegration test on all unique pairs.
-        Keeps pairs with p-value < 0.05 and half-life 2-30 days.
-        """
-        if not HAS_COINT:
-            return []
-        now = time.time()
-        if now - self._last_scan < self._rescan_interval and self._pairs:
-            return self._pairs
-
-        logging.info(f"🔗 Pairs scan: testing {len(universe)} tickers...")
-        # Fetch daily closes for covariance
-        prices = self.poly.fetch_batch_bars(universe, days=self.lookback_days)
-        if prices.empty or len(prices.columns) < 4:
-            return self._pairs
-
-        # Drop tickers with too many NaNs
-        prices = prices.dropna(axis=1, thresh=int(len(prices) * 0.8))
-        tickers = list(prices.columns)
-
-        found = []
-        for i in range(len(tickers)):
-            for j in range(i + 1, len(tickers)):
-                a, b = tickers[i], tickers[j]
-                try:
-                    s1 = prices[a].dropna()
-                    s2 = prices[b].dropna()
-                    common = s1.index.intersection(s2.index)
-                    if len(common) < 40:
-                        continue
-                    s1, s2 = s1.loc[common].values, s2.loc[common].values
-
-                    # Engle-Granger test
-                    _, p_value, _ = _coint_test(s1, s2)
-                    if p_value > 0.05:
-                        continue
-
-                    # Hedge ratio via OLS
-                    hedge_ratio = float(np.polyfit(s2, s1, 1)[0])
-
-                    # Spread and half-life
-                    spread = s1 - hedge_ratio * s2
-                    spread_diff = np.diff(spread)
-                    if len(spread_diff) < 10 or np.std(spread) < 1e-8:
-                        continue
-                    # Ornstein-Uhlenbeck half-life: HL = -ln(2) / lambda
-                    lag_spread = spread[:-1]
-                    beta_ou = np.polyfit(lag_spread, spread_diff, 1)[0]
-                    if beta_ou >= 0:
-                        continue  # Not mean-reverting
-                    half_life = -np.log(2) / beta_ou
-
-                    if 2 <= half_life <= 30:
-                        found.append((a, b, round(hedge_ratio, 4), round(half_life, 1), round(p_value, 4)))
-
-                except Exception:
-                    continue
-
-        # Rank by half-life (shorter = faster reversion = better)
-        found.sort(key=lambda x: x[3])
-        with self._lock:
-            self._pairs = found[:max_pairs]
-            self._last_scan = now
-
-        logging.info(f"🔗 Found {len(self._pairs)} cointegrated pairs (top {max_pairs})")
-        for p in self._pairs:
-            logging.info(f"   {p[0]}/{p[1]} HR={p[2]:.2f} HL={p[3]:.0f}d p={p[4]:.3f}")
-        return self._pairs
-
-    def get_pair_signals(self, prices_dict, z_entry=2.0, z_exit=0.5):
-        """
-        Generate spread-trade signals for active pairs.
-        Returns list of {legA, legB, sideA, sideB, z_score, half_life} dicts.
-        """
-        signals = []
-        with self._lock:
-            pairs = list(self._pairs)
-        for (a, b, hr, hl, _pv) in pairs:
-            try:
-                if a not in prices_dict or b not in prices_dict:
-                    continue
-                pa, pb = prices_dict[a], prices_dict[b]
-                spread = pa - hr * pb
-
-                # Z-score using 20-day lookback (from cache or fresh)
-                cache_key = (a, b)
-                now = time.time()
-                if cache_key in self._spread_cache:
-                    ts, hist = self._spread_cache[cache_key]
-                    if now - ts < 900:  # 15-min cache
-                        hist.append(spread)
-                        if len(hist) > 100:
-                            hist = hist[-100:]
-                    else:
-                        hist = [spread]
-                else:
-                    hist = [spread]
-                self._spread_cache[cache_key] = (now, hist)
-
-                if len(hist) < 10:
-                    continue
-                mu = np.mean(hist)
-                sigma = np.std(hist)
-                if sigma < 1e-8:
-                    continue
-                z = (spread - mu) / sigma
-
-                if abs(z) >= z_entry:
-                    # Spread is extended: trade mean-reversion
-                    # z > +2: spread too high → short A, long B
-                    # z < -2: spread too low → long A, short B
-                    signals.append({
-                        'legA': a, 'legB': b,
-                        'sideA': 'SHORT' if z > 0 else 'LONG',
-                        'sideB': 'LONG' if z > 0 else 'SHORT',
-                        'hedge_ratio': hr,
-                        'z_score': round(float(z), 2),
-                        'half_life': hl,
-                        'type': 'Pairs'
-                    })
-            except Exception:
-                continue
-        return signals
-
-
-# ==============================================================================
-# 7. DATA & EXECUTION
-# ==============================================================================
-
 class RateLimiter:
-    """Token-bucket rate limiter. Allows short bursts while capping average rate."""
     def __init__(self, rate_per_sec=6.0, burst=10):
         self._rate = rate_per_sec
         self._burst = float(burst)
@@ -2120,7 +588,6 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def acquire(self, timeout=30.0):
-        """Block until a token is available. Returns True on success."""
         deadline = time.time() + timeout
         while True:
             with self._lock:
@@ -2136,19 +603,9 @@ class RateLimiter:
             time.sleep(0.02)
 
 
-class ScanBarCache(_ScanBarCache):
-    """In-memory 15-min bar cache (core logic in hedge_fund/websocket.py)"""
-    def __init__(self):
-        super().__init__(tz=ET)
-
-
-class PolygonBarStream(_PolygonBarStream):
-    """Polygon WS bar stream (core logic in hedge_fund/websocket.py)"""
-    def __init__(self, api_key):
-        super().__init__(api_key=api_key, tz=ET,
-                         ws_module=ws_lib if HAS_WS else None)
-
-
+# ==============================================================================
+# 8. WRAPPER CLASSES (thin wrappers around hedge_fund/ package)
+# ==============================================================================
 class Polygon_Helper(_Polygon_Helper):
     """Polygon REST data (core logic in hedge_fund/data_providers.py)"""
     def __init__(self):
@@ -2156,36 +613,18 @@ class Polygon_Helper(_Polygon_Helper):
                          error_tracker=ERROR_TRACKER, io_workers=IO_WORKERS)
 
 
-class FMP_Helper(_FMP_Helper):
-    """FMP screener/news/fundamentals (core logic in hedge_fund/data_providers.py)"""
-    def __init__(self):
-        super().__init__(keys=KEYS)
-
-
-class FundamentalGuard(_FundamentalGuard):
-    """Fundamental filter (core logic in hedge_fund/data_providers.py)"""
-    pass
-
-
-class SeekingAlpha_Helper(_SeekingAlpha_Helper):
-    """SeekingAlpha news/sentiment (core logic in hedge_fund/data_providers.py)"""
-    def __init__(self):
-        super().__init__(keys=KEYS, drive_root=DRIVE_ROOT)
-
-
 class Alpaca_Helper(_Alpaca_Helper):
     """Alpaca broker interface (core logic in hedge_fund/broker.py)"""
-    def __init__(self, db, mc_governor=None, perf_monitor=None):
+    def __init__(self, db, mc_governor=None):
         api = tradeapi.REST(KEYS['ALPACA_KEY'], KEYS['ALPACA_SEC'], ALPACA_URL, 'v2')
         super().__init__(
             api=api, db=db, settings=SETTINGS, keys=KEYS,
-            mc_governor=mc_governor, perf_monitor=perf_monitor,
+            mc_governor=mc_governor,
             error_tracker=ERROR_TRACKER, send_alert_fn=send_alert,
             get_daily_atr_fn=get_daily_atr,
         )
 
     def check_kill(self):
-        """Override to set module-level KILL_TRIGGERED flag."""
         global KILL_TRIGGERED
         result = super().check_kill()
         if self._kill_triggered:
@@ -2194,1345 +633,7 @@ class Alpaca_Helper(_Alpaca_Helper):
 
 
 # ==============================================================================
-# ==============================================================================
-# INSTITUTIONAL-GRADE LOSS FUNCTIONS & MICROSTRUCTURE FEATURES
-# ==============================================================================
-
-def asymmetric_loss_objective(y_true, y_pred):
-    """
-    Custom XGBoost objective: Asymmetric Loss for High Win Rate
-    Penalizes false signals (wrong direction) 10x more than missed opportunities
-    This forces the model to only predict when highly confident
-
-    Loss = {
-        10.0 * (y_true - y_pred)^2  if sign(y_true) != sign(y_pred)  (WRONG DIRECTION)
-        1.0 * (y_true - y_pred)^2   if sign(y_true) == sign(y_pred)  (RIGHT DIRECTION)
-    }
-
-    Returns: (gradient, hessian)
-    """
-    grad = np.zeros_like(y_pred)
-    hess = np.zeros_like(y_pred)
-
-    residual = y_true - y_pred
-    wrong_direction = np.sign(y_true) != np.sign(y_pred)
-
-    # Asymmetric penalty: 10x for wrong direction
-    penalty = np.where(wrong_direction, 10.0, 1.0)
-
-    # Gradient: d/dy_pred [ penalty * (y_true - y_pred)^2 ] = -2 * penalty * (y_true - y_pred)
-    grad = -2.0 * penalty * residual
-
-    # Hessian: d^2/dy_pred^2 = 2 * penalty
-    hess = 2.0 * penalty
-
-    return grad, hess
-
-
-def profit_factor_objective(y_true, y_pred):
-    """
-    🎯 INSTITUTIONAL-GRADE: Differentiable Profit Factor Objective
-
-    Directly optimizes for Profit Factor = Gross_Wins / Gross_Losses
-    This is THE KEY to achieving >1.5 PF systematically.
-
-    Mathematical Strategy:
-    1. Classify predictions as "winners" or "losers" using soft sigmoid
-    2. Calculate Gross Profit (sum of winning R-values)
-    3. Calculate Gross Loss (sum of losing R-values)
-    4. Minimize -log(PF) = -log(GP) + log(GL)
-
-    The sigmoid smoothing makes the objective differentiable while
-    maintaining the economic interpretation of profit factor.
-
-    Returns: (gradient, hessian) for XGBoost
-    """
-    epsilon = 1e-6
-
-    # Agreement score: y_true * y_pred
-    # Positive = correct direction, negative = wrong direction
-    agreement = y_true * y_pred
-
-    # Soft classification using sigmoid for differentiability
-    # sigmoid(agreement/temp) = probability this trade is a "winner"
-    temp = 2.0  # Temperature (lower = sharper, higher = smoother)
-    soft_win_prob = 1.0 / (1.0 + np.exp(-agreement / temp))
-    soft_loss_prob = 1.0 - soft_win_prob
-
-    # Weighted returns (use absolute value of y_true as magnitude)
-    win_contribution = soft_win_prob * np.abs(y_true)
-    loss_contribution = soft_loss_prob * np.abs(y_true)
-
-    # Batch-level gross profit and gross loss
-    gross_profit = np.sum(win_contribution) + epsilon
-    gross_loss = np.sum(loss_contribution) + epsilon
-
-    # Profit Factor
-    pf = gross_profit / gross_loss
-
-    # We MAXIMIZE PF by MINIMIZING -log(PF)
-    # Gradient calculation:
-    # d(-log(PF))/d(y_pred) = d(-log(GP) + log(GL))/d(y_pred)
-
-    # Sigmoid derivative: sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))
-    sigmoid_derivative = soft_win_prob * (1.0 - soft_win_prob)
-
-    # Chain rule:
-    # d(win_prob)/d(y_pred) = sigmoid'(agreement/temp) * y_true / temp
-    d_win_prob = sigmoid_derivative * y_true / temp
-    d_loss_prob = -d_win_prob  # Loss prob decreases when win prob increases
-
-    # Gradient of loss w.r.t. y_pred
-    grad = -(1.0 / gross_profit) * d_win_prob * np.abs(y_true) + \
-           (1.0 / gross_loss) * d_loss_prob * np.abs(y_true)
-
-    # Hessian approximation (constant diagonal for stability)
-    # Use sigmoid curvature as proxy
-    hess = sigmoid_derivative * (1.0 / (temp**2)) * np.abs(y_true) + epsilon
-
-    return grad, hess
-
-
-# FIX: Import microstructure features from hedge_fund/ to eliminate code duplication
-# and ensure consistency between training and live inference.
-from hedge_fund.features import (
-    calculate_vpin,
-    calculate_enhanced_vwap_features,
-    calculate_amihud_illiquidity,
-    calculate_real_relative_strength,
-    calculate_liquidity_sweep,
-    calculate_volatility_regime,
-)
-
-
-def _compute_v7_features(df):
-    """
-    Compute V7 features on a DataFrame. Matches backtester's prepare_features().
-    Returns the DataFrame with all EXPECTED_FEATURES columns added.
-    """
-    # Core indicators (kept for internal use / filters)
-    df['ADX'] = df.ta.adx(14)['ADX_14']
-    df['ATR'] = df.ta.atr(14)
-    df['ATR_Pct'] = df['ATR'] / df['Close']
-
-    # Kalman filter with velocity
-    kalman_level, kalman_vel = get_kalman_filter(df['Close'].values, return_velocity=True)
-    df['Kalman_Trend'] = (df['Close'] - kalman_level) / df['Close']
-    df['Kalman_Velocity'] = kalman_vel
-
-    # Hurst exponent (100-bar window, computed every 10 bars)
-    df['Hurst_Exponent'] = np.nan
-    close_vals = df['Close'].values
-    for i in range(100, len(df), 10):
-        window = close_vals[max(0, i - 100):i]
-        df.iloc[i, df.columns.get_loc('Hurst_Exponent')] = get_hurst(window)
-    df['Hurst_Exponent'] = df['Hurst_Exponent'].ffill().fillna(0.5)
-
-    # VPIN
-    try:
-        df['VPIN'] = calculate_vpin(df)
-    except Exception:
-        df['VPIN'] = 0.5
-
-    # VWAP features
-    try:
-        vwap_feats = calculate_enhanced_vwap_features(df)
-        df['VWAP_ZScore'] = vwap_feats['VWAP_ZScore'].fillna(0.0)
-    except Exception:
-        df['VWAP_ZScore'] = 0.0
-
-    # GEX Proxy
-    try:
-        regime_gex, _ = calculate_volatility_regime(df)
-        df['GEX_Proxy'] = regime_gex.fillna(0)
-    except Exception:
-        df['GEX_Proxy'] = 0
-
-    # Amihud
-    try:
-        df['Amihud_Illiquidity'] = calculate_amihud_illiquidity(df, window=20)
-    except Exception:
-        df['Amihud_Illiquidity'] = 0.5
-
-    # Relative Return Strength
-    df['Relative_Return_Strength'] = df['Close'].pct_change(5).rolling(5).sum().fillna(0.0)
-
-    # NEW V7 features
-    df['OFI'] = compute_ofi(df)
-    df['RV_Ratio'] = compute_rv_ratio(df)
-
-    og, im = compute_momentum_decomp(df)
-    df['Overnight_Gap'] = og
-    df['Intraday_Mom'] = im
-
-    df['Efficiency_Ratio'] = compute_efficiency_ratio(df)
-    df['VPT_Acceleration'] = compute_vpt_acceleration(df)
-
-    uw, lw, br = compute_bar_patterns(df)
-    df['Upper_Wick'] = uw
-    df['Lower_Wick'] = lw
-    df['Body_Ratio'] = br
-
-    df['ATR_Channel_Pos'] = compute_atr_channel_pos(df)
-
-    # Beta Alpha (default 0 if no universe proxy available)
-    df['Beta_Alpha'] = 0.0
-
-    return df
-
-
-def enhance_triple_barrier_labels(df, sl_mult=1.5, tp_mult=3.0, max_bars=12, atr_col='ATR'):
-    """
-    🎯 ENHANCED: Triple Barrier Labeling with Time Penalty
-
-    Standard bracket labeling misses a critical fact: TIME HAS COST.
-    A trade that goes nowhere for 3 hours is a FAILED trade even if
-    it eventually breaks even.
-
-    This enhancement:
-    1. Labels trades that hit TP as WINNERS (positive R-value)
-    2. Labels trades that hit SL as LOSERS (negative R-value)
-    3. Labels trades that TIME OUT as LOSERS (small negative for opportunity cost)
-
-    This forces the model to find MOMENTUM, not drift.
-
-    Args:
-        df: DataFrame with OHLC and ATR
-        sl_mult: Stop loss multiplier of ATR
-        tp_mult: Take profit multiplier of ATR
-        max_bars: Maximum bars before timeout (vertical barrier)
-        atr_col: Column name for ATR
-
-    Returns:
-        Series of R-values (positive = win, negative = loss, near-zero = timeout)
-    """
-    labels = pd.Series(0.0, index=df.index)
-
-    for i in range(len(df) - max_bars):
-        entry_price = df['Close'].iloc[i]
-        atr = df[atr_col].iloc[i]
-
-        if pd.isna(atr) or atr <= 0:
-            continue
-
-        # Define barriers
-        sl_long = entry_price - sl_mult * atr
-        tp_long = entry_price + tp_mult * atr
-        sl_short = entry_price + sl_mult * atr
-        tp_short = entry_price - tp_mult * atr
-
-        # Look forward up to max_bars
-        future_highs = df['High'].iloc[i+1:i+max_bars+1]
-        future_lows = df['Low'].iloc[i+1:i+max_bars+1]
-
-        # Check LONG trade outcome
-        hit_tp_long = (future_highs >= tp_long).any()
-        hit_sl_long = (future_lows <= sl_long).any()
-
-        if hit_tp_long and hit_sl_long:
-            # Both hit - check which came first
-            tp_bar = (future_highs >= tp_long).idxmax() if hit_tp_long else max_bars
-            sl_bar = (future_lows <= sl_long).idxmax() if hit_sl_long else max_bars
-
-            if future_highs.index.get_loc(tp_bar) < future_lows.index.get_loc(sl_bar):
-                labels.iloc[i] = tp_mult  # Winner: TP hit first
-            else:
-                labels.iloc[i] = -sl_mult  # Loser: SL hit first
-        elif hit_tp_long:
-            labels.iloc[i] = tp_mult  # Winner
-        elif hit_sl_long:
-            labels.iloc[i] = -sl_mult  # Loser
-        else:
-            # TIMEOUT (neither barrier hit)
-            # Penalize with small negative (opportunity cost)
-            # This forces model to avoid sideways chop
-            final_price = df['Close'].iloc[min(i + max_bars, len(df) - 1)]
-            unrealized_r = (final_price - entry_price) / atr
-
-            # If unrealized is positive but didn't hit TP, penalize for slow momentum
-            # If unrealized is negative, treat as partial loss
-            labels.iloc[i] = min(unrealized_r * 0.3, -0.2)  # Cap at -0.2R penalty
-
-    return labels
-
-
-# ==============================================================================
-# 8. AI MODEL (FIX #9: True per-ticker walk-forward with embargo)
-# ==============================================================================
-class WalkForwardAI:
-    def __init__(self, use_ensemble=True):
-        self.model = None  # Main/fallback model
-        self.use_ensemble = use_ensemble
-
-        # ENHANCED: Ensemble of specialist models
-        self.trend_model = None  # Specialist for trending markets (ADX > 25)
-        self.mean_reversion_model = None  # Specialist for mean-reversion (Hurst < 0.4)
-        self.volatility_model = None  # Specialist for volatility breakouts (ATR spikes)
-        self.meta_weights = {'trend': 0.33, 'mean_rev': 0.33, 'vol': 0.33}  # Default equal weights
-
-        # Quantile models for prediction intervals (q10/q90)
-        self.model_q10 = None
-        self.model_q90 = None
-
-        # Model stacking: diverse learners + meta-learner
-        self.lgb_model = None       # LightGBM base learner
-        self.ridge_model = None     # Ridge regression base learner
-        self.stack_meta = None      # Meta-learner blending base predictions
-
-        # SHAP feature monitoring
-        self.shap_importances = {}  # {feature: importance} from last training
-        self.shap_history = []      # List of (timestamp, {feature: importance}) for drift detection
-
-        # V7: Feature set synchronized with backtester's EXPECTED_FEATURES
-        self.cols = list(EXPECTED_FEATURES)
-        self.active_features = list(self.cols)  # v15: Track active features after IC check
-
-        # ENHANCED: Optuna State - WEEKLY tuning to prevent overfitting
-        self.best_params = None
-        self.last_tune = datetime.datetime.now() - datetime.timedelta(days=8) # Force tune on start
-        self.tune_lock = threading.Lock()
-
-        # FIX: Save to DRIVE_ROOT/models, not CWD (persists across restarts)
-        self.params_path = os.path.join(APP_CONFIG.model_dir, "best_params.json")
-        self._load_best_params()
-
-    def _load_best_params(self):
-        try:
-            if os.path.exists(self.params_path):
-                with open(self.params_path, 'r') as f:
-                    self.best_params = json.load(f)
-                logging.info(f"🧠 Loaded persisted Best Params: {self.best_params}")
-        except Exception as e:
-            logging.warning(f"Failed to load best_params: {e}")
-
-    def _save_best_params(self):
-        try:
-            with open(self.params_path, 'w') as f:
-                json.dump(self.best_params, f)
-            logging.info("🧠 Saved Best Params to disk")
-        except Exception as e:
-            logging.error(f"Failed to save best_params: {e}")
-
-    def tune(self, X, y):
-        """
-        v15.12: Daily Optuna Tuning
-        Objective: Maximize Expectancy * sqrt(N_Trades) using TimeSeriesSplit (Walk-Forward)
-        """
-        with self.tune_lock:
-            # Only tune if enough data (e.g. > 1000 samples)
-            if len(X) < 1000:
-                logging.info("🧠 Not enough data for Optuna tuning.")
-                return
-
-            logging.info("🧠 Starting Optuna Tuning (20 trials, TimeSeriesSplit)...")
-
-            def objective(trial):
-                # Suggest params
-                params = {
-                    'n_estimators': trial.suggest_int('n_estimators', 50, 300),
-                    'max_depth': trial.suggest_int('max_depth', 3, 6),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1),
-                    'subsample': trial.suggest_float('subsample', 0.6, 0.9),
-                    'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.9),
-                    'gamma': trial.suggest_float('gamma', 0, 0.5),
-                    'verbosity': 0,
-                    'n_jobs': 1
-                }
-
-                # ENHANCED: Valid Walk-Forward CV with Embargo (Regression Mode)
-                tscv = TimeSeriesSplit(n_splits=3)
-                scores = []
-                embargo = 130  # FIX: 1-week embargo (Phase 19) to prevent lookahead
-
-                for train_idx, val_idx in tscv.split(X):
-                    train_end = train_idx[-1]
-                    # Apply embargo: skip samples immediately after train
-                    val_idx_embargoed = val_idx[val_idx > (train_end + embargo)]
-
-                    if len(val_idx_embargoed) < 50:
-                        continue
-
-                    train_X, val_X = X.iloc[train_idx], X.iloc[val_idx_embargoed]
-                    train_y, val_y = y.iloc[train_idx], y.iloc[val_idx_embargoed]
-
-                    # ENHANCED: Use XGBRegressor for R-value prediction
-                    model = XGBRegressor(**params, eval_metric='mae')
-                    model.fit(train_X, train_y)
-
-                    # Predict R-values
-                    preds = model.predict(val_X)
-
-                    # Filter to significant predictions (abs(R) > 0.10, equivalent to trade threshold)
-                    trade_mask = np.abs(preds) > 0.10
-
-                    if trade_mask.sum() < 5:
-                        scores.append(-1.0)  # Penalize inactivity
-                        continue
-
-                    # Calculate actual performance on traded samples
-                    trades_preds = preds[trade_mask]
-                    trades_actuals = val_y.values[trade_mask]
-
-                    # Correlation between predicted and actual R-values
-                    if len(trades_preds) > 5:
-                        corr = np.corrcoef(trades_preds, trades_actuals)[0, 1]
-                        corr = 0.0 if np.isnan(corr) else corr
-                    else:
-                        corr = 0.0
-
-                    # FIX: With signed labels, use correlation * sqrt(N) as score
-                    # High correlation = model predicts direction + magnitude correctly
-                    # sqrt(N) rewards models that trade enough (not too selective)
-                    n = len(trades_preds)
-                    score = corr * (n ** 0.5)
-                    scores.append(score)
-
-                if not scores:
-                    return -1.0
-
-                return float(np.mean(scores))
-
-            study = optuna.create_study(direction='maximize')
-            # ENHANCED: 100 trials with 30min timeout (was 20 trials, 10min)
-            study.optimize(objective, n_trials=100, timeout=1800, show_progress_bar=False)
-
-            self.best_params = study.best_params
-            self._save_best_params()
-            self.last_tune = datetime.datetime.now()
-            logging.info(f"🧠 Best Params (100 trials): {self.best_params}")
-
-    def train(self, tickers, poly, db=None, progress_callback=None, core_tickers=None):
-        """Train model on historical data + real trade outcomes if available"""
-        with MODEL_LOCK:
-            logging.info("🧠 AI Training (15-min bars, BRACKET LABELS, per-ticker split)...")
-            all_train = []
-            all_calib = []
-
-            # Market context: fetch SPY 15-min + VIX daily ONCE for all tickers
-            try:
-                _spy_df = self._fetch_15min_data('SPY', poly)
-                if len(_spy_df) > 20:
-                    _spy_df['SPY_ROC_5'] = _spy_df['Close'].pct_change(5)
-                    _spy_df['SPY_ROC_20'] = _spy_df['Close'].pct_change(20)
-                    spy_ctx = _spy_df[['SPY_ROC_5', 'SPY_ROC_20']].copy()
-                else:
-                    spy_ctx = None
-            except Exception:
-                spy_ctx = None
-
-            try:
-                _vix_hist = yf.Ticker('^VIX').history(period='6mo')
-                if not _vix_hist.empty:
-                    _vix_hist.index = _vix_hist.index.tz_convert('America/New_York') if _vix_hist.index.tzinfo else _vix_hist.index
-                    _vix_by_date = _vix_hist.groupby(_vix_hist.index.date).last()
-                    vix_level_map = _vix_by_date['Close'].to_dict()
-                    vix_roc_map = _vix_by_date['Close'].pct_change(5).to_dict()
-                else:
-                    vix_level_map, vix_roc_map = {}, {}
-            except Exception:
-                vix_level_map, vix_roc_map = {}, {}
-
-            total_tickers = len(tickers)
-
-            def process(t_idx, t):
-                try:
-                    if progress_callback:
-                         progress_callback(f"Training {t} ({t_idx+1}/{total_tickers})")
-
-                    # FIX: Use 15-min bars for training
-                    # CORE tickers get 4 years, dynamic universe gets 2 years
-                    fetch_days = 1460 if (core_tickers and t in core_tickers) else 730
-                    df = self._fetch_15min_data(t, poly, days=fetch_days)
-                    if df.empty or len(df) < 200:
-                        return None, None
-
-                    # V7: Compute all features using unified pipeline
-                    df = _compute_v7_features(df)
-
-                    # FIX: Attach daily ATR for consistent train/live stop geometry
-                    # Uses Polygon daily bars via vectorized join (fast)
-                    df = attach_daily_atr_to_15m(df, t, poly=poly)
-
-                    df = df.dropna()
-
-                    # BRACKET-AWARE LABELING: Simulate whether TP or SL would hit first
-                    # ENHANCED: Use regression mode to predict R-value directly
-                    # FIX: Use ATR_D (daily ATR) for labels to match live trading
-                    df['Target'] = compute_bracket_labels(
-                        df,
-                        sl_mult=1.5,  # Same as SETTINGS SL
-                        tp_mult=3.0,  # Same as SETTINGS TP
-                        max_bars=12,  # FIX: ~3 hours at 15-min bars (matches time-stop)
-                        atr_col='ATR_D' if 'ATR_D' in df.columns else 'ATR',  # Use daily ATR if available
-                        mode='regression'  # ENHANCED: Predict R-values instead of classes
-                    )
-
-                    if len(df) < 100:
-                        return None, None
-
-                    # FIX: True per-ticker percentile split (80/20) + bar embargo
-                    # 5 trading days = ~5*26 = 130 15-min bars
-                    embargo_bars = 130
-                    split_i = int(len(df) * 0.8)
-
-                    # 80% Train, 20% Calibration
-                    train_df = df.iloc[:max(0, split_i - embargo_bars)][self.cols + ['Target']]
-                    calib_df = df.iloc[min(len(df), split_i + embargo_bars):][self.cols + ['Target']]
-
-                    return train_df, calib_df
-                except Exception as e:
-                    logging.debug(f"Train process {t}: {e}")
-                    return None, None
-
-            # Optimized: Use CPU_WORKERS for Training (CPU-bound)
-            if not tickers: return {}
-
-        # Optimized: Use high concurrency for I/O
-        with concurrent.futures.ThreadPoolExecutor(max_workers=IO_WORKERS) as executor:
-            future_to_ticker = {executor.submit(process, i, t): t for i, t in enumerate(tickers)}
-            for future in concurrent.futures.as_completed(future_to_ticker):
-                    train_df, calib_df = future.result()
-                    if train_df is not None and len(train_df) > 0:
-                        all_train.append(train_df)
-                    if calib_df is not None and len(calib_df) > 0:
-                        all_calib.append(calib_df)
-
-            # NEW: Blend real trade outcomes if available (Learning from Mistakes)
-            if db:
-                try:
-                    real_outcomes = db.get_trade_outcomes(days=90)
-                    if len(real_outcomes) >= 50:  # Only start blending after enough data
-                        logging.info(f"🧠 Blending {len(real_outcomes)} real trade outcomes into training")
-                        real_df = pd.DataFrame(real_outcomes)
-
-                        # Ensure columns exist
-                        missing_cols = [c for c in self.cols if c not in real_df.columns]
-                        if not missing_cols:
-                            real_df['Target'] = real_df['pnl_r']  # Use R-multiple directly (regression target)
-
-                            # Weight recent trades higher (exponential decay)
-                            # Recent trades get ~2x-3x weight compared to old ones
-                            # This isn't directly supported by standard XGB fit unless we pass sample_weight
-                            # For simplicity validation, we'll just duplicate recent mistake rows
-                            # better: just append them.
-
-                            real_train = real_df[self.cols + ['Target']]
-                            # Append to CALIBRATION set (all_calib) to ground the model in reality
-                            all_calib.append(real_train)
-                except Exception as e:
-                    logging.warning(f"Failed to blend real outcomes: {e}")
-
-            if not all_train:
-                logging.error("No training data")
-                return
-
-            train = pd.concat(all_train)
-
-            # Save training feature statistics for live distribution validation
-            try:
-                from hedge_fund.features import save_feature_stats
-                save_feature_stats(train[valid_cols] if valid_cols else train[self.cols])
-                logging.info("Saved training feature statistics for distribution validation")
-            except Exception as e:
-                logging.warning(f"Failed to save feature stats: {e}")
-
-            # FIX: Use all_calib for the calibration set (previously undefined all_test)
-            test = pd.concat(all_calib) if all_calib else train.sample(frac=0.2)
-
-            # v15: FEATURE SELECTION (IC Tracking + Stability Check)
-            # Pass if: |aggregate_ic| > 0.02 AND stability > 0.3
-            # Stability = 1 - std(IC_k) / mean(|IC_k|) across quarterly windows
-            valid_cols = []
-            ic_only_cols = []  # fallback: IC-only (no stability requirement)
-
-            # Split training data into 4 quarterly windows for stability check
-            n_rows = len(train)
-            window_size = n_rows // 4
-            use_stability = window_size >= 50  # need enough rows per window
-
-            for col in self.cols:
-                try:
-                    agg_ic = train[col].corr(train['Target'], method='spearman')
-                    if np.isnan(agg_ic):
-                        continue
-
-                    passes_ic = abs(agg_ic) > 0.02
-                    if passes_ic:
-                        ic_only_cols.append(col)
-
-                    if passes_ic and use_stability:
-                        # Compute IC in each quarterly window
-                        window_ics = []
-                        for k in range(4):
-                            start = k * window_size
-                            end = start + window_size if k < 3 else n_rows
-                            window = train.iloc[start:end]
-                            w_ic = window[col].corr(window['Target'], method='spearman')
-                            if not np.isnan(w_ic):
-                                window_ics.append(w_ic)
-
-                        if len(window_ics) >= 3:
-                            ic_std = np.std(window_ics)
-                            ic_mean_abs = np.mean(np.abs(window_ics))
-                            stability = 1.0 - (ic_std / ic_mean_abs) if ic_mean_abs > 1e-9 else 0.0
-                            if stability > 0.3:
-                                valid_cols.append(col)
-                                logging.debug(f"✅ {col}: IC={agg_ic:.3f}, stability={stability:.2f}")
-                            else:
-                                logging.debug(f"🗑️ Dropping {col} (IC={agg_ic:.3f}, stability={stability:.2f} < 0.3)")
-                        else:
-                            # Not enough valid windows, accept on IC alone
-                            valid_cols.append(col)
-                    elif passes_ic and not use_stability:
-                        # Too few rows for stability check, accept on IC alone
-                        valid_cols.append(col)
-                    else:
-                        logging.debug(f"🗑️ Dropping {col} (IC={agg_ic:.3f})")
-                except Exception:
-                    pass
-
-            # Fallback chain: stability → IC-only → all defaults
-            if len(valid_cols) < 6 and ic_only_cols:
-                logging.warning(f"⚠️ Stability pruning left {len(valid_cols)} features, falling back to IC-only ({len(ic_only_cols)} features)")
-                valid_cols = ic_only_cols
-            if not valid_cols:
-                logging.warning("⚠️ All features dropped by IC check! Using all defaults.")
-                valid_cols = self.cols
-
-            self.active_features = valid_cols  # v15: Persist for prediction
-            logging.info(f"✨ Active Features: {valid_cols}")
-
-            X_train = train[valid_cols]
-            y_train = train['Target']
-            X_test = test[valid_cols]
-            y_test = test['Target']
-
-            # ENHANCED: Optuna Tuning WEEKLY (not daily) to prevent overfitting
-            # Tune if it's been more than 7 days since last tune
-            if (datetime.datetime.now() - self.last_tune).total_seconds() > 604800:
-                logging.info("🧠 Starting weekly Optuna tuning...")
-                self.tune(X_train, y_train)
-
-            # Use best params if available, otherwise default
-            xgb_params = self.best_params if self.best_params else {
-                'n_estimators': 100, 'max_depth': 4, 'learning_rate': 0.05
-            }
-
-            # ENHANCED: Switch to XGBRegressor with CUSTOM ASYMMETRIC LOSS for high win rate
-            # FIX: Proper GPU config with gpu_hist and gpu_predictor
-            try:
-                # Optimized: Force GPU for Colab Pro+ (A100/H100)
-                # XGBoost 2.0+ uses device="cuda"
-                # CRITICAL: Use custom objective for institutional-grade optimization
-                self.model = XGBRegressor(
-                    **xgb_params,
-                    device="cuda",
-                    n_jobs=CPU_WORKERS,
-                    objective=profit_factor_objective,  # PROFIT FACTOR OPTIMIZATION
-                    verbosity=0
-                )
-            except Exception as e:
-                try:
-                    # Legacy Fallback
-                    self.model = XGBRegressor(
-                        **xgb_params,
-                        tree_method='gpu_hist',
-                        predictor='gpu_predictor',
-                        n_jobs=CPU_WORKERS,
-                        objective=profit_factor_objective,  # PROFIT FACTOR OPTIMIZATION
-                        verbosity=0
-                    )
-                except Exception as e2:
-                    logging.warning(f"⚠️ GPU init failed ({e2}). Falling back to CPU.")
-                    self.model = XGBRegressor(
-                        **xgb_params,
-                        tree_method='hist',
-                        n_jobs=CPU_WORKERS,
-                        objective=profit_factor_objective,  # PROFIT FACTOR OPTIMIZATION
-                        verbosity=0
-                    )
-
-            self.model.fit(X_train, y_train)
-
-            # Feature importance pruning: log and auto-prune weak features
-            try:
-                importances = self.model.feature_importances_
-                feat_imp = sorted(zip(valid_cols, importances), key=lambda x: x[1], reverse=True)
-                logging.info("📊 Feature Importances (top 10):")
-                for fname, fimp in feat_imp[:10]:
-                    logging.info(f"   {fname}: {fimp:.4f}")
-
-                # Auto-prune features with near-zero importance AND low IC
-                pruned = []
-                for fname, fimp in feat_imp:
-                    if fimp < 0.005:  # Near-zero tree importance
-                        try:
-                            ic = abs(train[fname].corr(train['Target'], method='spearman'))
-                        except Exception:
-                            ic = 0
-                        if ic < 0.02:
-                            logging.info(f"   🗑️ Pruning {fname} (imp={fimp:.4f}, IC={ic:.3f})")
-                            continue
-                    pruned.append(fname)
-
-                if len(pruned) >= 6:  # Keep minimum viable feature set
-                    self.active_features = pruned
-                    logging.info(f"✨ Post-prune features ({len(pruned)}): {pruned}")
-                    # Re-fit with pruned features for cleaner model
-                    X_train = train[pruned]
-                    X_test = test[pruned]
-                    self.model.fit(X_train, y_train)
-            except Exception as e:
-                logging.debug(f"Feature pruning failed: {e}")
-
-            # ── MODEL STACKING: LightGBM + Ridge + Meta-learner (OOF) ──
-            # FIX: Use out-of-fold predictions to train meta-learner instead of
-            # fitting directly on the test set (which caused data leakage).
-            try:
-                from sklearn.model_selection import TimeSeriesSplit
-
-                # Base learner 2: LightGBM (different inductive bias from XGB)
-                if HAS_LGB:
-                    self.lgb_model = lgb.LGBMRegressor(
-                        n_estimators=xgb_params.get('n_estimators', 100),
-                        max_depth=xgb_params.get('max_depth', 4),
-                        learning_rate=xgb_params.get('learning_rate', 0.05),
-                        verbosity=-1, n_jobs=CPU_WORKERS
-                    )
-                    self.lgb_model.fit(X_train, y_train)
-                    logging.info(f"   LightGBM trained (R²={self.lgb_model.score(X_test, y_test):.3f})")
-
-                # Base learner 3: Ridge regression (linear, catches what trees miss)
-                self.ridge_model = Ridge(alpha=1.0)
-                self.ridge_model.fit(X_train, y_train)
-                logging.info(f"   Ridge trained (R²={self.ridge_model.score(X_test, y_test):.3f})")
-
-                # Meta-learner: train on out-of-fold (OOF) predictions from training set
-                # This prevents leakage: meta-learner never sees test labels.
-                n_base = 3 if self.lgb_model else 2
-                n_splits = 3
-                X_train_arr = np.array(X_train)
-                y_train_arr = np.array(y_train)
-
-                if len(X_train_arr) >= n_splits * 50:
-                    tscv = TimeSeriesSplit(n_splits=n_splits)
-                    oof_preds = np.zeros((len(X_train_arr), n_base))
-
-                    for fold_idx, (tr_idx, val_idx) in enumerate(tscv.split(X_train_arr)):
-                        # XGBoost OOF
-                        fold_xgb = XGBRegressor(**xgb_params, tree_method='hist', verbosity=0)
-                        fold_xgb.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
-                        oof_preds[val_idx, 0] = fold_xgb.predict(X_train_arr[val_idx])
-
-                        # Ridge OOF
-                        fold_ridge = Ridge(alpha=1.0)
-                        fold_ridge.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
-                        oof_preds[val_idx, 1] = fold_ridge.predict(X_train_arr[val_idx])
-
-                        # LightGBM OOF (if available)
-                        if self.lgb_model and HAS_LGB:
-                            fold_lgb = lgb.LGBMRegressor(
-                                n_estimators=xgb_params.get('n_estimators', 100),
-                                max_depth=xgb_params.get('max_depth', 4),
-                                learning_rate=xgb_params.get('learning_rate', 0.05),
-                                verbosity=-1, n_jobs=CPU_WORKERS
-                            )
-                            fold_lgb.fit(X_train_arr[tr_idx], y_train_arr[tr_idx])
-                            oof_preds[val_idx, 2] = fold_lgb.predict(X_train_arr[val_idx])
-
-                    # Train meta-learner on OOF predictions (exclude first fold with no OOF)
-                    first_val_start = list(tscv.split(X_train_arr))[0][1][0]
-                    meta_X = oof_preds[first_val_start:]
-                    meta_y = y_train_arr[first_val_start:]
-                    mask = np.any(meta_X != 0, axis=1)
-
-                    if mask.sum() > 20:
-                        self.stack_meta = Ridge(alpha=0.5)
-                        self.stack_meta.fit(meta_X[mask], meta_y[mask])
-                        # Evaluate on held-out test set for honest metric
-                        test_base_preds = np.column_stack([
-                            self.model.predict(X_test),
-                            self.ridge_model.predict(X_test),
-                        ] + ([self.lgb_model.predict(X_test)] if self.lgb_model else []))
-                        meta_r2 = self.stack_meta.score(test_base_preds, y_test)
-                        logging.info(f"Stacking meta-learner trained via OOF (test meta R²={meta_r2:.3f})")
-                    else:
-                        logging.warning("Not enough OOF samples for meta-learner, using XGB-only")
-                        self.stack_meta = None
-                else:
-                    # Not enough data for OOF cross-validation, skip stacking
-                    logging.info("Insufficient training data for OOF stacking, using XGB-only")
-                    self.stack_meta = None
-
-            except Exception as e:
-                logging.warning(f"Model stacking failed (XGB-only fallback): {e}")
-                self.lgb_model = None
-                self.ridge_model = None
-                self.stack_meta = None
-
-            # Train quantile models for prediction intervals (q10, q90)
-            try:
-                q10_params = dict(xgb_params)
-                # FIX: Use 'reg:quantileerror' for compatibility with installed XGBoost version
-                q10_params['objective'] = 'reg:quantileerror'
-                q10_params['quantile_alpha'] = 0.10
-                q10_params.pop('eval_metric', None)
-                self.model_q10 = XGBRegressor(**q10_params, device="cuda", verbosity=0)
-                self.model_q10.fit(X_train, y_train)
-
-                q90_params = dict(xgb_params)
-                q90_params['objective'] = 'reg:quantileerror'
-                q90_params['quantile_alpha'] = 0.90
-                q90_params.pop('eval_metric', None)
-                self.model_q90 = XGBRegressor(**q90_params, device="cuda", verbosity=0)
-                self.model_q90.fit(X_train, y_train)
-
-                logging.info("✅ Quantile models (q10, q90) trained on GPU")
-            except Exception as e:
-                logging.warning(f"Quantile model GPU training failed: {e}. Falling back to CPU with reg:quantileerror.")
-                # CPU Fallback code...
-                q10_params = dict(xgb_params)
-                q10_params['objective'] = 'reg:quantileerror'
-                q10_params['quantile_alpha'] = 0.10
-                q10_params.pop('eval_metric', None)
-                self.model_q10 = XGBRegressor(**q10_params, tree_method='hist', verbosity=0)
-                self.model_q10.fit(X_train, y_train)
-
-                q90_params = dict(xgb_params)
-                q90_params['objective'] = 'reg:quantileerror'
-                q90_params['quantile_alpha'] = 0.90
-                q90_params.pop('eval_metric', None)
-                self.model_q90 = XGBRegressor(**q90_params, tree_method='hist', verbosity=0)
-                self.model_q90.fit(X_train, y_train)
-
-            # ENHANCED: Train Ensemble Specialist Models
-            if self.use_ensemble and len(train) > 500:
-                logging.info("🎯 Training Ensemble Specialists...")
-                try:
-                    # 1. Trend Follower (ADX > 25)
-                    trend_mask_train = train['ADX'] > 25
-                    trend_mask_test = test['ADX'] > 25
-                    if trend_mask_train.sum() > 100:
-                        logging.info(f"   Trend Specialist: {trend_mask_train.sum()} samples")
-                        self.trend_model = XGBRegressor(**xgb_params, tree_method='hist', eval_metric='mae', verbosity=0)
-                        self.trend_model.fit(train.loc[trend_mask_train, valid_cols], train.loc[trend_mask_train, 'Target'])
-
-                    # 2. Mean Reversion (Hurst < 0.4)
-                    mr_mask_train = train['Hurst'] < 0.4
-                    mr_mask_test = test['Hurst'] < 0.4
-                    if mr_mask_train.sum() > 100:
-                        logging.info(f"   Mean-Rev Specialist: {mr_mask_train.sum()} samples")
-                        self.mean_reversion_model = XGBRegressor(**xgb_params, tree_method='hist', eval_metric='mae', verbosity=0)
-                        self.mean_reversion_model.fit(train.loc[mr_mask_train, valid_cols], train.loc[mr_mask_train, 'Target'])
-
-                    # 3. Volatility Breakout (ATR_Pct in top 30%)
-                    vol_threshold = train['ATR_Pct'].quantile(0.70)
-                    vol_mask_train = train['ATR_Pct'] > vol_threshold
-                    vol_mask_test = test['ATR_Pct'] > vol_threshold
-                    if vol_mask_train.sum() > 100:
-                        logging.info(f"   Volatility Specialist: {vol_mask_train.sum()} samples")
-                        self.volatility_model = XGBRegressor(**xgb_params, tree_method='hist', eval_metric='mae', verbosity=0)
-                        self.volatility_model.fit(train.loc[vol_mask_train, valid_cols], train.loc[vol_mask_train, 'Target'])
-
-                    # 4. Calculate meta-weights based on test performance
-                    scores = {}
-                    if self.trend_model and trend_mask_test.sum() > 20:
-                        scores['trend'] = self.trend_model.score(test.loc[trend_mask_test, valid_cols], test.loc[trend_mask_test, 'Target'])
-                    if self.mean_reversion_model and mr_mask_test.sum() > 20:
-                        scores['mean_rev'] = self.mean_reversion_model.score(test.loc[mr_mask_test, valid_cols], test.loc[mr_mask_test, 'Target'])
-                    if self.volatility_model and vol_mask_test.sum() > 20:
-                        scores['vol'] = self.volatility_model.score(test.loc[vol_mask_test, valid_cols], test.loc[vol_mask_test, 'Target'])
-
-                    # Normalize scores to weights
-                    if scores:
-                        total = sum(max(0, s) for s in scores.values())
-                        if total > 0:
-                            self.meta_weights = {k: max(0, v) / total for k, v in scores.items()}
-                        logging.info(f"   Meta-weights: {self.meta_weights}")
-
-                except Exception as e:
-                    logging.warning(f"Ensemble training failed: {e}")
-
-            # ENHANCED: For regression, calibration is replaced by R² scoring
-            # No calibrators needed - model predicts R-values directly
-
-            train_r2 = self.model.score(X_train, y_train)  # R² score for regression
-            test_r2 = self.model.score(X_test, y_test)
-
-            logging.info(f"✅ AI: {len(train)} train, {len(test)} test")
-            logging.info(f"   Train R²: {train_r2:.3f} | Test R²: {test_r2:.3f}")
-
-            # ENHANCED: Overfitting detection for regression (R² gap)
-            if train_r2 - test_r2 > 0.15:  # R² gap indicates overfitting
-                logging.warning("⚠️ Overfitting detected! Applying 10% confidence dampener.")
-                self.confidence_dampener = 0.90  # Reduce predictions by 10%
-            else:
-                self.confidence_dampener = 1.0
-
-            self.last_train = datetime.datetime.now()
-
-            # ── SHAP Feature Importance Monitoring ──
-            try:
-                if HAS_SHAP and len(X_test) > 50:
-                    sample = X_test.sample(min(200, len(X_test)), random_state=42)
-                    explainer = shap.TreeExplainer(self.model)
-                    shap_values = explainer.shap_values(sample)
-                    mean_abs_shap = np.abs(shap_values).mean(axis=0)
-                    self.shap_importances = dict(zip(self.active_features, mean_abs_shap))
-
-                    # Log top features by SHAP
-                    sorted_shap = sorted(self.shap_importances.items(), key=lambda x: x[1], reverse=True)
-                    logging.info("📊 SHAP Feature Importance (top 10):")
-                    for fname, simp in sorted_shap[:10]:
-                        logging.info(f"   {fname}: {simp:.4f}")
-
-                    # Drift detection: compare to previous SHAP snapshot
-                    self.shap_history.append((datetime.datetime.now(), dict(self.shap_importances)))
-                    if len(self.shap_history) >= 2:
-                        prev = self.shap_history[-2][1]
-                        curr = self.shap_importances
-                        common = set(prev.keys()) & set(curr.keys())
-                        if common:
-                            prev_vec = np.array([prev[k] for k in common])
-                            curr_vec = np.array([curr[k] for k in common])
-                            # Normalize
-                            if prev_vec.sum() > 0:
-                                prev_vec = prev_vec / prev_vec.sum()
-                            if curr_vec.sum() > 0:
-                                curr_vec = curr_vec / curr_vec.sum()
-                            drift = float(np.sqrt(np.mean((prev_vec - curr_vec) ** 2)))
-                            if drift > 0.15:
-                                logging.warning(f"⚠️ SHAP DRIFT detected (RMSE={drift:.3f}). "
-                                                "Feature importance shifted significantly since last training.")
-                            else:
-                                logging.info(f"   SHAP drift: {drift:.3f} (stable)")
-                    # Keep only last 10 snapshots
-                    if len(self.shap_history) > 10:
-                        self.shap_history = self.shap_history[-10:]
-            except Exception as e_shap:
-                logging.debug(f"SHAP monitoring skipped: {e_shap}")
-
-    def _fetch_15min_data(self, ticker, poly, days=1460):
-        """
-        Fetch 15-min bars directly from Polygon (no resampling).
-        CORE tickers: 4 years (1460 days). Dynamic universe: 2 years (730 days).
-        """
-        try:
-            df_15m = poly.fetch_data(ticker, days=days, mult=15)
-            return df_15m if df_15m is not None else pd.DataFrame()
-        except Exception as e:
-            logging.warning(f"_fetch_15min_data({ticker}) failed: {e}")
-            return pd.DataFrame()
-
-    def predict(self, row, return_uncertainty=False):
-        """
-        ENHANCED: Predict expected R-value using ensemble of specialist models.
-        Returns a single float representing expected R-multiple (or tuple if return_uncertainty=True).
-        Positive = profitable, negative = unprofitable
-        """
-        with MODEL_LOCK:
-            if not self.model:
-                logging.warning("⚠️ Model not fitted yet - returning neutral R-value")
-                return (0.0, 1.0) if return_uncertainty else 0.0
-            try:
-                # 1. Structure Features
-                features = pd.DataFrame([row])[self.active_features]
-
-                # 2. Ensemble Prediction (if enabled and specialists available)
-                if self.use_ensemble:
-                    predictions = []
-                    weights = []
-
-                    # Check regime and get specialist predictions
-                    adx = row.get('ADX', 0)
-                    hurst = row.get('Hurst', 0.5)
-                    atr_pct = row.get('ATR_Pct', 0)
-
-                    # Trend Specialist (ADX > 25)
-                    if self.trend_model and adx > 25:
-                        pred = float(self.trend_model.predict(features)[0])
-                        predictions.append(pred)
-                        weights.append(self.meta_weights.get('trend', 0.33))
-
-                    # Mean Reversion Specialist (Hurst < 0.4)
-                    if self.mean_reversion_model and hurst < 0.4:
-                        pred = float(self.mean_reversion_model.predict(features)[0])
-                        predictions.append(pred)
-                        weights.append(self.meta_weights.get('mean_rev', 0.33))
-
-                    # Volatility Specialist (High ATR)
-                    if self.volatility_model and atr_pct > 0.02:  # Top 30% threshold
-                        pred = float(self.volatility_model.predict(features)[0])
-                        predictions.append(pred)
-                        weights.append(self.meta_weights.get('vol', 0.33))
-
-                    # Blend predictions if any specialists apply
-                    if predictions:
-                        total_weight = sum(weights)
-                        predicted_r = sum(p * w for p, w in zip(predictions, weights)) / total_weight
-
-                        # ENHANCED: Uncertainty from ensemble disagreement
-                        if len(predictions) > 1:
-                            uncertainty = np.std(predictions)  # High std = high uncertainty
-                        else:
-                            uncertainty = 0.5  # Single specialist = moderate uncertainty
-                    else:
-                        # Fallback: use stacked prediction if available
-                        xgb_pred = float(self.model.predict(features)[0])
-                        if self.stack_meta and self.lgb_model and self.ridge_model:
-                            lgb_pred = float(self.lgb_model.predict(features)[0])
-                            ridge_pred = float(self.ridge_model.predict(features)[0])
-                            meta_X = np.array([[xgb_pred, lgb_pred, ridge_pred]])
-                            predicted_r = float(self.stack_meta.predict(meta_X)[0])
-                            uncertainty = float(np.std([xgb_pred, lgb_pred, ridge_pred]))
-                        else:
-                            predicted_r = xgb_pred
-                            uncertainty = 0.75
-                else:
-                    # Stacked model prediction (XGB + LGB + Ridge → meta)
-                    xgb_pred = float(self.model.predict(features)[0])
-                    if self.stack_meta and self.lgb_model and self.ridge_model:
-                        lgb_pred = float(self.lgb_model.predict(features)[0])
-                        ridge_pred = float(self.ridge_model.predict(features)[0])
-                        meta_X = np.array([[xgb_pred, lgb_pred, ridge_pred]])
-                        predicted_r = float(self.stack_meta.predict(meta_X)[0])
-                        uncertainty = float(np.std([xgb_pred, lgb_pred, ridge_pred]))
-                    else:
-                        predicted_r = xgb_pred
-                        uncertainty = 0.5
-
-                # 3. Apply dampener (reduce predictions if overfitting detected)
-                damp = getattr(self, "confidence_dampener", 1.0)
-                if damp < 1.0:
-                    predicted_r = predicted_r * damp
-
-                if return_uncertainty:
-                    return predicted_r, uncertainty
-                else:
-                    return predicted_r
-
-            except Exception as e:
-                logging.error(f"Predict failed: {e}")
-                return (0.0, 1.0) if return_uncertainty else 0.0
-
-    def predict_with_intervals(self, row):
-        """
-        Predict R-value with quantile-based prediction intervals.
-        Returns: (predicted_r, p_win, p_hold, p_loss, uncertainty)
-        """
-        predicted_r, unc = self.predict(row, return_uncertainty=True)
-
-        # Default: fallback linear mapping
-        raw_conf = min(0.90, max(0.30, 0.50 + abs(predicted_r) * 0.15))
-        p_win = raw_conf if predicted_r > 0 else (1.0 - raw_conf)
-        p_loss = (1.0 - raw_conf) if predicted_r > 0 else raw_conf
-        p_hold = 0.05
-        uncertainty = unc
-
-        # Override with quantile models if available
-        if self.model_q10 and self.model_q90:
-            try:
-                with MODEL_LOCK:
-                    features = pd.DataFrame([row])[self.active_features]
-                    q10 = float(self.model_q10.predict(features)[0])
-                    q90 = float(self.model_q90.predict(features)[0])
-
-                interval_width = q90 - q10
-                uncertainty = max(0.01, interval_width)
-
-                if interval_width > 1e-6 and q90 > q10:
-                    frac_above = np.clip((q90 - 0.0) / interval_width, 0, 1)
-                    frac_below = 1.0 - frac_above
-
-                    if predicted_r > 0:
-                        p_win = np.clip(frac_above, 0.30, 0.90)
-                        p_loss = np.clip(frac_below, 0.05, 0.60)
-                    else:
-                        p_win = np.clip(frac_below, 0.30, 0.90)
-                        p_loss = np.clip(frac_above, 0.05, 0.60)
-
-                    p_hold = max(0.05, 1.0 - p_win - p_loss)
-
-                    # Renormalize
-                    total = p_win + p_hold + p_loss
-                    p_win /= total
-                    p_hold /= total
-                    p_loss /= total
-
-            except Exception as e:
-                logging.debug(f"Quantile prediction failed, using fallback: {e}")
-
-        return predicted_r, float(p_win), float(p_hold), float(p_loss), float(uncertainty)
-
-# ==============================================================================
-# WALK-FORWARD BACKTEST ENGINE
-# ==============================================================================
-class BracketBacktest:
-    """
-    Vectorized walk-forward backtest with realistic bracket-order simulation.
-    Replays the model's predictions on historical data with slippage + costs.
-    """
-    def __init__(self, ai, poly, sl_mult=1.5, tp_mult=3.0, max_bars=12,
-                 cost_bps=5.0, risk_per_trade=0.01):
-        self.ai = ai
-        self.poly = poly
-        self.sl_mult = sl_mult
-        self.tp_mult = tp_mult
-        self.max_bars = max_bars
-        self.cost_bps = cost_bps  # Round-trip cost in basis points
-        self.risk_per_trade = risk_per_trade
-
-    def run(self, tickers, test_days=120, initial_equity=100000.0):
-        """
-        Run vectorized backtest on last `test_days` of data.
-        Returns dict with equity_curve, trades, metrics.
-        """
-        logging.info(f"📊 Running backtest: {len(tickers)} tickers, {test_days} days...")
-        equity = initial_equity
-        equity_curve = [equity]
-        all_trades = []
-        daily_returns = []
-        prev_equity = equity
-
-        for t in tickers:
-            try:
-                df = self.poly.fetch_data(t, days=test_days + 60, mult=15)
-                if df is None or len(df) < 200:
-                    continue
-
-                # V7: Compute all features using unified pipeline
-                df = _compute_v7_features(df)
-
-                # Fill placeholders for features not available in backtest
-                for col in self.ai.active_features:
-                    if col not in df.columns:
-                        df[col] = 0.0
-
-                df = df.dropna(subset=self.ai.active_features)
-                if len(df) < 100:
-                    continue
-
-                # Walk-forward: only test on last test_days portion
-                cutoff = df.index[-1] - pd.Timedelta(days=test_days)
-                test_mask = df.index >= cutoff
-                test_indices = df.index[test_mask]
-
-                close = df['Close'].values
-                high = df['High'].values
-                low = df['Low'].values
-                atr = df['ATR'].values
-
-                i = 0
-                while i < len(test_indices):
-                    idx = df.index.get_loc(test_indices[i])
-                    if idx + self.max_bars >= len(df):
-                        break
-
-                    row = df.iloc[idx].to_dict()
-                    predicted_r, uncertainty = self.ai.predict(row, return_uncertainty=True)
-
-                    # ==============================================================================
-                    # INSTITUTIONAL FILTERS (MATCH LIVE TRADING LOGIC)
-                    # ==============================================================================
-
-                    # 1. Base prediction threshold
-                    if abs(predicted_r) < 0.10:
-                        i += 1
-                        continue
-
-                    # 2. Uncertainty filter
-                    if uncertainty > 1.5:
-                        i += 1
-                        continue
-
-                    # 3. VPIN filter (toxic order flow)
-                    if row.get('VPIN', 0.0) > 0.85:
-                        i += 1
-                        continue
-
-                    # 4. Amihud filter (illiquidity)
-                    if row.get('Amihud_Illiquidity', 0.5) > 0.90:
-                        i += 1
-                        continue
-
-                    # 5. VWAP extreme filter
-                    vwap_z = row.get('VWAP_ZScore', 0.0)
-                    if abs(vwap_z) > 2.5:
-                        # Fade extreme VWAP deviations
-                        predicted_side = 'LONG' if predicted_r > 0 else 'SHORT'
-                        if vwap_z > 2.5 and predicted_side == 'LONG':
-                            i += 1
-                            continue
-                        if vwap_z < -2.5 and predicted_side == 'SHORT':
-                            i += 1
-                            continue
-
-                    # ==============================================================================
-
-                    side = 'LONG' if predicted_r > 0 else 'SHORT'
-                    entry = close[idx]
-                    a = atr[idx]
-                    if not np.isfinite(a) or a <= 0:
-                        i += 1
-                        continue
-
-                    sl_dist = self.sl_mult * a
-                    tp_dist = self.tp_mult * a
-                    sl = entry - sl_dist if side == 'LONG' else entry + sl_dist
-                    tp = entry + tp_dist if side == 'LONG' else entry - tp_dist
-
-                    # Simulate bracket
-                    outcome = _simulate_exit(
-                        high[idx+1:idx+self.max_bars+1],
-                        low[idx+1:idx+self.max_bars+1],
-                        sl, tp, side
-                    )
-
-                    # Calculate PnL
-                    cost = entry * (self.cost_bps / 10000)
-                    if outcome == 'win':
-                        pnl_per_share = tp_dist - cost
-                    elif outcome == 'loss':
-                        pnl_per_share = -(sl_dist + cost)
-                    else:
-                        exit_price = close[min(idx + self.max_bars, len(close) - 1)]
-                        raw = (exit_price - entry) if side == 'LONG' else (entry - exit_price)
-                        pnl_per_share = raw - cost
-
-                    # Size based on risk
-                    qty = max(1, int((equity * self.risk_per_trade) / sl_dist))
-                    trade_pnl = pnl_per_share * qty
-                    equity += trade_pnl
-
-                    all_trades.append({
-                        'ticker': t, 'side': side, 'entry': entry,
-                        'outcome': outcome, 'pnl': trade_pnl,
-                        'r_multiple': pnl_per_share / sl_dist if sl_dist > 0 else 0,
-                        'date': test_indices[i]
-                    })
-                    equity_curve.append(equity)
-
-                    # Skip forward by max_bars to avoid overlapping trades
-                    i += self.max_bars
-                    continue
-
-                # Daily return tracking
-                if equity != prev_equity:
-                    daily_returns.append((equity - prev_equity) / prev_equity)
-                    prev_equity = equity
-
-            except Exception as e:
-                logging.debug(f"Backtest {t}: {e}")
-                continue
-
-        # Compute metrics
-        metrics = self._compute_metrics(all_trades, equity_curve, initial_equity)
-        logging.info(f"📊 Backtest complete: {len(all_trades)} trades")
-        logging.info(f"   Final equity: ${equity:,.0f} ({(equity/initial_equity - 1)*100:+.1f}%)")
-        logging.info(f"   Win rate: {metrics['win_rate']:.1%} | Profit Factor: {metrics['profit_factor']:.2f}")
-        logging.info(f"   Sharpe: {metrics['sharpe']:.2f} | Max DD: {metrics['max_drawdown']:.1%}")
-        logging.info(f"   Avg R: {metrics['avg_r']:.2f} | Expectancy: {metrics['expectancy']:.3f}")
-        return {'equity_curve': equity_curve, 'trades': all_trades, 'metrics': metrics}
-
-    @staticmethod
-    def _compute_metrics(trades, equity_curve, initial_equity):
-        if not trades:
-            return {'win_rate': 0, 'profit_factor': 0, 'sharpe': 0,
-                    'max_drawdown': 0, 'avg_r': 0, 'expectancy': 0, 'n_trades': 0}
-
-        wins = [t for t in trades if t['pnl'] > 0]
-        losses = [t for t in trades if t['pnl'] <= 0]
-        gross_profit = sum(t['pnl'] for t in wins) if wins else 0
-        gross_loss = abs(sum(t['pnl'] for t in losses)) if losses else 1
-
-        # Max drawdown from equity curve
-        peak = initial_equity
-        max_dd = 0
-        for eq in equity_curve:
-            if eq > peak:
-                peak = eq
-            dd = (peak - eq) / peak
-            if dd > max_dd:
-                max_dd = dd
-
-        r_values = [t['r_multiple'] for t in trades]
-        pnls = [t['pnl'] for t in trades]
-
-        # Daily Sharpe approximation
-        if len(pnls) > 1:
-            sharpe = (np.mean(pnls) / np.std(pnls)) * np.sqrt(252) if np.std(pnls) > 0 else 0
-        else:
-            sharpe = 0
-
-        return {
-            'n_trades': len(trades),
-            'win_rate': len(wins) / len(trades) if trades else 0,
-            'profit_factor': gross_profit / gross_loss if gross_loss > 0 else float('inf'),
-            'sharpe': float(sharpe),
-            'max_drawdown': float(max_dd),
-            'avg_r': float(np.mean(r_values)) if r_values else 0,
-            'expectancy': float(np.mean(pnls)) if pnls else 0,
-        }
-
-
-# ==============================================================================
-# PERFORMANCE MONITORING & ADAPTIVE RETRAINING
-# ==============================================================================
-class PerformanceMonitor:
-    """
-    Monitors live trading performance and detects model drift.
-    Triggers retraining when performance degrades significantly.
-    """
-    def __init__(self, baseline_winrate=0.50):
-        self.recent_trades = deque(maxlen=30)  # Last 30 trades
-        self.baseline_winrate = baseline_winrate
-        self.last_check = datetime.datetime.now()
-
-    def add_trade_result(self, won):
-        """Add a trade outcome (True = win, False = loss)"""
-        self.recent_trades.append(1 if won else 0)
-
-    def should_retrain(self):
-        """Check if model drift is detected"""
-        if len(self.recent_trades) < 20:
-            return False
-
-        # Only check every hour
-        if (datetime.datetime.now() - self.last_check).total_seconds() < 3600:
-            return False
-
-        self.last_check = datetime.datetime.now()
-
-        recent_wr = sum(self.recent_trades) / len(self.recent_trades)
-
-        # Statistical significance test (binomial) - SciPy compat
-        try:
-            try:
-                from scipy.stats import binomtest as _binomtest
-                p_value = _binomtest(sum(self.recent_trades), len(self.recent_trades), self.baseline_winrate).pvalue
-            except ImportError:
-                from scipy.stats import binom_test as _binom_test
-                p_value = _binom_test(sum(self.recent_trades), len(self.recent_trades), self.baseline_winrate)
-
-            # If statistically significant AND worse than expected
-            if p_value < 0.05 and recent_wr < self.baseline_winrate - 0.10:
-                logging.warning(f"⚠️ MODEL DRIFT DETECTED! WR={recent_wr:.1%} (expected {self.baseline_winrate:.1%}, p={p_value:.3f})")
-                return True
-        except Exception:
-            # Fallback: simple threshold check
-            if recent_wr < self.baseline_winrate - 0.15:
-                logging.warning(f"⚠️ Performance degraded! WR={recent_wr:.1%} (expected {self.baseline_winrate:.1%})")
-                return True
-
-        return False
-
-    def update_baseline(self, new_baseline):
-        """Update baseline after retraining"""
-        self.baseline_winrate = new_baseline
-        logging.info(f"📊 Baseline WR updated to {new_baseline:.1%}")
-
-# ==============================================================================
-# 10. DASHBOARD & UI
+# 9. DASHBOARD (V12.7 — simplified for daily hybrid)
 # ==============================================================================
 class Dashboard:
     def __init__(self):
@@ -3541,29 +642,13 @@ class Dashboard:
             from rich.console import Console
             from rich.table import Table
             from rich.panel import Panel
-            from rich.layout import Layout
             from rich import box
-            from rich.live import Live
             self.console = Console()
             self.rich_available = True
         except ImportError:
             pass
 
     def render(self, state):
-        """
-        Render the full dashboard state.
-        state = {
-            'equity': float,
-            'vix': float,
-            'regime': str,
-            'universe_size': int,
-            'positions': list of dicts,
-            'candidates': list of dicts,
-            'hedged': bool,
-            'orders': int,
-            'pnl_day': float
-        }
-        """
         if self.rich_available:
             self._render_rich(state)
         else:
@@ -3575,67 +660,50 @@ class Dashboard:
         from rich.columns import Columns
         from rich.text import Text
 
-        # Header Metrics
         equity_color = "green" if state.get('pnl_day', 0) >= 0 else "red"
-        regime_icon = "🐮" if state['regime'] == "BULL" else "🐻" if state['regime'] == "BEAR" else "🦀"
+        n_pos = len(state.get('positions', []))
 
         metrics = [
             f"[bold cyan]Equity:[/bold cyan] [bold {equity_color}]${state['equity']:,.2f}[/]",
-            f"[bold yellow]VIX:[/bold yellow] {state['vix']:.2f}",
-            f"[bold magenta]Regime:[/bold magenta] {regime_icon} {state['regime']}",
-            f"[bold blue]Univ:[/bold blue] {state['universe_size']}",
-            f"[bold white]Hedged:[/bold white] {'✅' if state['hedged'] else '❌'}"
+            f"[bold yellow]Day PnL:[/bold yellow] ${state.get('pnl_day', 0):,.2f}",
+            f"[bold blue]Univ:[/bold blue] {state.get('universe_size', 0)}",
+            f"[bold magenta]Positions:[/bold magenta] {n_pos}",
         ]
 
         self.console.clear()
-        self.console.rule("[bold gold1]GOD MODE v14.3[/bold gold1]")
+        self.console.rule("[bold gold1]V12.7 HYBRID BOT[/bold gold1]")
         self.console.print(Panel(Columns([Text.from_markup(m) for m in metrics]), box=box.ROUNDED, expand=True))
 
         # Positions Table
         pos_table = Table(title="[bold green]ACTIVE POSITIONS[/bold green]", box=box.SIMPLE_HEAD, expand=True)
         pos_table.add_column("Sym", style="cyan")
         pos_table.add_column("Side", style="white")
-        pos_table.add_column("Size", justify="right")
         pos_table.add_column("Entry", justify="right")
-        pos_table.add_column("Curr", justify="right")
-        pos_table.add_column("PnL (R)", justify="right")
-        pos_table.add_column("Stop", justify="right")
+        pos_table.add_column("SL", justify="right")
+        pos_table.add_column("Days", justify="right")
+        pos_table.add_column("Partial", style="white")
 
-        for p in state['positions']:
-            pnl_color = "green" if p['pnl_r'] > 0 else "red"
+        for p in state.get('positions', []):
             pos_table.add_row(
-                p['symbol'], p['side'], str(p['qty']),
-                f"{p['entry']:.2f}", f"{p['curr']:.2f}",
-                f"[{pnl_color}]{p['pnl_r']:.2f}R[/]",
-                f"{p['sl']:.2f}"
+                p.get('symbol', ''), p.get('side', ''),
+                f"{p.get('entry', 0):.2f}", f"{p.get('sl', 0):.2f}",
+                str(p.get('days_held', 0)),
+                "Y" if p.get('partial_taken', False) else "N",
             )
+        if not state.get('positions'):
+            pos_table.add_row("-", "-", "-", "-", "-", "-")
 
-        if not state['positions']:
-            pos_table.add_row("-", "-", "-", "-", "-", "-", "-")
+        self.console.print(pos_table)
 
-        # Candidates Table
-        cand_table = Table(title="[bold yellow]TOP OPPORTUNITIES[/bold yellow]", box=box.SIMPLE_HEAD, expand=True)
-        cand_table.add_column("Sym", style="cyan")
-        cand_table.add_column("Score", justify="right")
-        cand_table.add_column("Win%", justify="right")
-        cand_table.add_column("EV", justify="right")
-        cand_table.add_column("Tier", style="magenta")
-        cand_table.add_column("Type", style="white")
-
-        for c in state['candidates'][:5]: # Show top 5
-             cand_table.add_row(
-                 c['symbol'],
-                 f"{c['score']:.2f}",
-                 f"{c['p_win']:.0%}",
-                 f"{c['ev']:.2f}",
-                 f"{c['tier_mult']:.1f}x",
-                 c['type']
-             )
-
-        if not state['candidates']:
-             cand_table.add_row("-", "-", "-", "-", "-", "-")
-
-        self.console.print(Columns([pos_table, cand_table], expand=True))
+        # Watchlist
+        if state.get('watchlist'):
+            wl_table = Table(title="[bold yellow]TOMORROW'S WATCHLIST[/bold yellow]", box=box.SIMPLE_HEAD, expand=True)
+            wl_table.add_column("Sym", style="cyan")
+            wl_table.add_column("Side", style="white")
+            wl_table.add_column("Score", justify="right")
+            for item in state['watchlist']:
+                wl_table.add_row(item['symbol'], item['side'], f"{item['score']:.4f}")
+            self.console.print(wl_table)
 
         if state.get('logs'):
             self.console.rule("[bold dim]Events[/bold dim]")
@@ -3643,841 +711,751 @@ class Dashboard:
                 self.console.print(f"[dim]{log}[/dim]")
 
     def _render_ascii(self, state):
-        print("\n" + "="*60)
-        print(f"GOD MODE v14.3 | ${state['equity']:,.2f} | {state['regime']} | VIX: {state['vix']:.2f}")
+        print("\n" + "=" * 60)
+        print(f"V12.7 HYBRID | ${state['equity']:,.2f} | PnL: ${state.get('pnl_day', 0):,.2f}")
         print("-" * 60)
         print("POSITIONS:")
-        print(f"{'SYM':<6} {'SIDE':<5} {'QTY':<5} {'ENTRY':<8} {'CURR':<8} {'PNL(R)':<6}")
-        for p in state['positions']:
-            print(f"{p['symbol']:<6} {p['side']:<5} {p['qty']:<5} {p['entry']:<8.2f} {p['curr']:<8.2f} {p['pnl_r']:<6.2f}")
-        print("-" * 60)
-        print("TOP CANDIDATES:")
-        print(f"{'SYM':<6} {'SCR':<5} {'WIN%':<5} {'EV':<5} {'TYPE'}")
-        for c in state['candidates'][:5]:
-            print(f"{c['symbol']:<6} {c['score']:<5.2f} {c['p_win']:<5.2f} {c['ev']:<5.2f} {c['type']}")
+        print(f"{'SYM':<6} {'SIDE':<6} {'ENTRY':<8} {'SL':<8} {'DAYS':<5}")
+        for p in state.get('positions', []):
+            print(f"{p.get('symbol',''):<6} {p.get('side',''):<6} "
+                  f"{p.get('entry',0):<8.2f} {p.get('sl',0):<8.2f} {p.get('days_held',0):<5}")
+        if state.get('watchlist'):
+            print("-" * 60)
+            print("WATCHLIST:")
+            for item in state['watchlist']:
+                print(f"  {item['side']:<6} {item['symbol']:<6} score={item['score']:.4f}")
         print("=" * 60)
 
     def render_loading(self, message):
-        """Show a loading/progress message (Scrolling log style)"""
-        # Optimized: Don't clear screen, just print progress line-by-line
-        # This prevents flickering when multiple threads report status
-        if "Training" in message:
-            print(f"🧠 {message}")
-        else:
-            # For major phases, maybe clear or box
-            print(f"⏳ {message}")
+        print(f"  {message}")
+
 
 # ==============================================================================
-# 11. MAIN LOOP
+# 10. DAILY SIGNAL ENGINE (V12.7)
 # ==============================================================================
-def run_god_mode():
+class DailySignalEngine:
+    """
+    Generates daily cross-sectional watchlist using V12.7 ML model.
+
+    Call flow:
+    1. After market close: engine.update_daily_data()
+    2. engine.train_model() — walk-forward on accumulated daily bars
+    3. engine.generate_signals() — returns tomorrow's watchlist
+    """
+
+    def __init__(self, tickers, polygon_helper, settings):
+        self.tickers = tickers
+        self.poly = polygon_helper
+        self.settings = settings
+        self.daily_cache = {}
+        self.model_predictions = {}
+        self.watchlist = {}
+        self.last_train_date = None
+        self.model_trained = False
+
+    def update_daily_data(self):
+        """Download latest daily bars and compute features."""
+        from hedge_fund.daily_features import compute_daily_features
+
+        raw_cache = {}
+        for t in self.tickers:
+            try:
+                raw = self.poly.fetch_daily_data(t, days=self.settings['V12_LOOKBACK_DAYS'])
+                if raw is not None and len(raw) > 200:
+                    # Normalize daily bar timestamps (same fix as backtester_v12.py)
+                    if hasattr(raw.index, 'tz') and raw.index.tz is not None:
+                        raw.index = raw.index.tz_localize(None)
+                    if hasattr(raw.index, 'normalize'):
+                        raw.index = raw.index.normalize()
+                    raw_cache[t] = raw
+                    logging.info(f"Daily data: {t} has {len(raw)} bars")
+            except Exception as e:
+                logging.warning(f"Daily data fetch failed for {t}: {e}")
+
+        for t, raw in raw_cache.items():
+            try:
+                df = compute_daily_features(raw, ticker=t, universe_daily=raw_cache)
+                self.daily_cache[t] = df
+            except Exception as e:
+                logging.warning(f"Feature computation failed for {t}: {e}")
+
+        logging.info(f"Daily data updated: {len(self.daily_cache)}/{len(self.tickers)} tickers")
+
+    def train_model(self):
+        """Walk-forward train the daily model on all available data."""
+        from hedge_fund.daily_model import walk_forward_daily
+        from hedge_fund.daily_features import DAILY_FEATURES
+
+        self.model_predictions = {}
+
+        for t, df in self.daily_cache.items():
+            try:
+                avail = [f for f in DAILY_FEATURES if f in df.columns]
+                if len(avail) < 5:
+                    logging.warning(f"Skipping {t}: only {len(avail)} features available")
+                    continue
+                result = walk_forward_daily(
+                    df, avail,
+                    train_days=self.settings['V12_TRAIN_DAYS'],
+                    test_days=60,
+                    step_days=60,
+                )
+                if result is not None and len(result) > 0:
+                    self.model_predictions[t] = result
+                    logging.info(f"Daily model: {t} has {len(result)} predictions")
+            except Exception as e:
+                logging.warning(f"Model training failed for {t}: {e}")
+
+        self.model_trained = bool(self.model_predictions)
+        self.last_train_date = datetime.date.today()
+        logging.info(f"Model training complete: {len(self.model_predictions)} tickers trained")
+        return self.model_trained
+
+    def generate_signals(self):
+        """Generate watchlist from predictions with T+1 shift."""
+        from hedge_fund.daily_model import generate_watchlist
+
+        if not self.model_trained:
+            return {}
+
+        self.watchlist = generate_watchlist(
+            self.model_predictions,
+            top_n=self.settings['V12_TOP_N'],
+            bottom_n=self.settings['V12_TOP_N'],
+            min_spread=self.settings['V12_MIN_SPREAD'],
+        )
+        logging.info(f"Watchlist generated: {len(self.watchlist)} days of signals")
+        return self.watchlist
+
+    def get_tomorrow_signals(self):
+        """Get signals for the next trading day."""
+        today = datetime.date.today()
+        for d in sorted(self.watchlist.keys()):
+            if d > today:
+                return self.watchlist[d]
+        # Fallback: return today's signals if available
+        return self.watchlist.get(today, {})
+
+    def get_latest_signals(self):
+        """Get the most recent signals (for startup when model already trained)."""
+        if not self.watchlist:
+            return {}
+        latest_date = max(self.watchlist.keys())
+        return self.watchlist[latest_date]
+
+
+# ==============================================================================
+# 11. POSITION MANAGER (V12.7)
+# ==============================================================================
+class PositionManager:
+    """
+    Manages live positions using V12.7 bracket logic.
+
+    Handles:
+    - New entries from daily watchlist via Alpaca bracket orders
+    - Daily SL/TP monitoring
+    - Trailing stop updates after partial profit
+    - Timeout exits
+    - Regime-aware size scaling
+    """
+
+    def __init__(self, alpaca_helper, settings, db=None, mc_governor=None):
+        self.alpaca = alpaca_helper
+        self.settings = settings
+        self.db = db
+        self.mc_governor = mc_governor
+        self.positions = {}
+        self.recent_outcomes = {'LONG': [], 'SHORT': []}
+        self.REGIME_LOOKBACK = 10
+        self.REGIME_MIN_WR = 0.35
+
+    def restore_positions_from_broker(self, polygon_helper):
+        """On startup, rebuild position state from Alpaca's open positions."""
+        try:
+            self.alpaca.sync_positions()
+            broker_positions = self.alpaca.pos_cache or {}
+
+            for symbol, pos_data in broker_positions.items():
+                if symbol in self.positions:
+                    continue
+
+                qty = abs(int(pos_data.get('qty', 0)))
+                if qty == 0:
+                    continue
+
+                side = pos_data.get('side', 'long')
+                direction = 'LONG' if side == 'long' else 'SHORT'
+                entry_price = float(pos_data.get('avg_entry_price', 0))
+
+                # Get daily ATR for this ticker
+                daily_atr = ATR_CACHE.get(symbol)
+                if not daily_atr:
+                    try:
+                        daily_bars = polygon_helper.fetch_daily_data(symbol, days=30)
+                        if daily_bars is not None and len(daily_bars) > 20:
+                            tr = daily_bars[['High', 'Low', 'Close']].copy()
+                            tr['TR'] = pd.concat([
+                                tr['High'] - tr['Low'],
+                                (tr['High'] - tr['Close'].shift()).abs(),
+                                (tr['Low'] - tr['Close'].shift()).abs()
+                            ], axis=1).max(axis=1)
+                            daily_atr = float(tr['TR'].rolling(20).mean().iloc[-1])
+                    except Exception:
+                        daily_atr = entry_price * 0.02  # Fallback: 2% ATR
+
+                if not daily_atr or daily_atr <= 0:
+                    daily_atr = entry_price * 0.02
+
+                sl_dist = self.settings['V12_SL_ATR_MULT'] * daily_atr
+
+                if direction == 'LONG':
+                    sl_price = entry_price - sl_dist
+                    tp_price = entry_price + sl_dist * self.settings['V12_TP_RR']
+                else:
+                    sl_price = entry_price + sl_dist
+                    tp_price = entry_price - sl_dist * self.settings['V12_TP_RR']
+
+                self.positions[symbol] = {
+                    'direction': direction,
+                    'entry_price': entry_price,
+                    'entry_date': datetime.date.today() - datetime.timedelta(days=1),
+                    'sl_price': sl_price,
+                    'tp_price': tp_price,
+                    'sl_dist': sl_dist,
+                    'daily_atr': daily_atr,
+                    'conviction': 0.5,
+                    'partial_taken': False,
+                    'best_price': entry_price,
+                    'size': 1.0,
+                    'qty': qty,
+                }
+                logging.info(f"Restored position: {direction} {symbol} x{qty} @ {entry_price:.2f}")
+
+            logging.info(f"Restored {len(self.positions)} positions from broker")
+        except Exception as e:
+            logging.warning(f"Position restore failed: {e}")
+
+    def enter_positions(self, signals, polygon_helper):
+        """Enter new positions from daily watchlist signals."""
+        sl_mult = self.settings['V12_SL_ATR_MULT']
+        tp_rr = self.settings['V12_TP_RR']
+        risk_pct = self.settings['V12_RISK_PER_TRADE']
+
+        for direction_key in ['longs', 'shorts']:
+            direction = 'LONG' if direction_key == 'longs' else 'SHORT'
+
+            for ticker, conviction in signals.get(direction_key, []):
+                # Skip if already in position
+                if ticker in self.positions:
+                    continue
+                broker_pos = self.alpaca.pos_cache or {}
+                if ticker in broker_pos:
+                    continue
+
+                # Regime gate: reduce size if recent direction is failing
+                regime_size = 1.0
+                recent = self.recent_outcomes.get(direction, [])
+                if len(recent) >= self.REGIME_LOOKBACK:
+                    recent_wr = sum(recent) / len(recent)
+                    if recent_wr < self.REGIME_MIN_WR:
+                        regime_size = 0.5
+
+                # Get daily ATR for bracket sizing
+                daily_atr = ATR_CACHE.get(ticker)
+                current_price = None
+
+                if not daily_atr:
+                    try:
+                        daily_bars = polygon_helper.fetch_daily_data(ticker, days=30)
+                        if daily_bars is not None and len(daily_bars) > 20:
+                            tr = daily_bars[['High', 'Low', 'Close']].copy()
+                            tr['TR'] = pd.concat([
+                                tr['High'] - tr['Low'],
+                                (tr['High'] - tr['Close'].shift()).abs(),
+                                (tr['Low'] - tr['Close'].shift()).abs()
+                            ], axis=1).max(axis=1)
+                            daily_atr = float(tr['TR'].rolling(20).mean().iloc[-1])
+                            current_price = float(daily_bars['Close'].iloc[-1])
+                    except Exception as e:
+                        logging.warning(f"ATR fetch failed for {ticker}: {e}")
+                        continue
+
+                if not daily_atr or daily_atr <= 0 or not np.isfinite(daily_atr):
+                    continue
+
+                # Get current price if not already obtained
+                if current_price is None:
+                    try:
+                        snap = polygon_helper.fetch_snapshot_prices([ticker])
+                        if ticker in snap:
+                            current_price = snap[ticker]['price']
+                    except Exception:
+                        pass
+
+                if current_price is None:
+                    try:
+                        daily_bars = polygon_helper.fetch_daily_data(ticker, days=5)
+                        if daily_bars is not None and len(daily_bars) > 0:
+                            current_price = float(daily_bars['Close'].iloc[-1])
+                    except Exception:
+                        pass
+
+                if current_price is None or current_price <= 0:
+                    logging.warning(f"Cannot get price for {ticker}, skipping")
+                    continue
+
+                # Compute bracket levels using DAILY ATR
+                sl_dist = sl_mult * daily_atr
+                tp_dist = sl_mult * tp_rr * daily_atr
+
+                if direction == 'LONG':
+                    sl_price = current_price - sl_dist
+                    tp_price = current_price + tp_dist
+                else:
+                    sl_price = current_price + sl_dist
+                    tp_price = current_price - tp_dist
+
+                # Position sizing: risk_pct of equity / SL distance
+                equity = self.alpaca.equity
+                risk_dollars = equity * risk_pct * regime_size
+
+                # Monte Carlo governor adjustment
+                if self.mc_governor:
+                    self.mc_governor.apply_adjustments()
+                    risk_dollars *= self.mc_governor.get_risk_scalar()
+
+                qty = int(risk_dollars / sl_dist) if sl_dist > 0 else 0
+                if qty <= 0:
+                    continue
+
+                # Max position size: 20% of equity
+                max_qty = int(equity * 0.20 / current_price)
+                qty = min(qty, max_qty)
+
+                # Submit bracket order via Alpaca
+                side = direction
+                success = self.alpaca.submit_bracket(
+                    ticker, side, qty, current_price,
+                    round(sl_price, 2), round(tp_price, 2),
+                    atr_override=daily_atr,
+                )
+
+                if success:
+                    self.positions[ticker] = {
+                        'direction': direction,
+                        'entry_price': current_price,
+                        'entry_date': datetime.date.today(),
+                        'sl_price': sl_price,
+                        'tp_price': tp_price,
+                        'sl_dist': sl_dist,
+                        'daily_atr': daily_atr,
+                        'conviction': conviction,
+                        'partial_taken': False,
+                        'best_price': current_price,
+                        'size': regime_size,
+                        'qty': qty,
+                    }
+                    logging.info(f"Entered {direction} {ticker} x{qty} @ {current_price:.2f} "
+                                 f"SL={sl_price:.2f} TP={tp_price:.2f}")
+                    send_alert(
+                        f"ENTRY: {direction} {ticker}",
+                        f"Qty: {qty} | Entry: ${current_price:.2f} | SL: ${sl_price:.2f} | TP: ${tp_price:.2f}",
+                        "trade"
+                    )
+
+    def update_positions(self, polygon_helper):
+        """Daily position management: trailing stops, partials, timeouts."""
+        today = datetime.date.today()
+        to_close = []
+
+        # Sync with broker first
+        try:
+            self.alpaca.sync_positions()
+        except Exception as e:
+            logging.warning(f"Position sync failed: {e}")
+
+        broker_positions = self.alpaca.pos_cache or {}
+
+        for ticker, pos in list(self.positions.items()):
+            # If broker closed the position (SL/TP hit), clean up
+            if ticker not in broker_positions:
+                to_close.append((ticker, 'broker_closed'))
+                continue
+
+            # Get current price
+            current_price = None
+            try:
+                snap = polygon_helper.fetch_snapshot_prices([ticker])
+                if ticker in snap:
+                    current_price = snap[ticker]['price']
+            except Exception:
+                pass
+
+            if current_price is None:
+                try:
+                    bp = broker_positions.get(ticker, {})
+                    current_price = float(bp.get('current_price', 0))
+                except Exception:
+                    pass
+
+            if not current_price or current_price <= 0:
+                continue
+
+            # Count days held
+            days_held = (today - pos['entry_date']).days
+            trading_days = max(1, int(days_held * 5 / 7))
+
+            # Update best price for trailing
+            if pos['direction'] == 'LONG':
+                if current_price > pos['best_price']:
+                    pos['best_price'] = current_price
+            else:
+                if current_price < pos['best_price']:
+                    pos['best_price'] = current_price
+
+            # Check partial profit
+            partial_atr = self.settings['V12_PARTIAL_EXIT_ATR']
+            if not pos['partial_taken']:
+                if pos['direction'] == 'LONG':
+                    partial_level = pos['entry_price'] + partial_atr * pos['daily_atr']
+                    if current_price >= partial_level:
+                        pos['partial_taken'] = True
+                        pos['sl_price'] = pos['entry_price']  # Move to breakeven
+                        self._update_stop_at_broker(ticker, pos['sl_price'], pos['direction'])
+                        logging.info(f"Partial taken on {ticker}, SL moved to breakeven")
+                else:
+                    partial_level = pos['entry_price'] - partial_atr * pos['daily_atr']
+                    if current_price <= partial_level:
+                        pos['partial_taken'] = True
+                        pos['sl_price'] = pos['entry_price']
+                        self._update_stop_at_broker(ticker, pos['sl_price'], pos['direction'])
+                        logging.info(f"Partial taken on {ticker}, SL moved to breakeven")
+
+            # Trailing stop (after partial)
+            if pos['partial_taken']:
+                if pos['direction'] == 'LONG':
+                    trail_level = pos['best_price'] - 1.0 * pos['daily_atr']
+                    if trail_level > pos['sl_price']:
+                        pos['sl_price'] = trail_level
+                        self._update_stop_at_broker(ticker, trail_level, 'LONG')
+                        logging.info(f"Trail SL updated for {ticker}: {trail_level:.2f}")
+                else:
+                    trail_level = pos['best_price'] + 1.0 * pos['daily_atr']
+                    if trail_level < pos['sl_price']:
+                        pos['sl_price'] = trail_level
+                        self._update_stop_at_broker(ticker, trail_level, 'SHORT')
+                        logging.info(f"Trail SL updated for {ticker}: {trail_level:.2f}")
+
+            # Timeout exit
+            if trading_days >= self.settings['V12_MAX_HOLD_DAYS']:
+                logging.info(f"Timeout exit for {ticker} after {trading_days} trading days")
+                try:
+                    self.alpaca.close(ticker, reason="V12 timeout")
+                except Exception as e:
+                    logging.warning(f"Timeout close failed for {ticker}: {e}")
+                to_close.append((ticker, 'timeout'))
+
+        # Clean up closed positions and track outcomes
+        for ticker, reason in to_close:
+            pos = self.positions.pop(ticker, None)
+            if pos:
+                # Calculate PnL from broker data
+                try:
+                    bp = broker_positions.get(ticker, {})
+                    exit_price = float(bp.get('current_price', pos['entry_price']))
+                    if pos['direction'] == 'LONG':
+                        pnl_r = (exit_price - pos['entry_price']) / pos['sl_dist']
+                    else:
+                        pnl_r = (pos['entry_price'] - exit_price) / pos['sl_dist']
+
+                    self.recent_outcomes[pos['direction']].append(1 if pnl_r > 0 else 0)
+                    if len(self.recent_outcomes[pos['direction']]) > self.REGIME_LOOKBACK:
+                        self.recent_outcomes[pos['direction']].pop(0)
+
+                    # Log to database
+                    if self.db:
+                        self.db.log_trade_outcome(
+                            ticker, pos['direction'], pos['entry_price'], exit_price,
+                            pnl_r * pos['sl_dist'] * pos['qty'], pnl_r, reason
+                        )
+
+                    # Log to MC governor
+                    if self.mc_governor:
+                        risk_dollars = pos['sl_dist'] * pos['qty']
+                        pnl_dollars = pnl_r * risk_dollars
+                        self.mc_governor.add_trade(pnl_dollars, risk_dollars, pos['direction'])
+
+                    logging.info(f"Closed {pos['direction']} {ticker}: PnL={pnl_r:.2f}R ({reason})")
+                    send_alert(
+                        f"EXIT: {pos['direction']} {ticker}",
+                        f"PnL: {pnl_r:.2f}R | Reason: {reason}",
+                        "trade"
+                    )
+                except Exception as e:
+                    logging.warning(f"PnL calc failed for {ticker}: {e}")
+
+    def _update_stop_at_broker(self, ticker, new_sl, direction):
+        """Update the stop-loss order at Alpaca."""
+        try:
+            orders = self.alpaca.api.list_orders(status='open')
+            for order in orders:
+                if order.symbol != ticker:
+                    continue
+                if order.type != 'stop':
+                    continue
+                # For a LONG position, the stop order is a SELL
+                # For a SHORT position, the stop order is a BUY
+                expected_side = 'sell' if direction == 'LONG' else 'buy'
+                if order.side == expected_side:
+                    self.alpaca.api.replace_order(
+                        order.id,
+                        stop_price=str(round(new_sl, 2)),
+                        qty=str(order.qty),
+                    )
+                    logging.info(f"Updated stop for {ticker} to {new_sl:.2f}")
+                    return True
+        except Exception as e:
+            logging.warning(f"Failed to update stop for {ticker}: {e}")
+        return False
+
+    def get_position_display(self):
+        """Get positions formatted for dashboard display."""
+        today = datetime.date.today()
+        display = []
+        for t, pos in self.positions.items():
+            display.append({
+                'symbol': t,
+                'side': pos['direction'],
+                'entry': pos['entry_price'],
+                'sl': pos['sl_price'],
+                'days_held': (today - pos['entry_date']).days,
+                'partial_taken': pos['partial_taken'],
+            })
+        return display
+
+
+# ==============================================================================
+# 12. MAIN LOOP — V12.7 HYBRID BOT
+# ==============================================================================
+def run_hybrid_bot():
+    """
+    V12.7 Hybrid Bot Main Loop.
+
+    Schedule:
+    - 4:15 PM ET: Download daily bars, compute features, train model
+    - 4:30 PM ET: Generate tomorrow's watchlist
+    - 9:30 AM ET: Enter positions from watchlist
+    - During market: Monitor positions (trailing stops, partials) every 30s
+    - 3:45 PM ET: Check for timeout exits
+    """
     print("=" * 60)
-    print("🔥 GOD MODE v14.2 PRODUCTION")
-    print("   Multi-Signal Scanner + ATR-Bracket Trades")
+    print("V12.7 HYBRID BOT — DAILY ALPHA + INTRADAY EXECUTION")
     print("=" * 60)
 
+    # Initialize infrastructure
     db = Database_Helper()
     poly = Polygon_Helper()
-    bar_stream = PolygonBarStream(KEYS['POLY'])
-    fmp = FMP_Helper()
-    mc_governor = MonteCarloGovernor(SETTINGS) # Monte Carlo Risk Governor
-    perf_monitor = PerformanceMonitor(baseline_winrate=0.50)  # ENHANCED: Adaptive retraining
-    alpaca = Alpaca_Helper(db, mc_governor, perf_monitor)  # Pass perf_monitor
-    vix_helper = VIX_Helper()
-    gex_helper = GEX_Helper()  # DIX/GEX for sizing and entry gating
-    portfolio_risk = PortfolioRisk()  # v15: Instance-based for correlation caching
-    vol_target = VolTarget(target_vol=0.15)  # v15: Volatility Targeting
-    regime_detector = RegimeDetector(vix_helper, vol_target=vol_target, portfolio_risk=portfolio_risk)
-    ai = WalkForwardAI()
-    earnings = EarningsGuard()
-    hedger = HedgeManager(alpaca)
-    fundamentals = FundamentalGuard(fmp) # Phase 15: Fundamental Guard
-    sa_helper = SeekingAlpha_Helper()    # Phase 16: SA Data
-    optimizer = PortfolioOptimizer(target_vol=0.25) # Aggressive Optimization
-    pairs_scanner = PairsScanner(poly, lookback_days=60, rescan_hours=6)
-    gap_model = OvernightGapModel(earnings_guard=earnings)
+    mc_governor = MonteCarloGovernor(SETTINGS)
     daily_risk = DailyRiskManager(max_daily_loss_pct=0.02)
-    cs_ranker = CrossSectionalRanker()
+    earnings = EarningsGuard()
     dashboard = Dashboard()
+    alpaca = Alpaca_Helper(db, mc_governor)
 
-    # V9: Regime and portfolio managers for institutional L/S
-    regime_manager = _RegimeManager()
-    portfolio_manager = _PortfolioManager(
-        max_gross=SETTINGS.get('max_gross', 1.2),
-        max_net=SETTINGS.get('max_net', 0.4),
-        max_single=0.25,
-    )
-    universe_buffer = {t: deque(maxlen=200) for t in CORE}
+    # V12.7 ticker universe
+    TICKERS = [
+        'RKLB', 'ASTS', 'AMD', 'NVDA', 'PLTR', 'COIN',
+        'GS', 'GE', 'COST', 'JPM', 'UNH', 'CAT',
+        'XOM', 'JNJ', 'PG',
+    ]
 
-    # v15.10: Safe Import for ZoneInfo
-    try:
-        from zoneinfo import ZoneInfo
-    except ImportError:
-        ZoneInfo = None  # Fallback logic if missing
+    # Initialize V12.7 engines
+    signal_engine = DailySignalEngine(TICKERS, poly, SETTINGS)
+    position_mgr = PositionManager(alpaca, SETTINGS, db=db, mc_governor=mc_governor)
 
-
-    CORE = ['RKLB', 'ASTS', 'MU', 'PLTR', 'LUNR', 'NVDA', 'NET', 'KTOS',
-            'AVGO', 'RIGL', 'RCAT', 'CRWV', 'HIMS', 'APP', 'VKTX', 'TMDX']
-
-    try:
-        universe = list(set(CORE + fmp.get_dynamic_universe(exclude=set(CORE))))
-    except Exception as e:
-        logging.warning(f"Dynamic universe failed, using CORE only: {e}")
-        universe = list(CORE)
-
-    dashboard.render_loading("Starting AI Training...")
-    ai.train(universe, poly, db=db, progress_callback=lambda msg: dashboard.render_loading(msg), core_tickers=set(CORE))
-
-    # Run backtest after initial training to validate strategy
-    try:
-        dashboard.render_loading("Running walk-forward backtest...")
-        backtester = BracketBacktest(ai, poly, sl_mult=SETTINGS['STOP_MULT'],
-                                     tp_mult=SETTINGS['TP_MULT'], max_bars=12)
-        bt_result = backtester.run(list(CORE)[:10], test_days=90)
-        if bt_result['metrics']['win_rate'] < 0.30:
-            logging.warning("⚠️ Backtest win rate < 30% — model may be undertrained")
-    except Exception as e_bt:
-        logging.warning(f"Backtest skipped: {e_bt}")
-
-    last_refresh = datetime.datetime.now()
+    # State tracking
+    last_model_train = None
+    todays_signals = {}
+    entries_done_today = False
     last_equity_log = datetime.datetime.now()
-    start_equity = alpaca.equity if alpaca.equity > 0 else 100000.0
+    last_position_check = datetime.datetime.now()
 
-    order_mode = "MARKET" if SETTINGS['USE_MARKET_ORDERS'] else "LIMIT"
+    print(f"Universe: {len(TICKERS)} tickers")
+    print(f"Risk per trade: {SETTINGS['V12_RISK_PER_TRADE'] * 100:.1f}%")
+    print(f"SL: {SETTINGS['V12_SL_ATR_MULT']:.1f} ATR | "
+          f"TP: {SETTINGS['V12_SL_ATR_MULT'] * SETTINGS['V12_TP_RR']:.1f} ATR "
+          f"(R:R 1:{SETTINGS['V12_TP_RR']:.1f})")
+    print(f"Hold: {SETTINGS['V12_MAX_HOLD_DAYS']} days | TopN: {SETTINGS['V12_TOP_N']}")
 
-    prices = {}
-    scored_candidates = []
-    scan_cache = ScanBarCache()  # New-bar gating: skip tickers with no new 15-min bar
+    # Restore any existing positions from broker
+    print("\nRestoring positions from broker...")
+    position_mgr.restore_positions_from_broker(poly)
 
-    # Start WebSocket bar stream (hybrid: WS triggers scan, REST fetches data)
-    bar_stream.start()
-    bar_stream.subscribe(universe)
+    # Initial model training
+    print("\nInitial model training (this takes 2-5 minutes)...")
+    signal_engine.update_daily_data()
+    if signal_engine.train_model():
+        signal_engine.generate_signals()
+        todays_signals = signal_engine.get_tomorrow_signals()
+        last_model_train = datetime.date.today()
+        n_days = len(signal_engine.watchlist)
+        print(f"Model trained. Watchlist has {n_days} days of signals.")
+        if todays_signals:
+            longs = todays_signals.get('longs', [])
+            shorts = todays_signals.get('shorts', [])
+            print(f"Next signals: {len(longs)} longs, {len(shorts)} shorts")
+    else:
+        print("WARNING: Model training failed. Will retry after market close.")
 
     while True:
         try:
+            # Check kill switch
             if alpaca.check_kill():
                 time.sleep(60)
                 continue
 
-            # FIX: Refresh equity and sync positions EVERY loop
-            alpaca.refresh_equity()
+            # Get current time in ET
+            now_et = datetime.datetime.now(ET)
+            today = datetime.date.today()
 
-            # Initialize daily risk session on first loop or new trading day
-            if daily_risk.session_start_equity is None:
-                daily_risk.initialize_session(alpaca.equity)
-
-            # Check daily loss limit before any trading
-            if not daily_risk.check_can_trade(alpaca.equity):
-                time.sleep(60)
-                continue
-
-            alpaca.sync_positions()
-
-            # Apply Monte Carlo Risk Adjustments
-            if mc_governor:
-                mc_governor.apply_adjustments()
-
-            # Periodic safety check: verify all positions have stops
-            try:
-                alpaca.verify_all_stops_active()
-            except Exception as e_verify:
-                logging.warning(f"Stop verification failed: {e_verify}")
-
-            # v15: Update holdings data for correlation check
-            portfolio_risk.update_holdings_data(alpaca.pos_cache)
-            # FIX: Update Universe Correlation Matrix (Batch)
-            portfolio_risk.update_universe_cache(universe)
-
-            # ENHANCED: Adaptive retraining based on performance drift
-            # Check for drift first
-            if perf_monitor.should_retrain():
-                logging.warning("🔄 DRIFT DETECTED - Forcing immediate retraining...")
-                universe = list(set(CORE + fmp.get_dynamic_universe(exclude=set(CORE))))
-                ai.train(universe, poly, db=db, core_tickers=set(CORE))
-                gc.collect()
-                scan_cache.invalidate()  # Force fresh bars after retrain
-                bar_stream.subscribe(universe)  # Update WS subscriptions
-                last_refresh = datetime.datetime.now()
-                # Update baseline after retraining
-                if len(perf_monitor.recent_trades) >= 20:
-                    new_baseline = sum(perf_monitor.recent_trades) / len(perf_monitor.recent_trades)
-                    perf_monitor.update_baseline(max(0.45, new_baseline))  # Don't go below 45%
-
-            # Regular refresh every 45 mins (if no drift detected)
-            elif (datetime.datetime.now() - last_refresh).total_seconds() > 2700:
-                universe = list(set(CORE + fmp.get_dynamic_universe(exclude=set(CORE))))
-                ai.train(universe, poly, db=db, core_tickers=set(CORE))
-                gc.collect()
-                scan_cache.invalidate()  # Force fresh bars after retrain
-                bar_stream.subscribe(universe)  # Update WS subscriptions
-                last_refresh = datetime.datetime.now()
-
-            vix = vix_helper.get_vix()
-            vix_mult = vix_helper.get_size_multiplier()
-            regime = regime_detector.get_regime()
-
-            # FIX: Use Alpaca Clock for accurate market hours (handles holidays/early close)
+            # Check market hours via Alpaca clock
             try:
                 clock = alpaca.api.get_clock()
-                is_market_hours = clock.is_open
-                # Optional: Sleep until open if close
-                if not is_market_hours:
-                    next_open = clock.next_open.replace(tzinfo=datetime.timezone.utc).timestamp()
-                    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
-                    sleep_sec = min(300, max(60, next_open - now_ts))
+                is_open = clock.is_open
+            except Exception:
+                is_open = (now_et.weekday() < 5 and
+                           9 * 60 + 30 <= now_et.hour * 60 + now_et.minute < 16 * 60)
 
-                    # Dashboard Update for Sleep
-                    dashboard.render({
-                        'equity': alpaca.equity,
-                        'vix': vix,
-                        'regime': regime,
-                        'universe_size': len(universe),
-                        'positions': [],
-                        'candidates': [],
-                        'hedged': hedger.is_hedged,
-                        'orders': 0,
-                        'pnl_day': alpaca.equity - start_equity,
-                        'logs': [f"💤 Market closed. Sleeping {sleep_sec:.0f}s..."]
-                    })
-
-                    time.sleep(sleep_sec)
-                    continue
-            except Exception as e:
-                # FIX: Fallback to proper ET time if API fails
-                try:
-                    from zoneinfo import ZoneInfo
-                    now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
-                except ImportError:
-                    # Last resort: assume local time (not ideal)
-                    now_et = datetime.datetime.now()
-                    logging.warning("ZoneInfo not available - using local time for market hours")
-
-                # FIX: Proper market hours check (9:30 AM - 4:00 PM ET, weekdays)
-                is_market_hours = (
-                    now_et.weekday() < 5 and
-                    ((now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)) and now_et.hour < 16)
-                )
-                if not is_market_hours:
-                    time.sleep(60)
-                    continue
-            hedger.check_hedge(regime)
-
-            # GEX-adjusted confidence threshold
-            gex_mult = gex_helper.get_size_multiplier()
-            gex_conf_adj = gex_helper.get_confidence_adjustment()
-            threshold = SETTINGS['MIN_CONFIDENCE'] + regime_detector.get_confidence_adjustment() + gex_conf_adj
-
-            # v15: Volatility Targeting Scalar
-            vol_scalar = vol_target.update_scalar()
-
-            # FIX: Show pending orders in log
-            pending_count = len(alpaca.pending_orders)
-
-            # FIX: Prepare Dashboard State for Rendering
-            # Calculate PnL for active positions
-            db_positions = []
-            for t, p in alpaca.pos_cache.items():
-                curr = prices.get(t, p['entry'])
-                init_risk = p.get('init_risk', 1) or 1
-                diff = (curr - p['entry']) if p['side'] == 'LONG' else (p['entry'] - curr)
-                pnl_r = diff / init_risk
-                db_positions.append({
-                    'symbol': t, 'side': p['side'], 'qty': p['qty'],
-                    'entry': p['entry'], 'curr': curr, 'pnl_r': pnl_r,
-                    'sl': p.get('sl', 0)
-                })
-
-            dashboard.render({
-                'equity': alpaca.equity,
-                'vix': vix,
-                'regime': regime,
-                'universe_size': len(universe),
-                'positions': db_positions,
-                'candidates': scored_candidates if 'scored_candidates' in locals() else [],
-                'hedged': hedger.is_hedged,
-                'orders': pending_count,
-                'pnl_day': alpaca.equity - start_equity
-            })
-
-
-
-            # FIX: Fetch all prices in 1 API call using Polygon Snapshot
-            snap = poly.fetch_snapshot_prices(universe, ttl=5)
-            prices = {t: snap[t]["price"] for t in snap.keys()}
-
-            # FIX: Pre-filter by day dollar volume before expensive bar fetches
-            candidates = []
-            for t in universe:
-                if t not in snap:
-                    continue
-                day_vol_usd = snap[t]["dayVol"] * prices[t]
-                if day_vol_usd < 1_000_000:  # Skip illiquid names
-                    continue
-                candidates.append(t)
-
-            # FIX: Batch news fetching to avoid per-ticker latency in loop
-            all_news_scores = fmp.news_scores_batch(candidates, lookback_hours=SETTINGS.get("NEWS_LOOKBACK_HOURS", 24))
-
-            # Cross-sectional factor ranking (once per scan cycle)
+            # Refresh equity
             try:
-                cs_ranker.update(snap, fmp, universe)
+                alpaca.refresh_equity()
             except Exception:
                 pass
 
-            # Market context: compute SPY ROC + VIX ROC once per scan cycle
-            try:
-                _spy_scan = scan_cache.get_if_same_slot('SPY')
-                if _spy_scan is None:
-                    _spy_scan = poly.fetch_data('SPY', days=5, mult=15)
-                    if len(_spy_scan) > 0:
-                        scan_cache.put('SPY', _spy_scan)
-                live_spy_roc_5 = float(_spy_scan['Close'].pct_change(5).iloc[-1]) if len(_spy_scan) > 5 else 0.0
-                live_spy_roc_20 = float(_spy_scan['Close'].pct_change(20).iloc[-1]) if len(_spy_scan) > 20 else 0.0
-            except Exception:
-                live_spy_roc_5, live_spy_roc_20 = 0.0, 0.0
+            # ── AFTER HOURS: TRAIN MODEL + GENERATE SIGNALS ──
+            if (now_et.hour == 16 and now_et.minute >= 15 and
+                    last_model_train != today):
 
-            live_vix_level = vix  # Already fetched above
-            try:
-                _vix_h = yf.Ticker('^VIX').history(period='10d')
-                live_vix_roc = float(_vix_h['Close'].pct_change(5).iloc[-1]) if len(_vix_h) > 5 else 0.0
-            except Exception:
-                live_vix_roc = 0.0
+                print(f"\n[{now_et.strftime('%H:%M')}] After-hours: Updating model...")
+                signal_engine.update_daily_data()
 
-            # Phase 23b: Candidate Collection for Top-K Selection
-            scored_candidates = []
+                if signal_engine.train_model():
+                    signal_engine.generate_signals()
+                    todays_signals = signal_engine.get_tomorrow_signals()
+                    last_model_train = today
+                    entries_done_today = False
 
-            # PHASE 23b: Parallelized Candidate Scanning
-            def check_candidate(t):
-                try:
-                    # New-bar gating: reuse cached bars if still in same 15-min slot
-                    cached_df = scan_cache.get_if_same_slot(t)
-                    if cached_df is not None:
-                        df_15m = cached_df
+                    if todays_signals:
+                        longs = todays_signals.get('longs', [])
+                        shorts = todays_signals.get('shorts', [])
+                        print(f"Tomorrow's watchlist:")
+                        for t, s in longs:
+                            print(f"  LONG  {t} (score: {s:.4f})")
+                        for t, s in shorts:
+                            print(f"  SHORT {t} (score: {s:.4f})")
+                        send_alert(
+                            "V12.7 Watchlist Generated",
+                            f"Longs: {[t for t,_ in longs]}\nShorts: {[t for t,_ in shorts]}",
+                            "normal"
+                        )
                     else:
-                        # FIX: Fetch 12 days (approx 300 bars) to support EMA200
-                        df_15m = poly.fetch_data(t, days=12, mult=15)
-                        if len(df_15m) < 200: return None
-                        scan_cache.put(t, df_15m)
-
-                    if len(df_15m) < 200: return None
-
-                    # FIX: Attach Daily ATR
-                    df_15m = attach_daily_atr_to_15m(df_15m, t, poly=poly)
-
-                    # News Guard & Penalty
-                    news_score = all_news_scores.get(t, 0)
-                    news_penalty = (news_score >= SETTINGS.get("NEWS_SOFT_PENALTY_SCORE", 1))
-
-                    # Severe News Skip
-                    if news_score >= SETTINGS.get("NEWS_HARD_SKIP_SCORE", 3):
-                        return None
-
-                    # Morning Burn-In
-                    burnin_conf_add = 0.0
-                    burnin_size_mult = 1.0
-                    if ZoneInfo: now_et = datetime.datetime.now(ZoneInfo("America/New_York"))
-                    else: now_et = datetime.datetime.now()
-
-                    if now_et.hour == 9 and now_et.minute < (30 + SETTINGS.get("OPEN_BURNIN_MINUTES", 15)):
-                            burnin_conf_add = SETTINGS.get("BURNIN_CONF_ADD", 0.03)
-                            burnin_size_mult = SETTINGS.get("BURNIN_SIZE_MULT", 0.60)
-
-                    # Guards
-                    if not earnings.check_safe(t): return None
-                    if not fundamentals.check_healthy(t): return None
-                    if not LiquidityFilter.check(df_15m): return None
-
-                    # Portfolio Check (Initial)
-                    combined_exposure = alpaca.pos_cache.copy()
-                    for o in alpaca.pending_orders.values():
-                        risk_per_share = abs(float(o.get('price', 0)) - float(o.get('sl', 0)))
-                        combined_exposure[o['symbol']] = {'qty': int(o.get('qty', 0)), 'init_risk': risk_per_share, 'pending': True}
-
-                    if not portfolio_risk.should_allow_entry(t, combined_exposure, alpaca.equity):
-                        return None
-
-                    # V7: Compute all features using unified pipeline
-                    df_15m = _compute_v7_features(df_15m)
-                    # EMA 200 for trend filter (not in EXPECTED_FEATURES but used by live filters)
-                    df_15m['EMA_200'] = df_15m['Close'].ewm(span=200).mean()
-
-                    row = df_15m.iloc[-2].to_dict()
-
-                    # Validate live features against training distribution
-                    try:
-                        from hedge_fund.features import validate_feature_distributions, load_feature_stats
-                        if not validate_feature_distributions.__defaults__:
-                            load_feature_stats()
-                        validate_feature_distributions({k: row.get(k, 0) for k in ai.active_features})
-                    except Exception:
-                        pass
-
-                    # Hygiene
-                    bad_feats = [k for k in ai.active_features if k in row and not np.isfinite(row[k])]
-                    if bad_feats: return None
-
-                    # Predict R-value with quantile-based probability intervals
-                    predicted_r, p_win, p_hold, p_loss, uncertainty = ai.predict_with_intervals(row)
-
-                    # ATR
-                    daily_atr = get_daily_atr_polygon(poly, t)
-                    if not daily_atr or np.isnan(daily_atr) or daily_atr <= 0: daily_atr = row.get('ATR', prices.get(t, row['Close']) * 0.02)
-
-                    # ==============================================================================
-                    # V7 FILTERING: Synced with backtester
-                    # Only VPIN and Amihud are hard blocks. ADX/Hurst are soft scalars.
-                    # ==============================================================================
-
-                    # 1. Base R-value threshold
-                    base_r_threshold = SETTINGS.get('MIN_CONFIDENCE', 0.02)
-                    if abs(predicted_r) < base_r_threshold:
-                        return None
-
-                    # 2. Uncertainty filter (keep for live, not in backtester)
-                    if uncertainty > 2.0:
-                        return None
-
-                    # 3. VPIN hard filter (synced with backtester: > 0.85)
-                    vpin = row.get('VPIN', 0.0)
-                    if vpin > 0.85:
-                        logging.debug(f"   {t} blocked by VPIN={vpin:.2f}")
-                        return None
-
-                    # 4. Amihud hard filter (synced with backtester: > 0.90)
-                    amihud = row.get('Amihud_Illiquidity', 0.5)
-                    if amihud > 0.90:
-                        logging.debug(f"   {t} blocked by Amihud={amihud:.2f}")
-                        return None
-
-                    # ==============================================================================
-
-                    # Determine side based on R-value sign
-                    predicted_side = "LONG" if predicted_r > 0 else "SHORT"
-                    side = predicted_side
-
-                    entry_price = prices.get(t, row['Close'])
-
-                    # --- V7 SOFT FILTERS (reduce size, don't block) ---
-                    hurst_val = row.get('Hurst_Exponent', row.get('Hurst', 0.5))
-                    adx_val = row.get('ADX', 20)
-                    soft_scalar = 1.0
-
-                    # ADX soft filter: reduce size when ADX is low (weak trend)
-                    adx_min = SETTINGS.get('ADX_MIN', 15)
-                    if adx_min > 0 and adx_val < adx_min:
-                        adx_scalar = 0.5 + 0.5 * (adx_val / max(adx_min, 1e-6))
-                        soft_scalar *= adx_scalar
-
-                    # Hurst directional soft filter (synced with backtester)
-                    hurst_limit = SETTINGS.get('HURST_LIMIT', 0.5)
-                    pred_direction = 1 if predicted_r > 0 else -1
-                    if pred_direction > 0:
-                        hurst_scalar = 0.5 + 0.5 * (hurst_val / max(hurst_limit, 0.01))
-                        hurst_scalar = min(1.5, hurst_scalar)
-                    else:
-                        hurst_scalar = 0.5 + 0.5 * ((1 - hurst_val) / max(1 - hurst_limit, 0.01))
-                        hurst_scalar = min(1.5, hurst_scalar)
-                    soft_scalar *= max(0.3, hurst_scalar)
-
-                    # Confidence scalar (synced with backtester)
-                    conf_scalar = min(2.0, 0.5 + 0.5 * (abs(predicted_r) / max(base_r_threshold, 1e-6)))
-                    soft_scalar *= conf_scalar
-
-                    # Tier classification (simplified: always allow, use soft_scalar for sizing)
-                    t1_cfg = SETTINGS.get("TIER_1", {})
-                    t2_cfg = SETTINGS.get("TIER_2", {})
-
-                    # Tier 1 if high confidence and strong trend
-                    is_tier_1 = (p_win >= t1_cfg.get("MIN_PROB", 0.30))
-                    is_tier_2 = (p_win >= t2_cfg.get("MIN_PROB", 0.20))
-
-                    if is_tier_1:
-                        active_tier = t1_cfg
-                        tier_type = "Tier 1 (Specialist)"
-                    elif is_tier_2:
-                        active_tier = t2_cfg
-                        tier_type = "Tier 2 (Grinder)"
-                    else:
-                        return None
-
-                    # --- Apply Tier Parameters ---
-                    risk_mult = active_tier.get("RISK_MULT", 1.0) * soft_scalar
-                    risk_mult = min(risk_mult, 3.0)  # Cap at 3x (synced with backtester)
-                    rr_target = active_tier.get("RR", 1.5)
-
-                    # Burn-in / News Penalties
-                    if burnin_size_mult < 1.0: risk_mult *= burnin_size_mult
-                    if news_penalty: risk_mult *= 0.75
-
-                    # Calculate Stops & Targets
-                    base_sl_mult = SETTINGS.get('STOP_MULT', 1.5)
-                    tp_dist_mult = base_sl_mult * rr_target
-
-                    sl = entry_price - base_sl_mult * daily_atr if side == "LONG" else entry_price + base_sl_mult * daily_atr
-                    tp = entry_price + tp_dist_mult * daily_atr if side == "LONG" else entry_price - tp_dist_mult * daily_atr
-
-                    # Calculate EV (Net)
-                    stop_dist = abs(entry_price - sl)
-                    cost_r = estimate_cost_in_R(df_15m, stop_dist)
-
-                    # EV Gate (Legacy safety check)
-                    # p_win is already high from Tier logic, but check +EV
-                    # EV = (Win% * Reward) - (Loss% * Risk) - Cost
-                    # Reward = RR, Risk = 1.0
-                    ev_net = (p_win * rr_target) - ((1.0 - p_win) * 1.0) - cost_r
-
-                    if ev_net < SETTINGS.get("EV_GATE_R", 0.02):
-                        return None
-
-                    # Score for Top-K Sorting
-                    # Prioritize Tier 1, then EV
-                    score = ev_net
-                    if is_tier_1: score += 10.0 # Strict priority to Tier 1
-
-                    _entry_features = {k: row.get(k, 0) for k in ai.active_features}
-
-                    return {
-                        'symbol': t, 'side': side, 'type': tier_type,
-                        'score': score, 'p_win': p_win, 'ev': ev_net, 'price': entry_price,
-                        'sl': sl, 'tp': tp, 'daily_atr': daily_atr,
-                        'tier_mult': risk_mult, 'hurst_scalar': 1.0, # Baked into risk_mult
-                        'burnin_size_mult': burnin_size_mult,
-                        'rr_net': rr_target, 'prob_vec': (p_win, p_hold, p_loss),
-                        'entry_features': _entry_features
-                    }
-
-                except Exception as eobj:
-                     ERROR_TRACKER.record_failure(f"Scan_{t}", str(eobj))
-                     return None
-
-            # RUN PARALLEL SCANNER
-            scored_candidates = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=CPU_WORKERS) as scanner_pool:
-                future_to_cand = {scanner_pool.submit(check_candidate, t): t for t in candidates}
-                for future in concurrent.futures.as_completed(future_to_cand):
-                    res = future.result()
-                    if res:
-                        scored_candidates.append(res)
-
-            # --- Block new entries near close (overnight gap risk) ---
-            if gap_model.is_pre_close():
-                logging.info("🌙 Pre-close window: skipping new entries, managing existing only.")
-                scored_candidates = []
-
-            # --- Pairs Trading (market-neutral, complements directional) ---
-            if HAS_COINT and regime == 'CHOP' and not gap_model.is_pre_close():
-                try:
-                    pairs_scanner.scan_pairs(universe)
-                    pair_signals = pairs_scanner.get_pair_signals(prices)
-                    for ps in pair_signals[:2]:  # Max 2 pairs trades per cycle
-                        logging.info(f"🔗 Pairs signal: {ps['sideA']} {ps['legA']} / "
-                                     f"{ps['sideB']} {ps['legB']} z={ps['z_score']:.1f}")
-                        # Execute pair as two bracket orders with tight stops
-                        pair_atr_a = get_daily_atr_polygon(poly, ps['legA']) or (prices.get(ps['legA'], 100) * 0.015)
-                        pair_atr_b = get_daily_atr_polygon(poly, ps['legB']) or (prices.get(ps['legB'], 100) * 0.015)
-                        pair_risk_pct = SETTINGS['RISK_PER_TRADE'] * 0.5  # Half-size per leg
-                        for leg, side_key, atr_leg in [
-                            (ps['legA'], 'sideA', pair_atr_a),
-                            (ps['legB'], 'sideB', pair_atr_b)
-                        ]:
-                            if leg in alpaca.pos_cache:
-                                continue
-                            lp = prices.get(leg, 0)
-                            if lp <= 0:
-                                continue
-                            sd = 1.5 * atr_leg
-                            pair_qty = max(1, int((alpaca.equity * pair_risk_pct) / sd))
-                            sl_p = lp - sd if ps[side_key] == 'LONG' else lp + sd
-                            tp_p = lp + 2.0 * atr_leg if ps[side_key] == 'LONG' else lp - 2.0 * atr_leg
-                            alpaca.submit_bracket(leg, ps[side_key], pair_qty, lp, sl_p, tp_p, atr_override=atr_leg)
-                except Exception as e_pairs:
-                    logging.debug(f"Pairs trading error: {e_pairs}")
-
-            # --- Execution Phase (Top-K + Portfolio Optimization) ---
-            scored_candidates.sort(key=lambda x: x['score'], reverse=True)
-
-            open_positions = len(alpaca.pos_cache) + len(alpaca.pending_orders)
-            max_new_trades = max(1, SETTINGS['MAX_POSITIONS'] - open_positions)
-            top_k_limit = min(8, max_new_trades) # Increased to 8 for optimizer to have choices
-
-            # Select Top Candidates for Optimization
-            final_batch = scored_candidates[:top_k_limit]
-
-            if final_batch:
-                # 1. Prepare Data for Optimizer
-                opt_symbols = [c['symbol'] for c in final_batch]
-
-                # Fetch history for covariance + SPY for Beta
-                fetch_symbols = list(set(opt_symbols + ['SPY']))
-
-                try:
-                    # Quick fetch of daily data for correlation (more robust than 15m for broad covariance)
-                    cov_prices = poly.fetch_batch_bars(fetch_symbols, days=30)
-                except:
-                    cov_prices = pd.DataFrame() # Fallback
-
-                # 2. Run Optimizer
-                logging.info(f"🧠 Optimizing Portfolio for {len(final_batch)} candidates...")
-                opt_weights = optimizer.get_optimal_weights(final_batch, cov_prices, market_ticker='SPY')
-
-                # 3. Execute Optimal Allocations
-                for cand in final_batch:
-                    t = cand['symbol']
-                    weight = opt_weights.get(t, 0.0)
-
-                    if weight <= 0.01:
-                        logging.info(f"📉 Optimizer Zeroed out {t} (Risk/Correlation too high)")
-                        continue
-
-                    # --- RISK-BASED SIZING (was bypassed - stop distance was ignored) ---
-                    stop_dist = abs(cand['price'] - cand['sl'])
-                    if stop_dist <= 0:
-                        continue
-
-                    # A. Risk-based qty: respects stop distance (SETTINGS['RISK_PER_TRADE'])
-                    risk_qty = alpaca.calculate_position_size(
-                        cand['price'], cand['sl'], vix_mult=vix_mult
-                    )
-
-                    # B. Kelly-optimal risk fraction (was defined but never called)
-                    kelly_scalar = 1.0
-                    if SETTINGS.get('USE_KELLY', False):
-                        pW, pH, pL = cand.get('prob_vec', (0.50, 0.05, 0.45))
-                        rr = cand.get('rr_net', 2.0)
-                        kelly_f = kelly_3_outcome(pW, pL, pH, b=rr, d=0.15,
-                                                  f_max=SETTINGS.get('KELLY_MAX_RISK', 0.04))
-                        if kelly_f > 0:
-                            base_risk = SETTINGS['RISK_PER_TRADE']
-                            kelly_scalar = min(
-                                SETTINGS.get('KELLY_MAX_RISK', 0.03) / base_risk,
-                                max(SETTINGS.get('KELLY_MIN_RISK', 0.003) / base_risk,
-                                    kelly_f / base_risk * SETTINGS.get('KELLY_FRACTION', 0.75))
-                            )
-
-                    # C. Optimizer weight as a proportion cap
-                    opt_qty = int((alpaca.equity * weight * 1.2) / cand['price'])
-
-                    # D. Combine: use min of risk-based and optimizer-based, then apply scalars
-                    mc_scalar = mc_governor.get_risk_scalar() if mc_governor else 1.0
-                    ev_scalar = ev_to_size_mult(cand['ev'])
-                    qty = min(risk_qty, opt_qty)
-                    # Apply all scalars: vol, kelly, monte-carlo, GEX, EV-based sizing
-                    qty = int(qty * kelly_scalar * mc_scalar * vol_scalar * gex_mult * ev_scalar)
-                    qty = max(qty, 0)
-
-                    if qty == 0: continue
-
-                    tag = "⭐" if t in CORE else "Quant"
-                    logging.info(
-                        f"🚀 {tag} {cand['side']} {t} | OptW: {weight:.1%} "
-                        f"| RiskQty: {risk_qty} OptQty: {opt_qty} Final: {qty} "
-                        f"| Kelly: {kelly_scalar:.2f} Vol: {vol_scalar:.2f} MC: {mc_scalar:.2f} "
-                        f"| EV: {cand['ev']:.2f} EVx: {ev_scalar:.2f}"
-                    )
-
-                    alpaca.submit_bracket(
-                        t, cand['side'], qty, cand['price'],
-                        cand['sl'], cand['tp'],
-                        atr_override=cand['daily_atr'],
-                        entry_features=cand.get('entry_features')
-                    )
-
-            # Legacy loop removed. Optimizer handles execution.
-
-            # Manage positions
-            # FIX: Ensure we have prices for all held positions (even if scan failed)
-            for t in list(alpaca.pos_cache.keys()):
-                if t not in prices:
-                    try:
-                        df = poly.fetch_data(t, days=1)
-                        if len(df) > 0:
-                            prices[t] = df['Close'].iloc[-1]
-                    except Exception as e:
-                        logging.debug(f"Price fetch failed for {t}: {e}")
-
-            for t, p in list(alpaca.pos_cache.items()):
-                try:
-                    if t not in prices:
-                        logging.warning(f"No price for {t}, skipping management")
-                        continue
-
-                    curr = prices[t]
-                    entry = p['entry']
-
-                    # OVERNIGHT GAP RISK: exit high-risk positions before close
-                    if gap_model.is_pre_close():
-                        init_risk = p.get('init_risk', 0)
-                        # FIX: Use ATR-based fallback instead of $1 when init_risk unknown
-                        if init_risk <= 0:
-                            init_risk = abs(entry - p.get('sl', entry)) if p.get('sl', entry) != entry else (1.5 * atr)
-                        amt = (curr - entry) if p['side'] == 'LONG' else (entry - curr)
-                        pos_pnl_r = amt / init_risk
-                        if gap_model.should_exit_pre_close(t, vix, pos_pnl_r):
-                            logging.info(f"🌙 Pre-close exit: {t} (PnL={pos_pnl_r:.2f}R, VIX={vix:.1f})")
-                            alpaca.close_position(t, reason="OvernightGapRisk")
-                            continue
+                        print("No signals for tomorrow (low conviction day)")
+                else:
+                    print("Model training failed. Will retry tomorrow.")
+
+                time.sleep(60)
+                continue
+
+            # ── PRE-MARKET ──
+            if not is_open:
+                # Reset daily flags at midnight
+                if now_et.hour == 0 and now_et.minute < 2:
+                    entries_done_today = False
+                    daily_risk.initialize_session(alpaca.equity)
+
+                time.sleep(60)
+                continue
+
+            # ── MARKET OPEN: INITIALIZE DAILY RISK ──
+            if daily_risk.session_start_equity is None:
+                daily_risk.initialize_session(alpaca.equity)
+
+            # ── MARKET OPEN: ENTER POSITIONS (9:30 - 10:00 AM) ──
+            if (now_et.hour == 9 and now_et.minute >= 30 and
+                    not entries_done_today and todays_signals):
+
+                # Wait a few minutes for opening noise to settle
+                if now_et.minute >= 35:
+                    # Filter out earnings tickers
+                    safe_signals = {}
+                    for key in ['longs', 'shorts']:
+                        safe_signals[key] = [
+                            (t, s) for t, s in todays_signals.get(key, [])
+                            if earnings.check_safe(t)
+                        ]
+
+                    if safe_signals.get('longs') or safe_signals.get('shorts'):
+                        print(f"\n[{now_et.strftime('%H:%M')}] Entering positions...")
+
+                        if daily_risk.check_can_trade(alpaca.equity):
+                            position_mgr.enter_positions(safe_signals, poly)
                         else:
-                            # Tighten stop for overnight hold
-                            new_sl = gap_model.pre_close_stop_tightening(
-                                p['side'], entry, p.get('sl', entry), p.get('atr', 0), pos_pnl_r
-                            )
-                            if new_sl is not None and new_sl != p.get('sl', entry):
-                                if alpaca.replace_stop(t, new_sl):
-                                    alpaca.pos_cache[t]['sl'] = new_sl
-                                    logging.info(f"🌙 Overnight tighten: {t} SL -> ${new_sl:.2f}")
+                            print("Daily loss limit reached — skipping entries")
 
-                    # v15: VOL-ADAPTIVE TIME STOP
-                    # High-vol names get more time (wider ATR = slower resolution).
-                    # Base: 180 min. Scale by ATR_Pct relative to median (~0.8%).
-                    duration_mins = (datetime.datetime.now() - datetime.datetime.fromisoformat(p['ts'])).total_seconds() / 60
-                    atr_pct = p.get('atr', 0) / entry if entry > 0 else 0.008
-                    # Low vol (< 0.5%) -> 150 min, high vol (> 1.5%) -> 240 min
-                    time_limit = max(120, min(300, 180 * (atr_pct / 0.008))) if atr_pct > 0 else 180
+                    entries_done_today = True
 
-                    if duration_mins > time_limit:
-                        init_risk = p.get('init_risk', 0)
-                        # FIX: Use ATR-based fallback instead of $1 when init_risk unknown
-                        if init_risk <= 0:
-                            init_risk = abs(entry - current_sl) if current_sl != entry else (1.5 * atr)
+            # ── DURING MARKET: MANAGE POSITIONS ──
+            now = datetime.datetime.now()
+            if is_open and (now - last_position_check).total_seconds() >= 60:
+                position_mgr.update_positions(poly)
+                last_position_check = now
 
-                        amt = (curr - entry) if p['side'] == 'LONG' else (entry - curr)
-                        pnl_r = amt / init_risk
-
-                        # Close if stale and low profit
-                        if pnl_r < 0.5:
-                            logging.info(f"⌛ Time Stop: {t} held {duration_mins:.0f}m (limit {time_limit:.0f}m) PnL ({pnl_r:.2f}R). Closing.")
-                            alpaca.close_position(t, reason="TimeStop")
-                            continue
-
-                    # MANAGE PROFITS (Trailing Stop & Ratchet)
-                    atr = p['atr']
-                    side = p['side']
-                    current_sl = p.get('sl', entry)
-
-                    # Use stored init_risk for accurate R calc
-                    init_risk = p.get('init_risk', 0)
-                    if init_risk <= 0:
-                        init_risk = abs(entry - current_sl) if current_sl != entry else (1.5 * atr)
-
-                    move = (curr - entry) if side == 'LONG' else (entry - curr)
-                    r_val = move / init_risk if init_risk > 0 else 0
-
-                    # v15.10: RATCHET / BREAKEVEN LOGIC
-                    # If R > 1.0 and not yet moved to BE, move SL to Entry + 0.05R
-                    if r_val >= SETTINGS.get("RATCHET_R", 1.0) and not p.get('ratcheted', False):
-                        buffer = SETTINGS.get("RATCHET_BUFFER_ATR", 0.10) * atr
-
-                        if side == 'LONG':
-                            new_sl = entry + buffer
-                            if new_sl > current_sl: # Only move up
-                                if alpaca.replace_stop(t, new_sl):
-                                    alpaca.pos_cache[t]['sl'] = new_sl
-                                    alpaca.pos_cache[t]['ratcheted'] = True
-                                    logging.info(f"🛡️ RATCHET {t}: SL -> ${new_sl:.2f} (+{r_val:.2f}R)")
-                        else: # SHORT
-                            new_sl = entry - buffer
-                            if new_sl < current_sl: # Only move down
-                                if alpaca.replace_stop(t, new_sl):
-                                    alpaca.pos_cache[t]['sl'] = new_sl
-                                    alpaca.pos_cache[t]['ratcheted'] = True
-                                    logging.info(f"🛡️ RATCHET {t}: SL -> ${new_sl:.2f} (+{r_val:.2f}R)")
-
-                    # ENHANCED: PARTIAL PROFIT TAKING at 1.5R and 2.5R
-                    # FIX: Use partial_close() which properly cancels/re-submits
-                    # bracket legs to avoid TP leg trying to sell more shares than held.
-                    if r_val >= 1.5 and not p.get('scaled_1', False) and p['qty'] >= 3:
-                        # Take 1/3 off at 1.5R
-                        close_qty = p['qty'] // 3
-                        if close_qty > 0:
-                            try:
-                                if alpaca.partial_close(t, close_qty, side):
-                                    alpaca.pos_cache[t]['scaled_1'] = True
-                                    logging.info(f"SCALED 1/3 of {t} @ +{r_val:.2f}R (qty: {close_qty})")
-                            except Exception as e:
-                                logging.debug(f"Partial close 1 failed for {t}: {e}")
-
-                    if r_val >= 2.5 and not p.get('scaled_2', False) and p['qty'] >= 2:
-                        # Take half of remaining at 2.5R
-                        close_qty = p['qty'] // 2
-                        if close_qty > 0:
-                            try:
-                                if alpaca.partial_close(t, close_qty, side):
-                                    alpaca.pos_cache[t]['scaled_2'] = True
-                                    logging.info(f"SCALED 50% remaining of {t} @ +{r_val:.2f}R (qty: {close_qty})")
-                            except Exception as e:
-                                logging.debug(f"Partial close 2 failed for {t}: {e}")
-
-                    # v15.10: TRAILING STOP (Start after +2R, regime-adaptive distance)
-                    if r_val >= SETTINGS.get("TRAIL_START_R", 2.0) and atr > 0:
-                        trail_mult = SETTINGS.get("TRAIL_ATR_MULT", 1.0)
-                        if regime == 'CHOP':
-                            trail_mult *= 0.7   # Tighter trail in chop (take profits)
-                        elif regime in ('BULL', 'BEAR'):
-                            trail_mult *= 1.2   # Wider trail in trends (let runners run)
-                        trail_dist = trail_mult * atr
-                        if side == 'LONG':
-                            trail_sl = curr - trail_dist
-                            # Never loosen stop
-                            new_sl = max(current_sl, trail_sl)
-                            if new_sl > current_sl + 0.01:
-                                if alpaca.replace_stop(t, new_sl):
-                                    alpaca.pos_cache[t]['sl'] = new_sl
-                                    logging.info(f"🔒 TRAIL {t}: SL -> ${new_sl:.2f} (+{r_val:.2f}R)")
-                        else: # SHORT
-                            trail_sl = curr + trail_dist
-                            new_sl = min(current_sl, trail_sl)
-                            if new_sl < current_sl - 0.01:
-                                if alpaca.replace_stop(t, new_sl):
-                                    alpaca.pos_cache[t]['sl'] = new_sl
-                                    logging.info(f"🔒 TRAIL {t}: SL -> ${new_sl:.2f} (+{r_val:.2f}R)")
-                    # FIX: Only pyramid if enabled (disabled by default - bracket stacking is messy)
-                    if SETTINGS.get('ENABLE_PYRAMIDING', False) and r_val > SETTINGS['PYRAMID_R'] and not p.get('pyramided'):
-                        add_qty = int(p['qty'] * 0.5)
-                        if add_qty > 0:
-                            ext_tp = curr + (4.0 * atr) if side == 'LONG' else curr - (4.0 * atr)
-                            # FIX: Pass atr_override to preserve correct ATR for pyramid
-                            # FIX: Use CURRENT STOP LOSS (current_sl) not ENTRY for new bracket stop
-                            if alpaca.submit_bracket(t, side, add_qty, curr, current_sl, ext_tp, atr_override=atr):
-                                with alpaca._pos_lock:  # FIX: Thread safety
-                                    alpaca.pos_cache[t]['pyramided'] = True
-
-                except Exception as e:
-                    ERROR_TRACKER.record_failure(f"Manage_{t}", str(e))
-
-            if (datetime.datetime.now() - last_equity_log).total_seconds() > 300:
+            # ── EQUITY LOG (every 5 minutes) ──
+            if is_open and (now - last_equity_log).total_seconds() >= 300:
                 db.log_equity(alpaca.equity)
-                last_equity_log = datetime.datetime.now()
+                last_equity_log = now
 
-            db.save_dashboard_state(alpaca.equity, regime, len(universe), hedger.is_hedged, vix)
+            # ── DASHBOARD UPDATE ──
+            if is_open:
+                # Build watchlist display
+                watchlist_display = []
+                if todays_signals:
+                    for t, s in todays_signals.get('longs', []):
+                        watchlist_display.append({'symbol': t, 'side': 'LONG', 'score': s})
+                    for t, s in todays_signals.get('shorts', []):
+                        watchlist_display.append({'symbol': t, 'side': 'SHORT', 'score': s})
 
-            # Hybrid wait: WS bar-close event OR REST fallback timeout
-            if bar_stream.is_connected:
-                bar_stream.wait_for_bars(timeout=SETTINGS['SCAN_INTERVAL'])
-                ws_ready = bar_stream.get_ready_tickers()
-                if ws_ready:
-                    # Invalidate scan cache for tickers with fresh bars
-                    for _t in ws_ready:
-                        scan_cache.invalidate(_t)
-                    logging.debug(f"🔌 WS triggered scan for {len(ws_ready)} tickers")
-            else:
-                time.sleep(SETTINGS['SCAN_INTERVAL'])
+                logs = []
+                if position_mgr.mc_governor:
+                    scalar = position_mgr.mc_governor.get_risk_scalar()
+                    if scalar < 1.0:
+                        logs.append(f"MC Governor: risk scalar = {scalar:.2f}")
+
+                long_wr = position_mgr.recent_outcomes.get('LONG', [])
+                short_wr = position_mgr.recent_outcomes.get('SHORT', [])
+                if long_wr:
+                    logs.append(f"Recent L WR: {sum(long_wr)/len(long_wr):.0%} ({len(long_wr)} trades)")
+                if short_wr:
+                    logs.append(f"Recent S WR: {sum(short_wr)/len(short_wr):.0%} ({len(short_wr)} trades)")
+
+                dashboard.render({
+                    'equity': alpaca.equity,
+                    'universe_size': len(TICKERS),
+                    'pnl_day': alpaca.equity - (daily_risk.session_start_equity or alpaca.equity),
+                    'positions': position_mgr.get_position_display(),
+                    'watchlist': watchlist_display,
+                    'logs': logs,
+                })
+
+            time.sleep(30)  # Check every 30 seconds during market hours
 
         except KeyboardInterrupt:
-            logging.info("\n🛑 Stopped")
-            bar_stream.stop()
+            print("\nShutting down gracefully...")
             break
         except Exception as e:
-            ERROR_TRACKER.record_failure("MainLoop", str(e))
-            logging.error(f"Loop: {e}\n{traceback.format_exc()}")
+            logging.error(f"Main loop error: {e}")
+            traceback.print_exc()
             time.sleep(60)
 
-if __name__ == "__main__":
-    try:
-        run_god_mode()
-    except KeyboardInterrupt:
-        logging.info("🛑 KeyboardInterrupt - shutting down cleanly.")
-    except Exception as e:
-        import traceback
-        logging.error(f"Fatal error in __main__: {e}\n{traceback.format_exc()}")
-        raise
 
+if __name__ == "__main__":
+    run_hybrid_bot()
