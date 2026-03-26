@@ -52,6 +52,12 @@ def walk_forward_daily(df, features, train_days=250, test_days=60,
         model = EnsembleModel(use_daily=True)
         model.fit(train_df[avail], train_df['DailyTarget'])
 
+        # Log feature importance for diagnostics
+        if hasattr(model, 'feature_importances_'):
+            imp = dict(zip(avail, model.feature_importances_))
+            top3 = sorted(imp.items(), key=lambda x: x[1], reverse=True)[:3]
+            print(f"      Top features: {', '.join(f'{n}={v:.3f}' for n,v in top3)}")
+
         preds = model.predict(test_clean[avail])
         test_clean = test_clean.copy()
         test_clean['DailyPrediction'] = preds
@@ -118,11 +124,13 @@ def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3,
         longs = [(t, s) for t, s in ranked[:top_n]]
         shorts = [(t, abs(s)) for t, s in ranked[-bottom_n:]]
 
-        # Force equal L/S balance to prevent directional bias
-        if len(longs) > len(shorts):
-            longs = longs[:len(shorts)]
-        elif len(shorts) > len(longs):
-            shorts = shorts[:len(longs)]
+        # Soft L/S balance: cap imbalance at 2:1 (don't force exact equality)
+        max_ratio = 2
+        if len(longs) > 0 and len(shorts) > 0:
+            if len(longs) > len(shorts) * max_ratio:
+                longs = longs[:len(shorts) * max_ratio]
+            elif len(shorts) > len(longs) * max_ratio:
+                shorts = shorts[:len(longs) * max_ratio]
 
         if longs or shorts:
             watchlist[trade_date] = {'longs': longs, 'shorts': shorts}
