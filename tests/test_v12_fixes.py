@@ -104,21 +104,21 @@ class TestConfidenceSizing:
         assert isinstance(scalar, float)
 
 
-class TestEarlyStoppingConfig:
-    """Verify early stopping is in XGB constructor, not set_params."""
+class TestDailyModelConfig:
+    """Verify daily model regularization is reasonable for ~200 rows."""
 
-    def test_daily_model_has_early_stopping(self):
+    def test_daily_model_no_early_stopping(self):
         from hedge_fund.ensemble import EnsembleModel
         model = EnsembleModel(use_daily=True)
         params = model.xgb_model.get_params()
-        assert params.get('early_stopping_rounds') == 10
-
-    def test_intraday_model_no_early_stopping(self):
-        from hedge_fund.ensemble import EnsembleModel
-        model = EnsembleModel(use_daily=False)
-        params = model.xgb_model.get_params()
-        # Intraday models should NOT have early stopping
+        # Early stopping removed — kills features on small daily data
         assert params.get('early_stopping_rounds') is None
+
+    def test_daily_model_min_child_weight_reasonable(self):
+        from hedge_fund.ensemble import EnsembleModel
+        model = EnsembleModel(use_daily=True)
+        params = model.xgb_model.get_params()
+        assert params['min_child_weight'] <= 15  # Not too restrictive for 200 rows
 
 
 class TestEmptyExecution:
