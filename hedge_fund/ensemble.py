@@ -209,7 +209,18 @@ class EnsembleModel:
 
     def _fit_direct(self, X, y, sample_weight=None):
         """Train all models directly with equal-weight meta."""
-        self.xgb_model.fit(X, y, sample_weight=sample_weight)
+        # Use last 15% as early-stopping validation for XGB
+        n = len(X)
+        if n > 200:
+            split = int(n * 0.85)
+            X_tr, X_val = X[:split], X[split:]
+            y_tr, y_val = y[:split], y[split:]
+            sw_tr = sample_weight[:split] if sample_weight is not None else None
+            self.xgb_model.set_params(early_stopping_rounds=10)
+            self.xgb_model.fit(X_tr, y_tr, sample_weight=sw_tr,
+                              eval_set=[(X_val, y_val)], verbose=False)
+        else:
+            self.xgb_model.fit(X, y, sample_weight=sample_weight)
         if self._has_lgb:
             self.lgb_model.fit(X, y, sample_weight=sample_weight)
 

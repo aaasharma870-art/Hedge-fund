@@ -232,22 +232,29 @@ def compute_risk_metrics(trades):
     short_trades = [t for t in trades if len(t) >= 5 and t[4] == 'SHORT']
 
     # Percent gain assuming 1.5% risk per trade
-    pct_gain = sum(o * 0.015 for o in outcomes) * 100
+    risk_per_trade = 0.015
+    pct_gain = sum(o * risk_per_trade for o in outcomes) * 100
 
-    # CAGR: annualize percent gain over trading days
-    # Estimate trading days from number of trades (assume ~1 trade per 2 days)
-    est_trading_days = max(n_total * 2, 1)
-    years = est_trading_days / 252.0
-    if years > 0 and pct_gain > -100:
-        cagr = ((1 + pct_gain / 100) ** (1 / years) - 1) * 100
+    # CAGR: annualize the percent gain
+    # Estimate ~200 trades per year as reasonable density
+    cumulative_return = sum(o * risk_per_trade for o in outcomes)
+    years = max(0.5, n_total / 200.0)
+    if cumulative_return > -1:
+        cagr = ((1 + cumulative_return) ** (1 / years) - 1) * 100
     else:
-        cagr = 0.0
+        cagr = -100.0
 
-    # Average transaction cost in R
-    avg_cost_r = 0.0
-    if n_total > 0:
-        sizes = [t[2] for t in trades]
-        avg_cost_r = abs(total_return - sum(outcomes)) / n_total if n_total > 0 else 0.0
+    # Average transaction cost in R (0.05% per side / ~3% daily ATR ≈ 0.033R)
+    avg_cost_r = 0.033
+
+    # Sortino ratio (downside deviation only)
+    downside_returns = [o * 0.02 for o in outcomes if o < 0]
+    if downside_returns and len(outcomes) > 1:
+        downside_std = np.std(downside_returns, ddof=1)
+        mean_return = np.mean([o * 0.02 for o in outcomes])
+        sortino = (mean_return / downside_std) * np.sqrt(252) if downside_std > 0 else 0
+    else:
+        sortino = 0
 
     return {
         'PF_Raw': round(pf_raw, 3),
@@ -258,6 +265,7 @@ def compute_risk_metrics(trades):
         'Resolved': len(resolved),
         'MaxDD_R': round(max_dd, 2),
         'Sharpe': round(sharpe_annual, 2),
+        'Sortino': round(sortino, 2),
         'TotalReturn_R': round(total_return, 2),
         'AvgWin_R': round(avg_win, 2),
         'AvgLoss_R': round(avg_loss, 2),
@@ -273,7 +281,7 @@ def compute_risk_metrics(trades):
 def _empty_metrics():
     return {
         'PF_Raw': 0, 'PF_Res': 0, 'WR_Raw': 0, 'WR_Res': 0,
-        'Trades': 0, 'Resolved': 0, 'MaxDD_R': 0, 'Sharpe': 0,
+        'Trades': 0, 'Resolved': 0, 'MaxDD_R': 0, 'Sharpe': 0, 'Sortino': 0,
         'TotalReturn_R': 0, 'AvgWin_R': 0, 'AvgLoss_R': 0, 'PayoffRatio': 0,
         'LongTrades': 0, 'ShortTrades': 0,
         'PctGain': 0, 'CAGR': 0, 'AvgCost_R': 0,
@@ -438,7 +446,7 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
         sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.5, 2.0)
         tp_rr = trial.suggest_float("tp_rr", 1.5, 3.0)
         tp_atr_mult = sl_atr_mult * tp_rr
-        max_hold_days = trial.suggest_int("max_hold_days", 3, 8)
+        max_hold_days = trial.suggest_int("max_hold_days", 4, 8)
         entry_threshold = trial.suggest_float("entry_threshold", 0.30, 0.45)
         top_n = trial.suggest_int("top_n", 2, 3)
         partial_exit_atr = trial.suggest_float("partial_exit_atr", 1.0, 2.0)
@@ -532,6 +540,13 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
             balance = min(long_n, short_n) / max(long_n, short_n) if max(long_n, short_n) > 0 else 0
             if balance < 0.3:
                 score *= 0.5
+
+        # Penalize deep drawdowns
+        max_dd = abs(metrics.get('MaxDD_R', 0))
+        if max_dd > 15:
+            score *= 0.7
+        elif max_dd > 10:
+            score *= 0.85
 
         trial.set_user_attr("n_trades", n_trades)
         trial.set_user_attr("pf", round(pf, 4))
@@ -766,14 +781,14 @@ def main():
 
     # Seed trials
     seed_configs = [
-        {'sl_atr_mult': 1.5, 'tp_rr': 3.0, 'max_hold_days': 6,
-         'entry_threshold': 0.40, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
-        {'sl_atr_mult': 1.5, 'tp_rr': 2.0, 'max_hold_days': 8,
+        {'sl_atr_mult': 1.7, 'tp_rr': 2.0, 'max_hold_days': 5,
+         'entry_threshold': 0.38, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
+        {'sl_atr_mult': 1.6, 'tp_rr': 2.5, 'max_hold_days': 6,
          'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.01},
-        {'sl_atr_mult': 1.7, 'tp_rr': 2.5, 'max_hold_days': 7,
-         'entry_threshold': 0.30, 'top_n': 3, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
-        {'sl_atr_mult': 2.0, 'tp_rr': 2.0, 'max_hold_days': 10,
-         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 2.0, 'min_spread': 0.0},
+        {'sl_atr_mult': 1.8, 'tp_rr': 1.8, 'max_hold_days': 4,
+         'entry_threshold': 0.40, 'top_n': 3, 'partial_exit_atr': 1.3, 'min_spread': 0.005},
+        {'sl_atr_mult': 2.0, 'tp_rr': 2.0, 'max_hold_days': 7,
+         'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 1.8, 'min_spread': 0.0},
     ]
     for sp in seed_configs:
         study.enqueue_trial(sp)
@@ -883,7 +898,8 @@ def main():
                   f"(L:{best_metrics['LongTrades']} S:{best_metrics['ShortTrades']})")
     console.print(f"   TotalReturn: {best_metrics['TotalReturn_R']:.1f}R | "
                   f"PayoffRatio: {best_metrics['PayoffRatio']:.2f}")
-    console.print(f"   PctGain: {best_metrics['PctGain']:.1f}% | CAGR: {best_metrics['CAGR']:.1f}%")
+    console.print(f"   PctGain: {best_metrics['PctGain']:.1f}% | CAGR: {best_metrics['CAGR']:.1f}% | "
+                  f"Sortino: {best_metrics['Sortino']:.2f}")
 
     # ── LONG vs SHORT breakdown ──
     long_trades = [t for t in best_trades if len(t) >= 5 and t[4] == 'LONG']
