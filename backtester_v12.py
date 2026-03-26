@@ -238,7 +238,7 @@ def compute_risk_metrics(trades):
     # CAGR: annualize the percent gain
     # Estimate ~200 trades per year as reasonable density
     cumulative_return = sum(o * risk_per_trade for o in outcomes)
-    years = max(0.5, n_total / 200.0)
+    years = max(0.5, n_total / 180.0)  # ~180 round-trip trades per year
     if cumulative_return > -1:
         cagr = ((1 + cumulative_return) ** (1 / years) - 1) * 100
     else:
@@ -785,7 +785,7 @@ def main():
          'entry_threshold': 0.38, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.005},
         {'sl_atr_mult': 1.6, 'tp_rr': 2.5, 'max_hold_days': 6,
          'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 1.5, 'min_spread': 0.01},
-        {'sl_atr_mult': 1.8, 'tp_rr': 1.8, 'max_hold_days': 4,
+        {'sl_atr_mult': 1.8, 'tp_rr': 1.8, 'max_hold_days': 5,
          'entry_threshold': 0.40, 'top_n': 3, 'partial_exit_atr': 1.3, 'min_spread': 0.005},
         {'sl_atr_mult': 2.0, 'tp_rr': 2.0, 'max_hold_days': 7,
          'entry_threshold': 0.35, 'top_n': 2, 'partial_exit_atr': 1.8, 'min_spread': 0.0},
@@ -1057,7 +1057,8 @@ def main():
                     console.print(f"   Trades: {h_metrics['Trades']} | "
                                   f"PF: {h_metrics['PF_Raw']:.2f} | "
                                   f"WR: {h_metrics['WR_Raw']:.1%} | "
-                                  f"Sharpe: {h_metrics['Sharpe']:.2f}")
+                                  f"Sharpe: {h_metrics['Sharpe']:.2f} | "
+                                  f"Sortino: {h_metrics['Sortino']:.2f}")
                     console.print(f"   PctGain: {h_metrics['PctGain']:.1f}%")
 
                     h_signal_acc = compute_signal_accuracy(h_wl, daily_featured)

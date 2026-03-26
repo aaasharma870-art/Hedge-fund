@@ -235,19 +235,12 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                 if entry_info:
                     entry_price = entry_info['price']
                 else:
-                    # Fallback to daily close — skip if volume is abnormally low
+                    # Fallback: daily close with size penalty for blind entry
                     entry_price = _get_price(daily_df, today)
                     if entry_price is None:
                         continue
-                    daily_vol = _get_field(daily_df, today, 'Volume')
-                    if daily_vol is not None and 'Volume' in daily_df.columns:
-                        avg_vol = daily_df['Volume'].rolling(20).mean()
-                        if hasattr(avg_vol.index, 'date'):
-                            today_avg = avg_vol[avg_vol.index.date <= today].iloc[-1] if len(avg_vol) > 0 else None
-                        else:
-                            today_avg = avg_vol.iloc[-1] if len(avg_vol) > 0 else None
-                        if today_avg and today_avg > 0 and daily_vol < today_avg * 0.3:
-                            continue  # Skip illiquid day
+                    # No intraday confirmation — reduce size
+                    regime_size *= 0.75
 
                 sl_dist = sl_atr_mult * daily_atr
                 tp_dist = tp_atr_mult * daily_atr
@@ -270,7 +263,7 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                         regime_size = 0.5  # Half size, don't skip entirely
 
                 # Confidence sizing: scale by conviction relative to median
-                confidence_scalar = np.clip(abs(conviction) / median_conviction, 0.7, 1.5)
+                confidence_scalar = float(np.clip(abs(conviction) / median_conviction, 0.7, 1.5))
                 size = 1.0 * regime_size * confidence_scalar
 
                 positions[ticker] = {
