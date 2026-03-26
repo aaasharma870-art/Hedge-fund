@@ -33,7 +33,7 @@ def walk_forward_daily(df, features, train_days=250, test_days=60,
 
     n = len(df)
     all_test = []
-    embargo = FORWARD_DAYS
+    embargo = FORWARD_DAYS + 5  # Extra gap to avoid label leakage from overlapping forward windows
 
     start = 0
     while start + train_days + embargo + test_days <= n:
@@ -45,7 +45,7 @@ def walk_forward_daily(df, features, train_days=250, test_days=60,
         test_df = df.iloc[test_start:test_end].copy()
         test_clean = test_df.dropna(subset=['DailyTarget'])
 
-        if len(train_df) < 100 or len(test_clean) < 10:
+        if len(train_df) < 200 or len(test_clean) < 10:
             start += step_days
             continue
 
@@ -117,6 +117,12 @@ def generate_watchlist(predictions_by_ticker, top_n=3, bottom_n=3,
         # Cross-sectional: long the best, short the worst — absolute sign irrelevant
         longs = [(t, s) for t, s in ranked[:top_n]]
         shorts = [(t, abs(s)) for t, s in ranked[-bottom_n:]]
+
+        # Force equal L/S balance to prevent directional bias
+        if len(longs) > len(shorts):
+            longs = longs[:len(shorts)]
+        elif len(shorts) > len(longs):
+            shorts = shorts[:len(longs)]
 
         if longs or shorts:
             watchlist[trade_date] = {'longs': longs, 'shorts': shorts}

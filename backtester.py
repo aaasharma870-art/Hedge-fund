@@ -1083,6 +1083,9 @@ def compute_risk_metrics(trades):
     avg_loss = gross_loss / (n_total - wins) if (n_total - wins) > 0 else 0
     payoff_ratio = avg_win / avg_loss if avg_loss > 0 else 0
 
+    # Percent gain assuming 1.5% risk per trade
+    pct_gain = sum(o * 0.015 for o in outcomes) * 100
+
     return {
         'PF_Res': pf_res, 'WR_Res': wr_res,
         'PF_Raw': pf_raw, 'WR_Raw': wr_raw,
@@ -1096,6 +1099,7 @@ def compute_risk_metrics(trades):
         'AvgWin_R': round(avg_win, 2),
         'AvgLoss_R': round(avg_loss, 2),
         'PayoffRatio': round(payoff_ratio, 2),
+        'PctGain': round(pct_gain, 2),
     }
 
 
@@ -1105,6 +1109,7 @@ def _empty_metrics():
         'Trades': 0, 'Resolved': 0, 'MaxDD_R': 0, 'Sharpe': 0,
         'Calmar': 0, 'LongestLoss': 0, 'TotalReturn_R': 0,
         'AvgWin_R': 0, 'AvgLoss_R': 0, 'PayoffRatio': 0,
+        'PctGain': 0,
     }
 
 

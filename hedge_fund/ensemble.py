@@ -29,27 +29,27 @@ class EnsembleModel:
         if use_daily:
             # Daily models: heavy regularization to prevent overfitting
             default_xgb = {
-                "n_estimators": 80,
+                "n_estimators": 50,
                 "max_depth": 2,
-                "learning_rate": 0.03,
-                "subsample": 0.65,
-                "colsample_bytree": 0.65,
-                "min_child_weight": 15,
-                "reg_alpha": 2.0,
-                "reg_lambda": 5.0,
+                "learning_rate": 0.02,
+                "subsample": 0.50,
+                "colsample_bytree": 0.50,
+                "min_child_weight": 20,
+                "reg_alpha": 5.0,
+                "reg_lambda": 10.0,
                 "gamma": 0.3,
                 "n_jobs": -1,
                 "verbosity": 0,
             }
             default_lgb = {
-                "n_estimators": 80,
-                "max_depth": 3,
-                "learning_rate": 0.03,
-                "subsample": 0.65,
-                "colsample_bytree": 0.65,
-                "min_child_weight": 15,
-                "reg_alpha": 2.0,
-                "reg_lambda": 5.0,
+                "n_estimators": 50,
+                "max_depth": 2,
+                "learning_rate": 0.02,
+                "subsample": 0.50,
+                "colsample_bytree": 0.50,
+                "min_child_weight": 20,
+                "reg_alpha": 5.0,
+                "reg_lambda": 10.0,
                 "n_jobs": -1,
                 "verbosity": -1,
             }
@@ -97,6 +97,10 @@ class EnsembleModel:
             self._has_lgb = True
         except ImportError:
             logging.info("LightGBM not available, using XGBoost only")
+
+        # Disable LightGBM for daily models — XGB-only reduces variance
+        if use_daily:
+            self._has_lgb = False
 
         self._is_fitted = False
         self._feature_importances = None
