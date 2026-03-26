@@ -86,7 +86,7 @@ def compute_daily_features(daily_df, ticker=None, universe_daily=None):
             valid_universe = {t: udf for t, udf in universe_daily.items()
                              if len(udf) >= 100}
             if len(valid_universe) < 3:
-                valid_universe = universe_daily
+                raise ValueError("Not enough valid tickers for cross-sectional features")
             all_mom21 = pd.DataFrame({t: udf['Close'].pct_change(21)
                                        for t, udf in valid_universe.items()})
             all_vol = pd.DataFrame({t: udf['Close'].pct_change().rolling(20).std()
