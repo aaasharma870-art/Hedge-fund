@@ -4,12 +4,12 @@ import numpy as np
 import pandas as pd
 
 DAILY_FEATURES = [
-    'Mom_5d', 'Mom_21d', 'Mom_63d', 'Mom_126d_skip21',
-    'MR_ZScore_20d', 'RSI_14d',
-    'Vol_Ratio', 'ATR_Pct_20d',
-    'Amihud_20d', 'Volume_ZScore',
-    'CS_Mom_Rank', 'CS_Vol_Rank', 'CS_MR_Rank',
-    'Reversal_1d', 'Volume_Price_Div', 'Vol_Surprise',
+    'Mom_21d', 'Mom_126d_skip21',
+    'MR_ZScore_20d',
+    'Vol_Ratio',
+    'Amihud_20d',
+    'CS_Mom_Rank',
+    'Reversal_1d', 'Volume_Price_Div',
 ]
 
 

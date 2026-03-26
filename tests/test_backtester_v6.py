@@ -346,6 +346,14 @@ class TestRiskMetricsV6:
         assert m['Resolved'] == 3
         assert m['PF_Res'] > 0
 
+    def test_pct_gain_key_exists(self):
+        trades = [
+            (2.0, True, 1.0, 'A', 'LONG'),
+            (-1.0, True, 1.0, 'A', 'SHORT'),
+        ]
+        m = compute_risk_metrics(trades)
+        assert 'PctGain' in m
+
 
 class TestAnchoredWalkForward:
     """Tests for anchored (expanding) walk-forward mode."""

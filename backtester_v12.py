@@ -76,13 +76,13 @@ TICKERS = [
 ]
 
 # Walk-forward settings for daily model
-DAILY_TRAIN_DAYS = 250    # ~1 year
+DAILY_TRAIN_DAYS = 300    # ~1.2 years (more history reduces variance)
 DAILY_TEST_DAYS = 60      # ~3 months
 DAILY_STEP_DAYS = 60      # non-overlapping
-HOLDOUT_DAYS = 90         # last 90 trading days
+HOLDOUT_DAYS = 120        # last 120 trading days for more robust validation
 
 # Optuna
-OPTUNA_N_TRIALS = 80
+OPTUNA_N_TRIALS = 120
 OPTUNA_TIMEOUT = None
 
 # Cost
@@ -231,6 +231,24 @@ def compute_risk_metrics(trades):
     long_trades = [t for t in trades if len(t) >= 5 and t[4] == 'LONG']
     short_trades = [t for t in trades if len(t) >= 5 and t[4] == 'SHORT']
 
+    # Percent gain assuming 1.5% risk per trade
+    pct_gain = sum(o * 0.015 for o in outcomes) * 100
+
+    # CAGR: annualize percent gain over trading days
+    # Estimate trading days from number of trades (assume ~1 trade per 2 days)
+    est_trading_days = max(n_total * 2, 1)
+    years = est_trading_days / 252.0
+    if years > 0 and pct_gain > -100:
+        cagr = ((1 + pct_gain / 100) ** (1 / years) - 1) * 100
+    else:
+        cagr = 0.0
+
+    # Average transaction cost in R
+    avg_cost_r = 0.0
+    if n_total > 0:
+        sizes = [t[2] for t in trades]
+        avg_cost_r = abs(total_return - sum(outcomes)) / n_total if n_total > 0 else 0.0
+
     return {
         'PF_Raw': round(pf_raw, 3),
         'PF_Res': round(pf_res, 3),
@@ -246,6 +264,9 @@ def compute_risk_metrics(trades):
         'PayoffRatio': round(payoff_ratio, 2),
         'LongTrades': len(long_trades),
         'ShortTrades': len(short_trades),
+        'PctGain': round(pct_gain, 2),
+        'CAGR': round(cagr, 2),
+        'AvgCost_R': round(avg_cost_r, 4),
     }
 
 
@@ -255,6 +276,7 @@ def _empty_metrics():
         'Trades': 0, 'Resolved': 0, 'MaxDD_R': 0, 'Sharpe': 0,
         'TotalReturn_R': 0, 'AvgWin_R': 0, 'AvgLoss_R': 0, 'PayoffRatio': 0,
         'LongTrades': 0, 'ShortTrades': 0,
+        'PctGain': 0, 'CAGR': 0, 'AvgCost_R': 0,
     }
 
 
@@ -413,11 +435,11 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
     """Create Optuna objective for hybrid system."""
 
     def objective(trial):
-        sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.3, 2.0)
-        tp_rr = trial.suggest_float("tp_rr", 2.0, 4.0)
+        sl_atr_mult = trial.suggest_float("sl_atr_mult", 1.5, 2.0)
+        tp_rr = trial.suggest_float("tp_rr", 1.5, 3.0)
         tp_atr_mult = sl_atr_mult * tp_rr
-        max_hold_days = trial.suggest_int("max_hold_days", 5, 12)
-        entry_threshold = trial.suggest_float("entry_threshold", 0.25, 0.50)
+        max_hold_days = trial.suggest_int("max_hold_days", 3, 8)
+        entry_threshold = trial.suggest_float("entry_threshold", 0.30, 0.45)
         top_n = trial.suggest_int("top_n", 2, 3)
         partial_exit_atr = trial.suggest_float("partial_exit_atr", 1.0, 2.0)
         min_spread = trial.suggest_float("min_spread", 0.0, 0.02)
@@ -502,6 +524,14 @@ def create_hybrid_objective(watchlist, intraday_data, daily_data):
             0.15 * consistency +
             0.15 * trade_score
         )
+
+        # Penalize L/S imbalance: if balance < 0.3, multiply score by 0.5
+        long_n = len([t for t in trades if len(t) >= 5 and t[4] == 'LONG'])
+        short_n = len([t for t in trades if len(t) >= 5 and t[4] == 'SHORT'])
+        if n_trades > 0:
+            balance = min(long_n, short_n) / max(long_n, short_n) if max(long_n, short_n) > 0 else 0
+            if balance < 0.3:
+                score *= 0.5
 
         trial.set_user_attr("n_trades", n_trades)
         trial.set_user_attr("pf", round(pf, 4))
@@ -853,6 +883,7 @@ def main():
                   f"(L:{best_metrics['LongTrades']} S:{best_metrics['ShortTrades']})")
     console.print(f"   TotalReturn: {best_metrics['TotalReturn_R']:.1f}R | "
                   f"PayoffRatio: {best_metrics['PayoffRatio']:.2f}")
+    console.print(f"   PctGain: {best_metrics['PctGain']:.1f}% | CAGR: {best_metrics['CAGR']:.1f}%")
 
     # ── LONG vs SHORT breakdown ──
     long_trades = [t for t in best_trades if len(t) >= 5 and t[4] == 'LONG']
@@ -1011,6 +1042,7 @@ def main():
                                   f"PF: {h_metrics['PF_Raw']:.2f} | "
                                   f"WR: {h_metrics['WR_Raw']:.1%} | "
                                   f"Sharpe: {h_metrics['Sharpe']:.2f}")
+                    console.print(f"   PctGain: {h_metrics['PctGain']:.1f}%")
 
                     h_signal_acc = compute_signal_accuracy(h_wl, daily_featured)
                     console.print(f"   Signal accuracy: "

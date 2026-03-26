@@ -97,6 +97,11 @@ class TestComputeRiskMetrics:
         m = compute_risk_metrics(trades)
         assert m['TotalReturn_R'] == pytest.approx(2.0)
 
+    def test_pct_gain_key_exists(self):
+        trades = self._make_trades([2.0, -1.0, 1.5])
+        m = compute_risk_metrics(trades)
+        assert 'PctGain' in m
+
 
 class TestPerTickerBreakdown:
     """Tests for per-ticker results decomposition."""

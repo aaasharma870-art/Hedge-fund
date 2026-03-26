@@ -80,7 +80,8 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
     positions = {}
     recent_outcomes = {'LONG': [], 'SHORT': []}  # Track last N outcomes per direction
     REGIME_LOOKBACK = 10   # Check last 10 trades per direction
-    REGIME_MIN_WR = 0.35   # If last 10 trades have <35% WR, reduce exposure
+    REGIME_MIN_WR = 0.40   # If last 10 trades have <40% WR, reduce exposure
+    MAX_CONCURRENT_POSITIONS = 6  # Limit concurrent positions
 
     # Build complete list of ALL trading days from daily data
     all_dates = set()
@@ -152,7 +153,7 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                 if pos.get('partial_taken') and current_price:
                     if current_price > pos.get('best_price', 0):
                         pos['best_price'] = current_price
-                    trail_level = pos['best_price'] - 1.0 * pos['daily_atr']
+                    trail_level = pos['best_price'] - 0.8 * pos['daily_atr']
                     if trail_level > pos['sl_price']:
                         pos['sl_price'] = trail_level
             else:
@@ -176,7 +177,7 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                 if pos.get('partial_taken') and current_price:
                     if current_price < pos.get('best_price', float('inf')):
                         pos['best_price'] = current_price
-                    trail_level = pos['best_price'] + 1.0 * pos['daily_atr']
+                    trail_level = pos['best_price'] + 0.8 * pos['daily_atr']
                     if trail_level < pos['sl_price']:
                         pos['sl_price'] = trail_level
 
@@ -201,10 +202,20 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
         if not signals:
             continue
 
+        # Compute median conviction for confidence sizing
+        all_convictions = []
+        for dk in ['longs', 'shorts']:
+            for _, conv in signals.get(dk, []):
+                all_convictions.append(abs(conv))
+        median_conviction = float(np.median(all_convictions)) if all_convictions else 1.0
+        median_conviction = max(median_conviction, 1e-10)  # avoid division by zero
+
         for direction_key in ['longs', 'shorts']:
             direction = 'LONG' if direction_key == 'longs' else 'SHORT'
 
             for ticker, conviction in signals.get(direction_key, []):
+                if len(positions) >= MAX_CONCURRENT_POSITIONS:
+                    break
                 if ticker in positions:
                     continue
                 if ticker not in daily_data:
@@ -248,8 +259,9 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     if recent_wr < REGIME_MIN_WR:
                         regime_size = 0.5  # Half size, don't skip entirely
 
-                # Equal sizing for both directions (market-neutral)
-                size = 1.0 * regime_size
+                # Confidence sizing: scale by conviction relative to median
+                confidence_scalar = min(1.5, abs(conviction) / median_conviction)
+                size = 1.0 * regime_size * confidence_scalar
 
                 positions[ticker] = {
                     'direction': direction,
