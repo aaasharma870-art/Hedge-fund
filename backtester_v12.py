@@ -798,17 +798,16 @@ def main():
         objective, n_trials=OPTUNA_N_TRIALS, timeout=OPTUNA_TIMEOUT,
         show_progress_bar=True,
         callbacks=[
-            lambda study, trial: (
-                print(
-                    f"\n  Trial {trial.number}: "
-                    f"score={trial.value:.4f} | "
-                    f"PF={trial.user_attrs.get('pf', '?')} | "
-                    f"Sharpe={trial.user_attrs.get('sharpe', '?')} | "
-                    f"Trades={trial.user_attrs.get('n_trades', '?')} | "
-                    f"L:{trial.user_attrs.get('long_n', '?')} "
-                    f"S:{trial.user_attrs.get('short_n', '?')}"
-                )
-                if trial.number % 5 == 0 and trial.value is not None else None
+            lambda study, trial: print(
+                f"\n  Trial {trial.number}/{OPTUNA_N_TRIALS}: "
+                f"score={trial.value:.4f} | "
+                f"PF={trial.user_attrs.get('pf', '?')} | "
+                f"Sharpe={trial.user_attrs.get('sharpe', '?')} | "
+                f"Trades={trial.user_attrs.get('n_trades', '?')} | "
+                f"L:{trial.user_attrs.get('long_n', '?')} "
+                f"S:{trial.user_attrs.get('short_n', '?')}"
+            ) if trial.value is not None else print(
+                f"\n  Trial {trial.number}/{OPTUNA_N_TRIALS}: FAILED"
             )
         ],
     )

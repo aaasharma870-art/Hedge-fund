@@ -227,6 +227,7 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                     continue
 
                 # Find intraday entry
+                no_intraday = False
                 entry_info = None
                 if ticker in intraday_data:
                     entry_info = find_intraday_entry(
@@ -235,12 +236,10 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                 if entry_info:
                     entry_price = entry_info['price']
                 else:
-                    # Fallback: daily close with size penalty for blind entry
                     entry_price = _get_price(daily_df, today)
                     if entry_price is None:
                         continue
-                    # No intraday confirmation — reduce size
-                    regime_size *= 0.75
+                    no_intraday = True
 
                 sl_dist = sl_atr_mult * daily_atr
                 tp_dist = tp_atr_mult * daily_atr
@@ -265,6 +264,8 @@ def simulate_hybrid_trades(watchlist, intraday_data, daily_data,
                 # Confidence sizing: scale by conviction relative to median
                 confidence_scalar = float(np.clip(abs(conviction) / median_conviction, 0.7, 1.5))
                 size = 1.0 * regime_size * confidence_scalar
+                if no_intraday:
+                    size *= 0.75  # No intraday confirmation — reduce size
 
                 positions[ticker] = {
                     'direction': direction,
